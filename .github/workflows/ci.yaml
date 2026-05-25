@@ -39,7 +39,7 @@ jobs:
           clean: false
           persist-credentials: true
       - name: Setup Elixir
-        uses: erlef/setup-beam@v1
+        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1
         env:
           ImageOS: ${{ env.RUNNER_OS }}
         with:
@@ -92,7 +92,7 @@ jobs:
           clean: false
           persist-credentials: true
       - name: Setup Elixir
-        uses: erlef/setup-beam@v1
+        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1
         env:
           ImageOS: ${{ env.RUNNER_OS }}
         with:
@@ -197,7 +197,7 @@ jobs:
           clean: false
           persist-credentials: true
       - name: Setup Elixir
-        uses: erlef/setup-beam@v1
+        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1
         env:
           ImageOS: ${{ env.RUNNER_OS }}
         with:
