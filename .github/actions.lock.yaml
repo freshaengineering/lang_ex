@@ -1,0 +1,44 @@
+version: 1
+generated_at: 2026-05-25T13:40:16Z
+internal: []
+trusted:
+  - action: actions/checkout
+    refs:
+      - v4
+    occurrences:
+      v4:
+        .github/workflows/ci.yaml:
+          - jobs.static.steps.[0].uses
+          - jobs.test.steps.[0].uses
+          - jobs.permit.steps.[0].uses
+          - jobs.publish.steps.[0].uses
+  - action: runs-on/cache
+    refs:
+      - v4
+    occurrences:
+      v4:
+        .github/workflows/ci.yaml:
+          - jobs.static.steps.[3].uses
+          - jobs.static.steps.[5].uses
+          - jobs.test.steps.[3].uses
+          - jobs.test.steps.[5].uses
+  - action: runs-on/cache/save
+    refs:
+      - v4
+    occurrences:
+      v4:
+        .github/workflows/ci.yaml:
+          - jobs.permit.steps.[3].uses
+external:
+  - action: erlef/setup-beam
+    refs:
+      - v1
+    occurrences:
+      v1:
+        .github/workflows/ci.yaml:
+          - jobs.static.steps.[1].uses
+          - jobs.test.steps.[1].uses
+          - jobs.publish.steps.[1].uses
+local: []
+docker: []
+dynamic: []
