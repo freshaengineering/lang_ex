@@ -23,7 +23,8 @@ defmodule LangEx.Graph.Pregel do
           context: term(),
           resume: %{node: atom(), value: term()} | nil,
           step: non_neg_integer(),
-          emit_to: pid() | nil
+          emit_to: pid() | nil,
+          next_nodes: [atom()] | nil
         }
 
   @doc "Runs the compiled graph from the start node through to completion."
@@ -37,7 +38,8 @@ defmodule LangEx.Graph.Pregel do
       context: nil,
       resume: nil,
       step: 0,
-      emit_to: nil
+      emit_to: nil,
+      next_nodes: nil
     })
   end
 
@@ -57,6 +59,14 @@ defmodule LangEx.Graph.Pregel do
     Process.delete(:lang_ex_resume)
 
     handle_resume_result(result, graph, node, opts)
+  end
+
+  # Resume from a stuck checkpoint: graph stopped mid-execution at a
+  # non-interrupt node. Continue from the queued nodes instead of
+  # restarting from `:__start__`.
+  defp run_graph(graph, state, %{next_nodes: nodes} = opts)
+       when is_list(nodes) and nodes !== [] do
+    step(nodes, graph, state, opts)
   end
 
   defp run_graph(graph, state, opts) do

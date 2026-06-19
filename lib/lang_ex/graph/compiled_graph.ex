@@ -72,6 +72,30 @@ defmodule LangEx.Graph.Compiled do
     )
   end
 
+  # Recovery from a stuck checkpoint: graph stopped mid-execution at a
+  # non-interrupt node. Latest checkpoint has queued `next_nodes` but no
+  # pending interrupt. Continue from those queued nodes (the resume
+  # value is discarded — there is no interrupt to feed it to).
+  defp resume_from_checkpoint(
+         {:ok, %Checkpoint{pending_interrupts: pending, next_nodes: next_nodes} = saved},
+         graph,
+         _resume_val,
+         opts
+       )
+       when (is_nil(pending) or pending === []) and is_list(next_nodes) do
+    case Enum.reject(next_nodes, &(&1 === :__end__)) do
+      [] ->
+        {:error, :no_pending_interrupt}
+
+      runnable ->
+        Pregel.run(
+          graph,
+          saved.state,
+          build_run_opts(opts, graph, next_nodes: runnable, step: saved.step)
+        )
+    end
+  end
+
   defp resume_from_checkpoint(_, _graph, _resume_val, _opts),
     do: {:error, :no_pending_interrupt}
 
@@ -102,7 +126,8 @@ defmodule LangEx.Graph.Compiled do
       context: Keyword.get(opts, :context),
       resume: Keyword.get(overrides, :resume),
       step: Keyword.get(overrides, :step, 0),
-      emit_to: nil
+      emit_to: nil,
+      next_nodes: Keyword.get(overrides, :next_nodes)
     }
   end
 end
