@@ -6,6 +6,12 @@ defmodule LangEx.Graph.Stream do
   executes. Uses a spawned process that runs Pregel and sends events
   to the consumer via the mailbox.
 
+  The streaming worker runs as a `Task`, which propagates `$callers`
+  and `$ancestors` from the calling process. Libraries that rely on
+  per-PID ownership (e.g. `Ecto.Adapters.SQL.Sandbox.allow/3`, custom
+  per-test sandboxes, or process-dictionary-based stubs) see the
+  consumer in the caller chain.
+
   ## Events
 
   - `{:node_start, node_name}` - a node is about to execute
@@ -33,21 +39,24 @@ defmodule LangEx.Graph.Stream do
   defp start_execution(graph, input, opts) do
     parent = self()
 
-    spawn_link(fn ->
-      state = State.apply_update(graph.initial_state, input, graph.reducers)
+    {:ok, pid} =
+      Task.start_link(fn ->
+        state = State.apply_update(graph.initial_state, input, graph.reducers)
 
-      graph
-      |> Pregel.run(state, %{
-        recursion_limit: Keyword.get(opts, :recursion_limit, 25),
-        checkpointer: graph.checkpointer,
-        config: Keyword.get(opts, :config, []),
-        context: Keyword.get(opts, :context),
-        resume: nil,
-        step: 0,
-        emit_to: parent
-      })
-      |> then(&send(parent, {:lang_ex_stream, {:done, &1}}))
-    end)
+        graph
+        |> Pregel.run(state, %{
+          recursion_limit: Keyword.get(opts, :recursion_limit, 25),
+          checkpointer: graph.checkpointer,
+          config: Keyword.get(opts, :config, []),
+          context: Keyword.get(opts, :context),
+          resume: nil,
+          step: 0,
+          emit_to: parent
+        })
+        |> then(&send(parent, {:lang_ex_stream, {:done, &1}}))
+      end)
+
+    pid
   end
 
   defp receive_events(:halted), do: {:halt, :halted}
