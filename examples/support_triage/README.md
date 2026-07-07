@@ -80,8 +80,11 @@ mix test
 
 - `Graph.add_conditional_edges` for intent-based routing
 - `LangEx.Interrupt.interrupt/1` for human-in-the-loop approval
-- `LangEx.Types.Command{resume: value}` for resuming interrupted graphs
+- `LangEx.Command{resume: value}` for resuming interrupted graphs
 - `LangEx.Checkpointer.Postgres` for durable state persistence across pause/resume
 - `MessagesState.schema` for pre-built message state with reducer
 - `LangEx.LLM.Anthropic.chat/2` for direct LLM calls via Claude Opus
 - Multiple LLM calls orchestrated across a branched graph
+
+For small, runnable feature tours (no API key or database needed), see
+[`examples/scripts`](../scripts).

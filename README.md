@@ -253,6 +253,7 @@ LangEx.LLM.Registry.register_provider(:groq, MyApp.LLM.Groq)
 
 | Example | What it demonstrates |
 |---|---|
+| [Feature Scripts](examples/scripts) | Ten tiny, runnable scripts — one per feature, no API keys or databases needed (`elixir examples/scripts/01_quick_start.exs`) |
 | [Incident Responder](examples/incident_responder) | DevOps agent with tool chains, multi-turn conversation, conditional routing, Postgres checkpointing |
 | [Support Triage](examples/support_triage) | Customer support agent with intent classification and escalation |
 

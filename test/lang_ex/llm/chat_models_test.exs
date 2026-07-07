@@ -77,8 +77,8 @@ defmodule LangEx.LLM.RegistryTest do
 
   describe "ChatModel.node with model string auto-resolution" do
     test "model string resolves provider and works in a graph" do
-      stub(LangEx.LLM.OpenAI, :chat, fn _messages, _opts ->
-        {:ok, Message.ai("auto-resolved response")}
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, _opts ->
+        {:ok, Message.ai("auto-resolved response"), %{input_tokens: 10, output_tokens: 5}}
       end)
 
       {:ok, result} =

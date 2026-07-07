@@ -129,12 +129,15 @@ Or use the programmatic API:
 
 ## What This Demonstrates
 
-- `LangEx.ToolNode.node/2` for executing diagnostic and action tools as a graph node
-- `LangEx.ToolNode.tools_condition/1` for routing based on tool calls
+- `LangEx.Tool.Node.node/2` for executing diagnostic and action tools as a graph node
+- `LangEx.Tool.Node.tools_condition/1` for routing based on tool calls
 - `%LangEx.Tool{function: fn args -> ... end}` for tools with embedded implementations
 - Multi-step tool chains (health check -> logs -> metrics -> action) in a single triage node
 - `LangEx.Interrupt.interrupt/1` for multi-turn conversation
-- `LangEx.Types.Command{resume: message}` for resuming with user input
+- `LangEx.Command{resume: message}` for resuming with user input
 - `Graph.add_conditional_edges` for intent-based routing (question vs incident vs goodbye)
-- `LangEx.LLM.Anthropic.chat/2` for LLM calls via Claude Opus
-- Retry logic with exponential backoff for rate limits
+- `LangEx.LLM.Resilient.chat/3` for LLM calls with retries, backoff, and a fallback message
+- `LangEx.Checkpointer.Postgres` for durable session state
+
+For small, runnable feature tours (no API key or database needed), see
+[`examples/scripts`](../scripts).

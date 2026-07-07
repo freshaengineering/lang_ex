@@ -7,6 +7,21 @@ defmodule LangEx.Telemetry do
   `[prefix, :stop]`, `[prefix, :exception]` convention produced by
   `:telemetry.span/3`.
 
+  ## Run-tree correlation
+
+  Every span's metadata carries two extra keys:
+
+  | Key              | Type                | Description                              |
+  |------------------|---------------------|------------------------------------------|
+  | `:run_id`        | `String.t()`        | Unique ID of this span                   |
+  | `:parent_run_id` | `String.t() \\| nil` | ID of the enclosing span (nil at root)   |
+
+  Graph invoke → step → node → LLM/checkpoint spans form a tree, so a
+  single invocation can be fully reconstructed from the event stream.
+  Subgraph invokes appear as child invoke spans of the parent node.
+  See `LangEx.Telemetry.Runs` and, for exporting to OpenTelemetry,
+  `LangEx.Telemetry.OpenTelemetryBridge`.
+
   ## Events
 
   ### `[:lang_ex, :graph, :invoke, :start]`

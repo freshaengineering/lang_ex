@@ -6,11 +6,15 @@ if Code.ensure_loaded?(Redix) do
     Checkpoints are stored as JSON under `lang_ex:cp:{thread_id}:{checkpoint_id}`.
     A sorted set `lang_ex:thread:{thread_id}` indexes checkpoint IDs by timestamp
     for ordered retrieval.
+
+    State is encoded with `LangEx.Checkpoint.Serializer`, so structs, atoms,
+    and tuples survive the round-trip exactly.
     """
 
     @behaviour LangEx.Checkpointer
 
     alias LangEx.Checkpoint
+    alias LangEx.Checkpoint.Serializer
 
     @prefix "lang_ex"
     @default_conn LangEx.Redix
@@ -32,19 +36,9 @@ if Code.ensure_loaded?(Redix) do
 
     @impl true
     def load(config) do
-      conn = config[:conn] || @default_conn
-      thread_id = Keyword.fetch!(config, :thread_id)
-
-      with {:ok, [latest_id]} <-
-             Redix.command(conn, ["ZREVRANGE", thread_index_key(thread_id), "0", "0"]),
-           {:ok, data} when not is_nil(data) <-
-             Redix.command(conn, ["GET", checkpoint_key(thread_id, latest_id)]) do
-        {:ok, deserialize(data)}
-      else
-        {:ok, []} -> :none
-        {:ok, nil} -> :none
-        {:error, _} = err -> err
-      end
+      config
+      |> Keyword.get(:checkpoint_id)
+      |> load_by_id(config)
     end
 
     @impl true
@@ -65,82 +59,61 @@ if Code.ensure_loaded?(Redix) do
       end
     end
 
+    defp load_by_id(nil, config) do
+      conn = config[:conn] || @default_conn
+      thread_id = Keyword.fetch!(config, :thread_id)
+
+      with {:ok, [latest_id]} <-
+             Redix.command(conn, ["ZREVRANGE", thread_index_key(thread_id), "0", "0"]) do
+        fetch_checkpoint(conn, thread_id, latest_id)
+      else
+        {:ok, []} -> :none
+        {:error, _} = err -> err
+      end
+    end
+
+    defp load_by_id(checkpoint_id, config) do
+      conn = config[:conn] || @default_conn
+      thread_id = Keyword.fetch!(config, :thread_id)
+      fetch_checkpoint(conn, thread_id, checkpoint_id)
+    end
+
+    defp fetch_checkpoint(conn, thread_id, checkpoint_id) do
+      conn
+      |> Redix.command(["GET", checkpoint_key(thread_id, checkpoint_id)])
+      |> handle_fetch()
+    end
+
+    defp handle_fetch({:ok, nil}), do: :none
+    defp handle_fetch({:ok, data}), do: {:ok, deserialize(data)}
+    defp handle_fetch({:error, _} = err), do: err
+
     defp checkpoint_key(thread_id, cp_id), do: "#{@prefix}:cp:#{thread_id}:#{cp_id}"
     defp thread_index_key(thread_id), do: "#{@prefix}:thread:#{thread_id}"
 
-    defp apply_ttl(_conn, config, _key, _index_key) when not is_map_key(config, :ttl),
-      do: :ok
-
     defp apply_ttl(conn, config, key, index_key) do
-      ttl = Keyword.get(config, :ttl)
-      set_expiry(conn, ttl, key, index_key)
+      config
+      |> Keyword.get(:ttl)
+      |> set_expiry(conn, key, index_key)
     end
 
-    defp set_expiry(_conn, nil, _key, _index_key), do: :ok
+    defp set_expiry(nil, _conn, _key, _index_key), do: :ok
 
-    defp set_expiry(conn, ttl, key, index_key) do
+    defp set_expiry(ttl, conn, key, index_key) do
       Redix.command(conn, ["EXPIRE", key, "#{ttl}"])
       Redix.command(conn, ["EXPIRE", index_key, "#{ttl}"])
     end
 
     defp serialize(%Checkpoint{} = cp) do
       cp
-      |> Map.from_struct()
-      |> Map.update!(:next_nodes, &Enum.map(&1, fn n -> Atom.to_string(n) end))
-      |> Map.update!(:created_at, &DateTime.to_iso8601/1)
-      |> Map.update(:pending_interrupts, nil, &encode_interrupt_nodes/1)
+      |> Serializer.encode()
       |> Jason.encode!()
     end
 
-    defp encode_interrupt_nodes(nil), do: nil
-
-    defp encode_interrupt_nodes(interrupts) do
-      Enum.map(interrupts, fn i ->
-        Map.update(i, :node, nil, &stringify_atom/1)
-      end)
-    end
-
-    defp stringify_atom(n) when is_atom(n), do: Atom.to_string(n)
-    defp stringify_atom(n), do: n
-
     defp deserialize(json) do
-      data = Jason.decode!(json)
-
-      %Checkpoint{
-        thread_id: data["thread_id"],
-        checkpoint_id: data["checkpoint_id"],
-        parent_id: data["parent_id"],
-        state: restore_atom_keys(data["state"]),
-        next_nodes: Enum.map(data["next_nodes"] || [], &String.to_existing_atom/1),
-        step: data["step"],
-        metadata: data["metadata"] || %{},
-        pending_interrupts: deserialize_interrupts(data["pending_interrupts"]),
-        created_at: parse_datetime(data["created_at"])
-      }
-    end
-
-    defp restore_atom_keys(map) when is_map(map) do
-      Map.new(map, fn {k, v} -> {String.to_existing_atom(k), v} end)
-    end
-
-    defp restore_atom_keys(other), do: other
-
-    defp deserialize_interrupts(nil), do: nil
-
-    defp deserialize_interrupts(list) when is_list(list) do
-      Enum.map(list, fn i ->
-        %{value: i["value"], node: safe_to_atom(i["node"])}
-      end)
-    end
-
-    defp safe_to_atom(nil), do: nil
-    defp safe_to_atom(s) when is_binary(s), do: String.to_existing_atom(s)
-
-    defp parse_datetime(nil), do: nil
-
-    defp parse_datetime(s) do
-      {:ok, dt, _} = DateTime.from_iso8601(s)
-      dt
+      json
+      |> Jason.decode!()
+      |> Serializer.decode()
     end
   end
 end

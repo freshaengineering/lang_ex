@@ -83,6 +83,45 @@ defmodule LangEx.Checkpoint.CheckpointStateTest do
       assert %{value: 42, label: "saw:42"} = result
     end
 
+    test "empty input resumes a crashed run from the pending nodes" do
+      {:ok, attempts} = Agent.start_link(fn -> 0 end)
+
+      graph =
+        Graph.new(trail: {[], &Kernel.++/2})
+        |> Graph.add_node(:prepare, fn _state -> %{trail: [:prepare]} end)
+        |> Graph.add_node(:flaky, fn _state ->
+          Agent.get_and_update(attempts, &{&1, &1 + 1})
+          |> Kernel.==(0)
+          |> crash_first_attempt()
+        end)
+        |> Graph.add_edge(:__start__, :prepare)
+        |> Graph.add_edge(:prepare, :flaky)
+        |> Graph.add_edge(:flaky, :__end__)
+        |> Graph.compile(checkpointer: Mock)
+
+      assert_raise RuntimeError, "transient failure", fn ->
+        LangEx.invoke(graph, %{trail: [:input]}, config: [thread_id: "crash-recovery"])
+      end
+
+      {:ok, result} = LangEx.invoke(graph, %{}, config: [thread_id: "crash-recovery"])
+
+      assert %{trail: [:input, :prepare, :flaky]} = result
+    end
+
+    test "empty input on a completed thread starts a fresh pass" do
+      graph =
+        Graph.new(runs: {0, &Kernel.+/2})
+        |> Graph.add_node(:work, fn _state -> %{runs: 1} end)
+        |> Graph.add_edge(:__start__, :work)
+        |> Graph.add_edge(:work, :__end__)
+        |> Graph.compile(checkpointer: Mock)
+
+      {:ok, %{runs: 1}} = LangEx.invoke(graph, %{}, config: [thread_id: "completed-thread"])
+      {:ok, result} = LangEx.invoke(graph, %{}, config: [thread_id: "completed-thread"])
+
+      assert %{runs: 2} = result
+    end
+
     test "without checkpointer, input always applies to schema defaults" do
       graph =
         Graph.new(value: 0)
@@ -97,4 +136,7 @@ defmodule LangEx.Checkpoint.CheckpointStateTest do
       assert %{value: 14} = result
     end
   end
+
+  defp crash_first_attempt(true), do: raise("transient failure")
+  defp crash_first_attempt(false), do: %{trail: [:flaky]}
 end
