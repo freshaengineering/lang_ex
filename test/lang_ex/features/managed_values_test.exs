@@ -22,5 +22,19 @@ defmodule LangEx.Features.ManagedValuesTest do
       assert %{counter: 3, seen: [10, 9, 8]} = result
       refute Map.has_key?(result, :remaining_steps)
     end
+
+    test "a schema-declared :remaining_steps key is left to the user" do
+      {:ok, result} =
+        Graph.new(remaining_steps: 99, doubled: nil)
+        |> Graph.add_node(:use_own, fn state ->
+          %{doubled: state.remaining_steps * 2}
+        end)
+        |> Graph.add_edge(:__start__, :use_own)
+        |> Graph.add_edge(:use_own, :__end__)
+        |> Graph.compile()
+        |> LangEx.invoke(%{})
+
+      assert %{remaining_steps: 99, doubled: 198} = result
+    end
   end
 end

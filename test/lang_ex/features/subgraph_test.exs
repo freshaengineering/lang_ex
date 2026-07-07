@@ -95,6 +95,32 @@ defmodule LangEx.Features.SubgraphTest do
       assert %{greeting: "hello from outer"} = result
     end
 
+    test "Command goto {:parent, target} routes the parent graph" do
+      inner =
+        Graph.new(amount: 0)
+        |> Graph.add_node(:check, fn state ->
+          %LangEx.Command{
+            update: %{amount: state.amount},
+            goto: {:parent, route_for(state.amount)}
+          }
+        end)
+        |> Graph.add_edge(:__start__, :check)
+        |> Graph.compile()
+
+      outer =
+        Graph.new(amount: 0, outcome: nil)
+        |> Graph.add_node(:triage, inner)
+        |> Graph.add_node(:auto_approve, fn _state -> %{outcome: :auto_approved} end)
+        |> Graph.add_node(:manual_review, fn _state -> %{outcome: :needs_review} end)
+        |> Graph.add_edge(:__start__, :triage)
+        |> Graph.add_edge(:auto_approve, :__end__)
+        |> Graph.add_edge(:manual_review, :__end__)
+        |> Graph.compile(warn_unreachable: false)
+
+      assert {:ok, %{outcome: :auto_approved}} = LangEx.invoke(outer, %{amount: 50})
+      assert {:ok, %{outcome: :needs_review}} = LangEx.invoke(outer, %{amount: 5_000})
+    end
+
     test "subgraph node events appear in the parent stream" do
       inner =
         Graph.new(value: 0)
@@ -116,4 +142,7 @@ defmodule LangEx.Features.SubgraphTest do
       assert Enum.any?(events, &match?({:node_start, :sub}, &1))
     end
   end
+
+  defp route_for(amount) when amount > 1_000, do: :manual_review
+  defp route_for(_amount), do: :auto_approve
 end

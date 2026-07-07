@@ -4,6 +4,9 @@ defmodule LangEx.Application do
 
   @impl true
   def start(_type, _args) do
+    :ok = LangEx.Graph.NodeCache.create_table()
+    :ok = LangEx.Store.ETS.create_table()
+
     children =
       [
         {Task.Supervisor, name: LangEx.TaskSupervisor}

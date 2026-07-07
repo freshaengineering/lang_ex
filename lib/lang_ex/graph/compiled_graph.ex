@@ -19,6 +19,8 @@ defmodule LangEx.Graph.Compiled do
     :initial_state,
     :reducers,
     :checkpointer,
+    :store,
+    node_opts: %{},
     interrupt_before: [],
     interrupt_after: []
   ]
@@ -26,11 +28,13 @@ defmodule LangEx.Graph.Compiled do
   @type t :: %__MODULE__{
           name: atom() | String.t() | nil,
           nodes: %{atom() => (map() -> map()) | t()},
+          node_opts: %{atom() => keyword()},
           edges: %{atom() => [atom()]},
           conditional_edges: %{atom() => {(map() -> atom() | String.t()), map() | nil}},
           initial_state: map(),
           reducers: State.reducers(),
           checkpointer: module() | nil,
+          store: {module(), keyword()} | nil,
           interrupt_before: [atom()],
           interrupt_after: [atom()]
         }
@@ -54,12 +58,28 @@ defmodule LangEx.Graph.Compiled do
     (default: `System.schedulers_online()`)
   - `:node_timeout` - per-node timeout in ms for parallel super-steps
     (default: `:infinity`)
+  - `:durability` - checkpoint write mode (default `:sync`):
+    - `:sync` - write after every super-step, on the hot path
+    - `:async` - write after every super-step in a supervised task
+      (lower latency; a crash may lose the most recent step)
+    - `:exit` - skip per-step checkpoints; only interrupts persist
+      (pause/resume works, crash recovery restarts from `:__start__`)
   """
   @spec invoke(t(), map() | LangEx.Command.t(), keyword()) ::
           {:ok, map()} | {:interrupt, term(), map()} | {:error, term()}
-  def invoke(graph, input, opts \\ [])
+  def invoke(graph, input, opts \\ []) do
+    graph
+    |> prepare_run(input, opts)
+    |> execute_run(graph)
+  end
 
-  def invoke(
+  defp execute_run({:run, state, run_opts}, graph), do: Pregel.run(graph, state, run_opts)
+  defp execute_run({:error, _} = err, _graph), do: err
+
+  @doc false
+  @spec prepare_run(t(), map() | LangEx.Command.t(), keyword()) ::
+          {:run, map(), Pregel.run_opts()} | {:error, term()}
+  def prepare_run(
         %__MODULE__{checkpointer: cp} = graph,
         %LangEx.Command{resume: resume_val},
         opts
@@ -70,7 +90,7 @@ defmodule LangEx.Graph.Compiled do
     |> resume_from_checkpoint(graph, resume_val, opts)
   end
 
-  def invoke(%__MODULE__{checkpointer: cp} = graph, input, opts)
+  def prepare_run(%__MODULE__{checkpointer: cp} = graph, input, opts)
       when cp != nil and input == %{} do
     opts
     |> Keyword.get(:config, [])
@@ -78,7 +98,7 @@ defmodule LangEx.Graph.Compiled do
     |> continue_thread(graph, input, opts)
   end
 
-  def invoke(%__MODULE__{} = graph, input, opts) when is_map(input) do
+  def prepare_run(%__MODULE__{} = graph, input, opts) when is_map(input) do
     start_fresh(graph, input, opts)
   end
 
@@ -106,21 +126,16 @@ defmodule LangEx.Graph.Compiled do
   defp continue_pending([], _saved, graph, input, opts), do: start_fresh(graph, input, opts)
 
   defp continue_pending(pending, saved, graph, _input, opts) do
-    Pregel.run(
-      graph,
-      saved.state,
-      build_run_opts(opts, graph,
-        start_nodes: pending,
-        step: saved.step + 1,
-        parent_id: saved.checkpoint_id
-      )
-    )
+    {:run, saved.state,
+     build_run_opts(opts, graph,
+       start_nodes: pending,
+       step: saved.step + 1,
+       parent_id: saved.checkpoint_id
+     )}
   end
 
   defp start_fresh(graph, input, opts) do
-    graph
-    |> resolve_initial_state(input, opts)
-    |> then(&Pregel.run(graph, &1, build_run_opts(opts, graph)))
+    {:run, resolve_initial_state(graph, input, opts), build_run_opts(opts, graph)}
   end
 
   @doc """
@@ -146,6 +161,15 @@ defmodule LangEx.Graph.Compiled do
   @spec get_state_history(t(), keyword()) :: [Checkpoint.t()]
   def get_state_history(%__MODULE__{checkpointer: cp}, opts) when not is_nil(cp) do
     cp.list(Keyword.get(opts, :config, []), Keyword.take(opts, [:limit]))
+  end
+
+  @doc """
+  Deletes every checkpoint for the thread in `:config` — e.g. when a
+  conversation is closed or a user requests data removal.
+  """
+  @spec delete_thread(t(), keyword()) :: :ok | {:error, term()}
+  def delete_thread(%__MODULE__{checkpointer: cp}, opts) when not is_nil(cp) do
+    cp.delete_thread(Keyword.get(opts, :config, []))
   end
 
   @doc """
@@ -210,17 +234,14 @@ defmodule LangEx.Graph.Compiled do
   # continue with the already-resolved next nodes (interrupt_after); the
   # first resumed super-step bypasses breakpoints so it does not pause again.
   defp dispatch_resume(true, saved, graph, _resume_val, opts) do
-    Pregel.run(
-      graph,
-      saved.state,
-      opts
-      |> build_run_opts(graph,
-        start_nodes: saved.next_nodes,
-        step: static_resume_step(saved),
-        parent_id: saved.checkpoint_id
-      )
-      |> Map.put(:bypass_breakpoints, true)
-    )
+    {:run, saved.state,
+     opts
+     |> build_run_opts(graph,
+       start_nodes: saved.next_nodes,
+       step: static_resume_step(saved),
+       parent_id: saved.checkpoint_id
+     )
+     |> Map.put(:bypass_breakpoints, true)}
   end
 
   defp dispatch_resume(false, saved, graph, resume_val, opts) do
@@ -231,15 +252,12 @@ defmodule LangEx.Graph.Compiled do
 
     nodes = saved.pending_interrupts |> Enum.map(& &1.node) |> Enum.uniq()
 
-    Pregel.run(
-      graph,
-      saved.state,
-      build_run_opts(opts, graph,
-        resume: %{nodes: nodes, values: values},
-        step: saved.step,
-        parent_id: saved.checkpoint_id
-      )
-    )
+    {:run, saved.state,
+     build_run_opts(opts, graph,
+       resume: %{nodes: nodes, values: values},
+       step: saved.step,
+       parent_id: saved.checkpoint_id
+     )}
   end
 
   defp static_resume_step(
@@ -299,7 +317,9 @@ defmodule LangEx.Graph.Compiled do
       start_nodes: Keyword.get(overrides, :start_nodes),
       parent_id: Keyword.get(overrides, :parent_id),
       max_concurrency: Keyword.get(opts, :max_concurrency),
-      node_timeout: Keyword.get(opts, :node_timeout)
+      node_timeout: Keyword.get(opts, :node_timeout),
+      store: graph.store,
+      durability: Keyword.get(opts, :durability, :sync)
     }
   end
 end

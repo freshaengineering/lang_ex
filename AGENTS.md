@@ -22,12 +22,13 @@ Always run `mix compile --warnings-as-errors` before considering work done. Zero
 ## Architecture
 
 ```
-LangEx (facade: invoke/3, stream/3, get_state/2, get_state_history/2, update_state/3)
-├── Graph                             # Builder: new, add_node, add_edge, compile
+LangEx (facade: invoke/3, stream/3, get_state/2, get_state_history/2, update_state/3, delete_thread/2)
+├── Graph                             # Builder: new, add_node (+retry/cache/defer), add_edge, compile, to_mermaid
 │   ├── Graph.Compiled                # Compiled executable graph
 │   ├── Graph.Pregel                  # Super-step execution engine (internal)
 │   ├── Graph.State                   # State management with reducers
-│   └── Graph.Stream                  # Lazy event streaming
+│   ├── Graph.NodeCache               # ETS memoization for cache: nodes
+│   └── Graph.Stream                  # Lazy event streaming with modes + emit/1
 ├── LLM                               # Behaviour for provider adapters
 │   ├── LLM.Anthropic                 # Claude adapter (streaming SSE)
 │   │   ├── Anthropic.SSE             # SSE state machine (internal)
@@ -42,6 +43,8 @@ LangEx (facade: invoke/3, stream/3, get_state/2, get_state_history/2, update_sta
 │   └── Tool.Annotation               # Error recovery guidance for LLM
 ├── Message                           # Chat message types (Human, AI, System, Tool)
 ├── Checkpoint / Checkpointer         # Pause/resume with Redis or Postgres
+├── Store                             # Long-term memory (ETS / Postgres backends)
+├── Prebuilt                          # Ready-made agent graph constructor
 ├── Command / Send / Interrupt        # Graph control flow primitives
 ├── Config                            # Layered config resolution
 ├── ContextCompaction                 # Context window budget enforcement
@@ -53,7 +56,8 @@ LangEx (facade: invoke/3, stream/3, get_state/2, get_state_history/2, update_sta
 | Behaviour | Callbacks | Purpose |
 |-----------|-----------|---------|
 | `LangEx.LLM` | `chat/2`, `chat_with_usage/2` (optional) | LLM provider adapters |
-| `LangEx.Checkpointer` | `save/2`, `load/1`, `list/2` | Checkpoint persistence backends |
+| `LangEx.Checkpointer` | `save/2`, `load/1`, `list/2`, `delete_thread/1` | Checkpoint persistence backends |
+| `LangEx.Store` | `get/3`, `put/4`, `delete/3`, `search/3` | Long-term memory backends |
 
 ### Key Design Decisions
 

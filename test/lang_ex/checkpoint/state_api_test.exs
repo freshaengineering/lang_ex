@@ -67,6 +67,28 @@ defmodule LangEx.Checkpoint.StateApiTest do
     end
   end
 
+  describe "delete_thread/2" do
+    test "removes all checkpoints for the thread", %{graph: graph} do
+      {:ok, _} = LangEx.invoke(graph, %{value: 1}, config: [thread_id: "del-1"])
+
+      assert [_ | _] = LangEx.get_state_history(graph, config: [thread_id: "del-1"])
+      assert :ok = LangEx.delete_thread(graph, config: [thread_id: "del-1"])
+      assert [] = LangEx.get_state_history(graph, config: [thread_id: "del-1"])
+      assert :none = LangEx.get_state(graph, config: [thread_id: "del-1"])
+    end
+  end
+
+  describe "checkpoint versioning" do
+    test "every checkpoint records the format version", %{graph: graph} do
+      {:ok, _} = LangEx.invoke(graph, %{value: 1}, config: [thread_id: "ver-1"])
+
+      version = Checkpoint.format_version()
+
+      assert {:ok, %Checkpoint{version: ^version}} =
+               LangEx.get_state(graph, config: [thread_id: "ver-1"])
+    end
+  end
+
   defp build_graph do
     Graph.new(value: 0)
     |> Graph.add_node(:first, fn state -> %{value: state.value + 1} end)

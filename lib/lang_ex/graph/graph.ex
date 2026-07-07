@@ -11,20 +11,29 @@ defmodule LangEx.Graph do
   alias LangEx.Graph.State
 
   defstruct nodes: %{},
+            node_opts: %{},
             edges: %{},
             conditional_edges: %{},
             schema: []
 
   @type node_fn :: (map() -> map() | LangEx.Command.t())
 
+  @type node_opt ::
+          {:retry, keyword() | true}
+          | {:cache, keyword() | true}
+          | {:defer, boolean()}
+
   @type routing_fn :: (map() -> atom() | String.t())
 
   @type t :: %__MODULE__{
           nodes: %{atom() => node_fn() | Compiled.t()},
+          node_opts: %{atom() => [node_opt()]},
           edges: %{atom() => [atom()]},
           conditional_edges: %{atom() => {routing_fn(), map() | nil}},
           schema: keyword()
         }
+
+  @node_opt_keys [:retry, :cache, :defer]
 
   @doc """
   Creates a new graph builder with the given state schema.
@@ -41,14 +50,57 @@ defmodule LangEx.Graph do
   context, streaming events, and interrupts propagate through it, and
   its checkpoints (when it has its own checkpointer) are namespaced
   under `"{thread_id}/{node_name}"`.
+
+  ## Execution policy options
+
+  - `:retry` - retry the node on exceptions. `true` for defaults, or
+    `[max_attempts: 3, backoff_ms: 100, retryable?: fn exception -> ... end]`
+    (linear backoff: `attempt * backoff_ms`).
+  - `:cache` - memoize successful results keyed by the node's input
+    state. `true` for no expiry, or `[ttl: milliseconds]`.
+  - `:defer` - when `true`, the node runs only once no other
+    (non-deferred) nodes are active — a fan-in barrier for parallel
+    branches that converge at different depths.
   """
-  @spec add_node(t(), atom(), node_fn() | Compiled.t()) :: t()
-  def add_node(%__MODULE__{} = graph, name, %Compiled{} = subgraph) when is_atom(name) do
-    %{graph | nodes: Map.put(graph.nodes, name, subgraph)}
+  @spec add_node(t(), atom(), node_fn() | Compiled.t(), [node_opt()]) :: t()
+  def add_node(graph, name, node_value, node_opts \\ [])
+
+  def add_node(%__MODULE__{} = graph, name, %Compiled{} = subgraph, node_opts)
+      when is_atom(name) do
+    graph
+    |> put_node(name, subgraph)
+    |> put_node_opts(name, node_opts)
   end
 
-  def add_node(%__MODULE__{} = graph, name, fun) when is_atom(name) and is_function(fun) do
-    %{graph | nodes: Map.put(graph.nodes, name, fun)}
+  def add_node(%__MODULE__{} = graph, name, fun, node_opts)
+      when is_atom(name) and is_function(fun) do
+    graph
+    |> put_node(name, fun)
+    |> put_node_opts(name, node_opts)
+  end
+
+  defp put_node(graph, name, value), do: %{graph | nodes: Map.put(graph.nodes, name, value)}
+
+  defp put_node_opts(graph, _name, []), do: graph
+
+  defp put_node_opts(graph, name, node_opts) do
+    :ok = validate_node_opts!(name, node_opts)
+    %{graph | node_opts: Map.put(graph.node_opts, name, node_opts)}
+  end
+
+  defp validate_node_opts!(name, node_opts) do
+    node_opts
+    |> Keyword.keys()
+    |> Enum.reject(&(&1 in @node_opt_keys))
+    |> assert_no_unknown_opts!(name)
+  end
+
+  defp assert_no_unknown_opts!([], _name), do: :ok
+
+  defp assert_no_unknown_opts!(unknown, name) do
+    raise ArgumentError,
+          "unknown node option(s) #{inspect(unknown)} for #{inspect(name)} — " <>
+            "supported: #{inspect(@node_opt_keys)}"
   end
 
   @doc "Adds a fixed edge from `from` to `to`."
@@ -88,25 +140,33 @@ defmodule LangEx.Graph do
   Options:
   - `:name` - stable graph identifier used in telemetry (`:graph_id`)
   - `:checkpointer` - module implementing `LangEx.Checkpointer` behaviour
+  - `:store` - long-term memory backend, `Module` or `{Module, config}`
+    (see `LangEx.Store`)
   - `:interrupt_before` - node names to pause at before execution
     (static breakpoints; requires a checkpointer to resume)
   - `:interrupt_after` - node names to pause at after execution
+  - `:warn_unreachable` - warn about nodes not reachable via declared
+    edges (default `true`; disable for graphs routed via Command goto)
   """
   @spec compile(t(), keyword()) :: Compiled.t()
   def compile(%__MODULE__{} = graph, opts \\ []) do
     :ok = validate_entry_point(graph)
     :ok = validate_edge_targets(graph)
+    :ok = validate_conditional_targets(graph)
+    :ok = warn_on_unreachable_nodes(graph, Keyword.get(opts, :warn_unreachable, true))
 
     {initial_state, reducers} = State.parse_schema(graph.schema)
 
     %Compiled{
       name: Keyword.get(opts, :name),
       nodes: graph.nodes,
+      node_opts: graph.node_opts,
       edges: graph.edges,
       conditional_edges: graph.conditional_edges,
       initial_state: initial_state,
       reducers: reducers,
       checkpointer: Keyword.get(opts, :checkpointer),
+      store: opts |> Keyword.get(:store) |> LangEx.Store.normalize(),
       interrupt_before: Keyword.get(opts, :interrupt_before, []),
       interrupt_after: Keyword.get(opts, :interrupt_after, [])
     }
@@ -142,4 +202,138 @@ defmodule LangEx.Graph do
   defp assert_node_exists!(false, name, context) do
     raise ArgumentError, "#{context} #{inspect(name)} is not a defined node"
   end
+
+  defp validate_conditional_targets(%__MODULE__{} = graph) do
+    valid = known_targets(graph)
+
+    graph.conditional_edges
+    |> Enum.flat_map(&mapping_targets/1)
+    |> Enum.each(fn {source, target} ->
+      validate_node_exists!(target, valid, "conditional edge target from #{inspect(source)}")
+    end)
+
+    :ok
+  end
+
+  defp mapping_targets({_source, {_routing_fn, nil}}), do: []
+
+  defp mapping_targets({source, {_routing_fn, mapping}}) when is_map(mapping) do
+    mapping
+    |> Map.values()
+    |> List.flatten()
+    |> Enum.map(&{source, &1})
+  end
+
+  # Reachability over *declared* edges is best-effort: mapping-less
+  # conditional edges are opaque (stay silent), and nodes reached only
+  # via Command goto look unreachable — silence those with
+  # `compile(warn_unreachable: false)`.
+  defp warn_on_unreachable_nodes(_graph, false), do: :ok
+
+  defp warn_on_unreachable_nodes(%__MODULE__{} = graph, true) do
+    graph.conditional_edges
+    |> Enum.any?(&match?({_source, {_fn, nil}}, &1))
+    |> report_unreachable(graph)
+  end
+
+  defp report_unreachable(true, _graph), do: :ok
+
+  defp report_unreachable(false, graph) do
+    graph.nodes
+    |> Map.keys()
+    |> MapSet.new()
+    |> MapSet.difference(reachable_from_start(graph))
+    |> MapSet.to_list()
+    |> emit_unreachable_warning()
+  end
+
+  defp emit_unreachable_warning([]), do: :ok
+
+  defp emit_unreachable_warning(unreachable) do
+    IO.warn(
+      "graph node(s) not reachable via declared edges: #{inspect(Enum.sort(unreachable))} — " <>
+        "pass `warn_unreachable: false` to compile/2 if they are Command goto targets"
+    )
+
+    :ok
+  end
+
+  defp reachable_from_start(graph), do: traverse(graph, [:__start__], MapSet.new())
+
+  defp traverse(_graph, [], visited), do: visited
+
+  defp traverse(graph, [node | rest], visited) do
+    node
+    |> targets_of(graph)
+    |> Enum.reject(&(&1 in [:__end__] or MapSet.member?(visited, &1)))
+    |> then(&traverse(graph, &1 ++ rest, MapSet.union(visited, MapSet.new(&1))))
+  end
+
+  defp targets_of(node, graph) do
+    static = Map.get(graph.edges, node, [])
+
+    conditional =
+      graph.conditional_edges
+      |> Map.take([node])
+      |> Enum.flat_map(&mapping_targets/1)
+      |> Enum.map(&elem(&1, 1))
+
+    List.flatten(static ++ conditional)
+  end
+
+  defp known_targets(graph) do
+    graph.nodes
+    |> Map.keys()
+    |> MapSet.new()
+    |> MapSet.put(:__start__)
+    |> MapSet.put(:__end__)
+  end
+
+  @doc """
+  Renders the graph as a Mermaid flowchart.
+
+  Solid arrows are static edges; dashed arrows are conditional edges,
+  labelled with the routing value when a mapping is given. Accepts a
+  builder or a compiled graph.
+
+      graph |> Graph.to_mermaid() |> IO.puts()
+  """
+  @spec to_mermaid(t() | Compiled.t()) :: String.t()
+  def to_mermaid(%Compiled{} = compiled) do
+    to_mermaid(%__MODULE__{
+      nodes: compiled.nodes,
+      edges: compiled.edges,
+      conditional_edges: compiled.conditional_edges
+    })
+  end
+
+  def to_mermaid(%__MODULE__{} = graph) do
+    [
+      "flowchart TD",
+      "  __start__([start])",
+      "  __end__([finish])",
+      Enum.map(Map.keys(graph.nodes), &"  #{&1}[#{&1}]"),
+      Enum.flat_map(graph.edges, &static_edge_lines/1),
+      Enum.flat_map(graph.conditional_edges, &conditional_edge_lines/1)
+    ]
+    |> List.flatten()
+    |> Enum.join("\n")
+    |> Kernel.<>("\n")
+  end
+
+  defp static_edge_lines({from, targets}), do: Enum.map(targets, &"  #{from} --> #{&1}")
+
+  defp conditional_edge_lines({source, {_routing_fn, nil}}),
+    do: ["  %% #{source}: dynamic routing (no mapping)"]
+
+  defp conditional_edge_lines({source, {_routing_fn, mapping}}) do
+    Enum.flat_map(mapping, fn {label, targets} ->
+      targets
+      |> List.wrap()
+      |> Enum.map(&"  #{source} -.->|#{format_label(label)}| #{&1}")
+    end)
+  end
+
+  defp format_label(label) when is_binary(label), do: label
+  defp format_label(label), do: inspect(label)
 end

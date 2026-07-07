@@ -31,6 +31,8 @@ defmodule LangEx.LLM.Anthropic do
 
   - `:thinking` — enable adaptive thinking (`true` / `false`, default `false`)
   - `:on_thinking` — `fn(accumulated_thinking_text) -> any()` callback
+  - `:on_token` — `fn(text_delta) -> any()` callback invoked per streamed
+    content token (used by graph streaming's `:messages` mode)
   - `:prompt_caching` — enable prompt caching headers (default `true`)
   - `:stream` — use SSE streaming (default `true`); set `false` for simple requests
   - `:max_tokens` — override max tokens (defaults: 64K for sonnet, 128K otherwise)
@@ -64,7 +66,7 @@ defmodule LangEx.LLM.Anthropic do
     model = Config.model(:anthropic, opts)
     tools = Keyword.get(opts, :tools, [])
     thinking? = Keyword.get(opts, :thinking, false)
-    on_thinking = Keyword.get(opts, :on_thinking)
+    callbacks = SSE.callbacks(Keyword.get(opts, :on_thinking), Keyword.get(opts, :on_token))
     caching? = Keyword.get(opts, :prompt_caching, true)
     stream? = Keyword.get(opts, :stream, true)
 
@@ -81,7 +83,7 @@ defmodule LangEx.LLM.Anthropic do
       |> put_system(system_prompt, caching?)
       |> put_tools(tools, caching?)
 
-    send_request(body, api_key, on_thinking, caching?)
+    send_request(body, api_key, callbacks, caching?)
   end
 
   defp put_stream(body, true), do: Map.put(body, :stream, true)
@@ -90,14 +92,14 @@ defmodule LangEx.LLM.Anthropic do
   defp put_thinking(body, true, _opts), do: Map.put(body, :thinking, %{type: "adaptive"})
   defp put_thinking(body, false, opts), do: put_present(body, :temperature, opts[:temperature])
 
-  defp send_request(body, api_key, on_thinking, caching?) do
+  defp send_request(body, api_key, callbacks, caching?) do
     [
       json: body,
       headers: build_headers(api_key, caching?),
       receive_timeout: 300_000,
       pool_timeout: 60_000
     ]
-    |> dispatch_request(on_thinking, body[:stream])
+    |> dispatch_request(callbacks, body[:stream])
   end
 
   defp build_headers(api_key, caching?) do
@@ -109,26 +111,27 @@ defmodule LangEx.LLM.Anthropic do
     |> add_caching_header(caching?)
   end
 
-  defp dispatch_request(req_opts, on_thinking, _stream? = true)
-       when is_function(on_thinking, 1),
-       do: stream_request(req_opts, on_thinking)
+  defp dispatch_request(req_opts, callbacks, _stream? = true)
+       when is_function(:erlang.map_get(:on_thinking, callbacks), 1)
+       when is_function(:erlang.map_get(:on_token, callbacks), 1),
+       do: stream_request(req_opts, callbacks)
 
-  defp dispatch_request(req_opts, on_thinking, _stream?),
-    do: batch_request(req_opts, on_thinking)
+  defp dispatch_request(req_opts, callbacks, _stream?),
+    do: batch_request(req_opts, callbacks)
 
   defp add_caching_header(headers, true),
     do: headers ++ [{"anthropic-beta", @prompt_caching_beta}]
 
   defp add_caching_header(headers, false), do: headers
 
-  defp stream_request(req_opts, on_thinking) do
+  defp stream_request(req_opts, callbacks) do
     pkey = {__MODULE__, make_ref()}
     Process.put(pkey, SSE.initial_state())
 
     callback = fn {:data, chunk}, {req, resp} ->
       pkey
       |> Process.get()
-      |> SSE.process_chunk(on_thinking, chunk)
+      |> SSE.process_chunk(callbacks, chunk)
       |> then(&Process.put(pkey, &1))
 
       {:cont, {req, resp}}
@@ -138,58 +141,58 @@ defmodule LangEx.LLM.Anthropic do
       req_opts
       |> Keyword.put(:into, callback)
       |> then(&Req.post("#{@base_url}/messages", &1))
-      |> handle_streaming_response(pkey, on_thinking)
+      |> handle_streaming_response(pkey, callbacks)
 
     Process.delete(pkey)
     result
   end
 
-  defp handle_streaming_response({:ok, %{status: 200, body: ""}}, pkey, _on_thinking),
+  defp handle_streaming_response({:ok, %{status: 200, body: ""}}, pkey, _callbacks),
     do: SSE.build_message(Process.get(pkey))
 
   defp handle_streaming_response(
          {:ok, %{status: 200, body: %Req.Response.Async{}}},
          pkey,
-         _on_thinking
+         _callbacks
        ),
        do: SSE.build_message(Process.get(pkey))
 
-  defp handle_streaming_response({:ok, %{status: 200, body: raw}}, _pkey, on_thinking)
+  defp handle_streaming_response({:ok, %{status: 200, body: raw}}, _pkey, callbacks)
        when is_binary(raw) and byte_size(raw) > 0,
-       do: SSE.parse_response(raw, on_thinking)
+       do: SSE.parse_response(raw, callbacks)
 
   defp handle_streaming_response(
          {:ok, %{status: 200, body: %{"content" => _} = json_resp}},
          _pkey,
-         _on_thinking
+         _callbacks
        ),
        do: parse_json_response(json_resp)
 
-  defp handle_streaming_response({:ok, %{status: status, body: resp_body}}, _pkey, _on_thinking),
+  defp handle_streaming_response({:ok, %{status: status, body: resp_body}}, _pkey, _callbacks),
     do: {:error, {status, resp_body}}
 
-  defp handle_streaming_response({:error, reason}, _pkey, _on_thinking),
+  defp handle_streaming_response({:error, reason}, _pkey, _callbacks),
     do: {:error, reason}
 
-  defp batch_request(req_opts, on_thinking) do
+  defp batch_request(req_opts, callbacks) do
     "#{@base_url}/messages"
     |> Req.post(req_opts)
-    |> handle_batch_response(on_thinking)
+    |> handle_batch_response(callbacks)
   end
 
-  defp handle_batch_response({:ok, %{status: 200, body: raw}}, on_thinking) when is_binary(raw),
-    do: SSE.parse_response(raw, on_thinking)
+  defp handle_batch_response({:ok, %{status: 200, body: raw}}, callbacks) when is_binary(raw),
+    do: SSE.parse_response(raw, callbacks)
 
   defp handle_batch_response(
          {:ok, %{status: 200, body: %{"content" => _} = json_resp}},
-         _on_thinking
+         _callbacks
        ),
        do: parse_json_response(json_resp)
 
-  defp handle_batch_response({:ok, %{status: status, body: resp_body}}, _on_thinking),
+  defp handle_batch_response({:ok, %{status: status, body: resp_body}}, _callbacks),
     do: {:error, {status, resp_body}}
 
-  defp handle_batch_response({:error, reason}, _on_thinking),
+  defp handle_batch_response({:error, reason}, _callbacks),
     do: {:error, reason}
 
   defp parse_json_response(%{"content" => content, "usage" => usage}) when is_list(content) do
