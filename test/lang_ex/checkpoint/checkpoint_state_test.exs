@@ -137,6 +137,57 @@ defmodule LangEx.Checkpoint.CheckpointStateTest do
     end
   end
 
+  describe "durability modes" do
+    test ":async still persists checkpoints (eventually)" do
+      graph =
+        Graph.new(value: 0)
+        |> Graph.add_node(:work, fn state -> %{value: state.value + 1} end)
+        |> Graph.add_edge(:__start__, :work)
+        |> Graph.add_edge(:work, :__end__)
+        |> Graph.compile(checkpointer: Mock)
+
+      {:ok, %{value: 1}} =
+        LangEx.invoke(graph, %{value: 0},
+          config: [thread_id: "durability-async"],
+          durability: :async
+        )
+
+      assert eventually(fn ->
+               match?({:ok, _}, LangEx.get_state(graph, config: [thread_id: "durability-async"]))
+             end)
+    end
+
+    test ":exit skips step checkpoints but keeps interrupt checkpoints" do
+      graph =
+        Graph.new(approved: nil)
+        |> Graph.add_node(:prepare, fn _state -> %{} end)
+        |> Graph.add_node(:gate, fn _state ->
+          %{approved: LangEx.Interrupt.interrupt("ok?")}
+        end)
+        |> Graph.add_edge(:__start__, :prepare)
+        |> Graph.add_edge(:prepare, :gate)
+        |> Graph.add_edge(:gate, :__end__)
+        |> Graph.compile(checkpointer: Mock)
+
+      config = [thread_id: "durability-exit"]
+
+      {:interrupt, "ok?", _} = LangEx.invoke(graph, %{}, config: config, durability: :exit)
+
+      # Only the interrupt checkpoint exists — no per-step checkpoints.
+      assert [%{pending_interrupts: [_]}] = LangEx.get_state_history(graph, config: config)
+
+      {:ok, %{approved: true}} =
+        LangEx.invoke(graph, %LangEx.Command{resume: true}, config: config, durability: :exit)
+    end
+  end
+
+  defp eventually(fun, attempts \\ 50)
+  defp eventually(_fun, 0), do: false
+
+  defp eventually(fun, attempts) do
+    fun.() || (Process.sleep(10) && eventually(fun, attempts - 1))
+  end
+
   defp crash_first_attempt(true), do: raise("transient failure")
   defp crash_first_attempt(false), do: %{trail: [:flaky]}
 end

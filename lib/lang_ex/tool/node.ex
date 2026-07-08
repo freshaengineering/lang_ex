@@ -98,10 +98,12 @@ defmodule LangEx.Tool.Node do
     tools_by_name = Map.new(tools, fn %Tool{name: name} = tool -> {name, tool} end)
 
     fn state ->
+      store = LangEx.Store.attached()
+
       state
       |> Map.fetch!(messages_key)
       |> extract_tool_calls()
-      |> then(&execute_all(&1, tools_by_name, state, handle_errors, wrapper, exec_opts))
+      |> then(&execute_all(&1, tools_by_name, state, store, handle_errors, wrapper, exec_opts))
       |> then(&%{messages_key => &1})
     end
   end
@@ -138,11 +140,11 @@ defmodule LangEx.Tool.Node do
   defp last_tool_calls(%Message.AI{tool_calls: calls}) when calls != [], do: calls
   defp last_tool_calls(_), do: []
 
-  defp execute_all(tool_calls, tools_by_name, state, handle_errors, wrapper, exec_opts) do
+  defp execute_all(tool_calls, tools_by_name, state, store, handle_errors, wrapper, exec_opts) do
     LangEx.TaskSupervisor
     |> Task.Supervisor.async_stream_nolink(
       tool_calls,
-      &run_one(&1, tools_by_name, state, handle_errors, wrapper),
+      &run_one(&1, tools_by_name, state, store, handle_errors, wrapper),
       max_concurrency: exec_opts.max_concurrency,
       timeout: exec_opts.timeout,
       on_timeout: :kill_task,
@@ -159,12 +161,14 @@ defmodule LangEx.Tool.Node do
   defp handle_task_outcome({:exit, :timeout}), do: raise("Tool execution timed out")
   defp handle_task_outcome({:exit, reason}), do: exit(reason)
 
-  defp run_one(call, tools_by_name, state, handle_errors, wrapper) do
+  defp run_one(call, tools_by_name, state, store, handle_errors, wrapper) do
+    Process.put(:lang_ex_store, store)
+
     request = %ToolCallRequest{
       tool_call: call,
       tool: Map.get(tools_by_name, call.name),
       state: state,
-      store: nil
+      store: store
     }
 
     dispatch_tool_call(
@@ -201,12 +205,12 @@ defmodule LangEx.Tool.Node do
     do: invalid_tool_message(call, tools_by_name)
 
   defp execute_tool(
-         %ToolCallRequest{tool: tool, tool_call: call, state: state},
+         %ToolCallRequest{tool: tool, tool_call: call, state: state, store: store},
          _tools_by_name,
          handle_errors
        ) do
     tool.function
-    |> call_function(call.args, state, call.id)
+    |> call_function(call.args, state, store, call.id)
     |> encode_result()
     |> Message.tool(call.id)
   rescue
@@ -218,16 +222,16 @@ defmodule LangEx.Tool.Node do
   defp propagate_error(false, e, stacktrace), do: reraise(e, stacktrace)
   defp propagate_error(_, _e, _stacktrace), do: :ok
 
-  defp call_function(fun, args, state, tool_call_id) do
+  defp call_function(fun, args, state, store, tool_call_id) do
     fun
     |> Function.info(:arity)
-    |> dispatch_function(fun, args, state, tool_call_id)
+    |> dispatch_function(fun, args, state, store, tool_call_id)
   end
 
-  defp dispatch_function({:arity, 1}, fun, args, _state, _tool_call_id), do: fun.(args)
+  defp dispatch_function({:arity, 1}, fun, args, _state, _store, _tool_call_id), do: fun.(args)
 
-  defp dispatch_function({:arity, 2}, fun, args, state, tool_call_id),
-    do: fun.(args, %{state: state, store: nil, tool_call_id: tool_call_id})
+  defp dispatch_function({:arity, 2}, fun, args, state, store, tool_call_id),
+    do: fun.(args, %{state: state, store: store, tool_call_id: tool_call_id})
 
   defp format_error(exception, call, true) do
     @tool_error_template

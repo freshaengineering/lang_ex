@@ -1,3 +1,72 @@
+defmodule LangEx.Graph.ValidationTest do
+  use ExUnit.Case, async: true
+
+  import ExUnit.CaptureIO
+
+  alias LangEx.Graph
+
+  describe "compile-time validation" do
+    test "conditional edge mapping targets must be defined nodes" do
+      assert_raise ArgumentError, ~r/conditional edge target from :router/, fn ->
+        Graph.new(intent: nil)
+        |> Graph.add_node(:router, fn state -> state end)
+        |> Graph.add_edge(:__start__, :router)
+        |> Graph.add_conditional_edges(:router, & &1.intent, %{"qa" => :missing_node})
+        |> Graph.compile()
+      end
+    end
+
+    test "unreachable nodes produce a compile warning" do
+      warning =
+        capture_io(:stderr, fn ->
+          Graph.new(value: 0)
+          |> Graph.add_node(:used, fn state -> state end)
+          |> Graph.add_node(:orphan, fn state -> state end)
+          |> Graph.add_edge(:__start__, :used)
+          |> Graph.add_edge(:used, :__end__)
+          |> Graph.compile()
+        end)
+
+      assert warning =~ "not reachable via declared edges: [:orphan]"
+    end
+
+    test "no warning when a mapping-less conditional edge exists" do
+      warning =
+        capture_io(:stderr, fn ->
+          Graph.new(value: 0)
+          |> Graph.add_node(:router, fn _state -> :dynamic_target end)
+          |> Graph.add_node(:dynamic_target, fn state -> state end)
+          |> Graph.add_edge(:__start__, :router)
+          |> Graph.add_conditional_edges(:router, fn _state -> :dynamic_target end)
+          |> Graph.add_edge(:dynamic_target, :__end__)
+          |> Graph.compile()
+        end)
+
+      assert warning == ""
+    end
+  end
+
+  describe "to_mermaid/1" do
+    test "renders nodes, static edges, and labelled conditional edges" do
+      mermaid =
+        Graph.new(intent: nil)
+        |> Graph.add_node(:router, fn state -> state end)
+        |> Graph.add_node(:qa, fn state -> state end)
+        |> Graph.add_edge(:__start__, :router)
+        |> Graph.add_conditional_edges(:router, & &1.intent, %{"qa" => :qa, "done" => :__end__})
+        |> Graph.add_edge(:qa, :__end__)
+        |> Graph.compile()
+        |> Graph.to_mermaid()
+
+      assert mermaid =~ "flowchart TD"
+      assert mermaid =~ "__start__ --> router"
+      assert mermaid =~ "qa --> __end__"
+      assert mermaid =~ "router -.->|qa| qa"
+      assert mermaid =~ "router -.->|done| __end__"
+    end
+  end
+end
+
 defmodule LangEx.GraphTest do
   use ExUnit.Case, async: true
 

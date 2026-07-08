@@ -21,6 +21,9 @@ defmodule LangEx.LLM.ChatModel do
   - `:usage_key` - state key accumulating token usage (default: `:llm_usage`);
     only written when the key exists in the graph state schema
   - `:tools` - list of `%LangEx.Tool{}` definitions for function calling
+  - `:resilient` - route calls through `LangEx.LLM.Resilient` for retries
+    with backoff. `true` for defaults, or a keyword list of `Resilient`
+    options (`:max_retries`, `:retry_base_ms`, `:fallback`, ...)
   - All other opts forwarded to `provider.chat/2` (`:api_key`, `:temperature`, etc.)
 
   Either `:provider` or `:model` must be given. When `:model` is a string and
@@ -53,6 +56,7 @@ defmodule LangEx.LLM.ChatModel do
     {provider, llm_opts} = resolve_provider(opts)
     {messages_key, llm_opts} = Keyword.pop(llm_opts, :messages_key, :messages)
     {usage_key, llm_opts} = Keyword.pop(llm_opts, :usage_key, :llm_usage)
+    {resilient, llm_opts} = Keyword.pop(llm_opts, :resilient)
     model = Keyword.get(llm_opts, :model)
 
     fn state ->
@@ -61,13 +65,49 @@ defmodule LangEx.LLM.ChatModel do
 
       {:ok, ai_message, usage} =
         Runs.span([:lang_ex, :llm, :chat], metadata, fn ->
-          result = call_provider(provider, messages, llm_opts)
+          result = dispatch_call(resilient, provider, messages, attach_delta_callback(llm_opts))
           {result, chat_metadata(metadata, result)}
         end)
 
       %{messages_key => [ai_message]}
       |> with_usage(state, usage_key, usage)
     end
+  end
+
+  defp dispatch_call(nil, provider, messages, llm_opts),
+    do: call_provider(provider, messages, llm_opts)
+
+  defp dispatch_call(true, provider, messages, llm_opts),
+    do: dispatch_call([], provider, messages, llm_opts)
+
+  defp dispatch_call(resilient_opts, provider, messages, llm_opts)
+       when is_list(resilient_opts) do
+    provider
+    |> LangEx.LLM.Resilient.chat_with_usage(messages, resilient_opts ++ llm_opts)
+    |> ensure_usage()
+  end
+
+  defp ensure_usage({:ok, ai, usage}), do: {:ok, ai, usage}
+  defp ensure_usage({:ok, ai}), do: {:ok, ai, %{input_tokens: 0, output_tokens: 0}}
+  defp ensure_usage({:error, _} = err), do: err
+
+  # When the graph is being streamed, forward token deltas from streaming
+  # adapters as {:message_delta, ...} events (consumed via the :messages
+  # stream mode). An explicit user :on_token callback takes precedence.
+  defp attach_delta_callback(llm_opts) do
+    :lang_ex_stream_emit
+    |> Process.get()
+    |> add_delta_callback(llm_opts)
+  end
+
+  defp add_delta_callback(nil, llm_opts), do: llm_opts
+
+  defp add_delta_callback(_pid, llm_opts) do
+    node = Process.get(:lang_ex_current_node)
+
+    Keyword.put_new(llm_opts, :on_token, fn text ->
+      LangEx.Graph.Stream.notify({:message_delta, %{node: node, kind: :content, text: text}})
+    end)
   end
 
   @doc """

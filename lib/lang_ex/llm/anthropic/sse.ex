@@ -7,18 +7,21 @@ defmodule LangEx.LLM.Anthropic.SSE do
     %{text: %{}, thinking: %{}, tools: %{}, tool_json: %{}, usage: %{}, line_buffer: ""}
   end
 
-  def process_chunk(state, on_thinking, chunk) do
+  # Callbacks: %{on_thinking: fn accumulated -> _ | nil, on_token: fn delta -> _ | nil}
+  def callbacks(on_thinking, on_token), do: %{on_thinking: on_thinking, on_token: on_token}
+
+  def process_chunk(state, callbacks, chunk) do
     {lines, remainder} =
       (state.line_buffer <> chunk)
       |> split_buffer()
 
-    Enum.reduce(lines, %{state | line_buffer: remainder}, &reduce_line(&1, &2, on_thinking))
+    Enum.reduce(lines, %{state | line_buffer: remainder}, &reduce_line(&1, &2, callbacks))
   end
 
-  def parse_response(raw, on_thinking) do
+  def parse_response(raw, callbacks) do
     raw
     |> String.split("\n")
-    |> Enum.reduce(initial_state(), &reduce_line(&1, &2, on_thinking))
+    |> Enum.reduce(initial_state(), &reduce_line(&1, &2, callbacks))
     |> build_message()
   end
 
@@ -47,21 +50,22 @@ defmodule LangEx.LLM.Anthropic.SSE do
   defp split_lines([single]), do: {[], single}
   defp split_lines(parts), do: {Enum.slice(parts, 0..-2//1), List.last(parts)}
 
-  defp reduce_line("data: " <> json_str, acc, on_thinking) do
+  defp reduce_line("data: " <> json_str, acc, callbacks) do
     json_str
     |> Jason.decode()
-    |> apply_event(acc, on_thinking)
+    |> apply_event(acc, callbacks)
   end
 
-  defp reduce_line(_line, acc, _on_thinking), do: acc
+  defp reduce_line(_line, acc, _callbacks), do: acc
 
-  defp apply_event({:ok, event}, acc, on_thinking) do
+  defp apply_event({:ok, event}, acc, callbacks) do
     updated = handle_event(event, acc)
-    emit_thinking(event, updated, on_thinking)
+    emit_thinking(event, updated, callbacks.on_thinking)
+    emit_token(event, callbacks.on_token)
     updated
   end
 
-  defp apply_event(_, acc, _on_thinking), do: acc
+  defp apply_event(_, acc, _callbacks), do: acc
 
   defp emit_thinking(
          %{"type" => "content_block_delta", "delta" => %{"type" => "thinking_delta"}},
@@ -73,6 +77,15 @@ defmodule LangEx.LLM.Anthropic.SSE do
   end
 
   defp emit_thinking(_, _, _), do: :ok
+
+  defp emit_token(
+         %{"type" => "content_block_delta", "delta" => %{"type" => "text_delta", "text" => text}},
+         on_token
+       )
+       when is_function(on_token, 1),
+       do: on_token.(text)
+
+  defp emit_token(_, _), do: :ok
 
   defp handle_event(
          %{"type" => "content_block_start", "index" => idx, "content_block" => block},

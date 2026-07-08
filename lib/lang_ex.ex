@@ -47,4 +47,8 @@ defmodule LangEx do
   @spec update_state(Compiled.t(), map(), keyword()) ::
           {:ok, LangEx.Checkpoint.t()} | {:error, term()}
   defdelegate update_state(graph, update, opts), to: Compiled
+
+  @doc "Deletes every checkpoint for the thread in the config."
+  @spec delete_thread(Compiled.t(), keyword()) :: :ok | {:error, term()}
+  defdelegate delete_thread(graph, opts), to: Compiled
 end

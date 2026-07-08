@@ -38,14 +38,16 @@ if Code.ensure_loaded?(Ecto) do
         step: cp.step,
         metadata: Serializer.encode(cp.metadata || %{}),
         pending_interrupts: encode_interrupts(cp.pending_interrupts),
-        created_at: cp.created_at
+        created_at: cp.created_at,
+        version: cp.version
       }
 
       %Schema{}
       |> Ecto.Changeset.cast(attrs, Map.keys(attrs))
       |> repo.insert(
         on_conflict:
-          {:replace, [:parent_id, :state, :next_nodes, :step, :metadata, :pending_interrupts]},
+          {:replace,
+           [:parent_id, :state, :next_nodes, :step, :metadata, :pending_interrupts, :version]},
         conflict_target: [:thread_id, :checkpoint_id]
       )
       |> handle_insert()
@@ -79,6 +81,40 @@ if Code.ensure_loaded?(Ecto) do
       |> Enum.map(&schema_to_checkpoint/1)
     end
 
+    @impl true
+    def delete_thread(config) do
+      repo = Keyword.fetch!(config, :repo)
+      thread_id = Keyword.fetch!(config, :thread_id)
+
+      Schema
+      |> where([c], c.thread_id == ^thread_id)
+      |> repo.delete_all()
+
+      :ok
+    end
+
+    @doc """
+    Deletes checkpoints created before the given `DateTime`, across all
+    threads. Returns `{:ok, deleted_count}`. Run periodically (e.g. from
+    a scheduled job) to enforce a retention window:
+
+        LangEx.Checkpointer.Postgres.prune([repo: MyApp.Repo],
+          older_than: DateTime.add(DateTime.utc_now(), -30, :day)
+        )
+    """
+    @spec prune(keyword(), keyword()) :: {:ok, non_neg_integer()}
+    def prune(config, opts) do
+      repo = Keyword.fetch!(config, :repo)
+      older_than = Keyword.fetch!(opts, :older_than)
+
+      {count, _} =
+        Schema
+        |> where([c], c.created_at < ^older_than)
+        |> repo.delete_all()
+
+      {:ok, count}
+    end
+
     defp scope_checkpoint_id(query, nil), do: query
 
     defp scope_checkpoint_id(query, checkpoint_id),
@@ -100,7 +136,8 @@ if Code.ensure_loaded?(Ecto) do
         step: row.step,
         metadata: Serializer.decode(row.metadata || %{}),
         pending_interrupts: decode_interrupts(row.pending_interrupts),
-        created_at: row.created_at
+        created_at: row.created_at,
+        version: row.version || 1
       }
     end
 

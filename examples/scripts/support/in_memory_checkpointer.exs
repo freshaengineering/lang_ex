@@ -38,6 +38,12 @@ defmodule Example.InMemoryCheckpointer do
     |> Enum.take(Keyword.get(opts, :limit, 100))
   end
 
+  @impl true
+  def delete_thread(config) do
+    thread_id = Keyword.fetch!(config, :thread_id)
+    Agent.update(__MODULE__, &Map.delete(&1, thread_id))
+  end
+
   defp checkpoints(config) do
     thread_id = Keyword.fetch!(config, :thread_id)
     Agent.get(__MODULE__, &Map.get(&1, thread_id, []))

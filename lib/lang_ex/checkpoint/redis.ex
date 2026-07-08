@@ -47,16 +47,33 @@ if Code.ensure_loaded?(Redix) do
       thread_id = Keyword.fetch!(config, :thread_id)
       limit = Keyword.get(opts, :limit, 100)
 
-      with {:ok, ids} when ids != [] <-
+      with {:ok, ids} <-
              Redix.command(conn, ["ZREVRANGE", thread_index_key(thread_id), "0", "#{limit - 1}"]),
-           keys = Enum.map(ids, &checkpoint_key(thread_id, &1)),
-           {:ok, values} <- Redix.command(conn, ["MGET" | keys]) do
+           {:ok, values} <- fetch_values(conn, thread_id, ids) do
         values
         |> Enum.reject(&is_nil/1)
         |> Enum.map(&deserialize/1)
-      else
-        _ -> []
       end
+    end
+
+    @impl true
+    def delete_thread(config) do
+      conn = config[:conn] || @default_conn
+      thread_id = Keyword.fetch!(config, :thread_id)
+      index_key = thread_index_key(thread_id)
+
+      with {:ok, ids} <- Redix.command(conn, ["ZRANGE", index_key, "0", "-1"]),
+           keys = Enum.map(ids, &checkpoint_key(thread_id, &1)),
+           {:ok, _} <- Redix.command(conn, ["DEL", index_key | keys]) do
+        :ok
+      end
+    end
+
+    defp fetch_values(_conn, _thread_id, []), do: {:ok, []}
+
+    defp fetch_values(conn, thread_id, ids) do
+      keys = Enum.map(ids, &checkpoint_key(thread_id, &1))
+      Redix.command(conn, ["MGET" | keys])
     end
 
     defp load_by_id(nil, config) do

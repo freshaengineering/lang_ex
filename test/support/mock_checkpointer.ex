@@ -47,6 +47,12 @@ defmodule LangEx.Checkpointer.Mock do
     Agent.get(__MODULE__, &Map.get(&1, thread_id, []))
   end
 
+  @impl true
+  def delete_thread(config) do
+    thread_id = Keyword.fetch!(config, :thread_id)
+    Agent.update(__MODULE__, &Map.delete(&1, thread_id))
+  end
+
   def clear do
     Agent.update(__MODULE__, fn _ -> %{} end)
   end

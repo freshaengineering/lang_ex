@@ -22,5 +22,8 @@ defmodule LangEx.Checkpointer do
   @callback load(config()) :: {:ok, Checkpoint.t()} | :none | {:error, term()}
 
   @doc "Lists checkpoints for a thread, most recent first."
-  @callback list(config(), keyword()) :: [Checkpoint.t()]
+  @callback list(config(), keyword()) :: [Checkpoint.t()] | {:error, term()}
+
+  @doc "Deletes every checkpoint belonging to the thread in the config."
+  @callback delete_thread(config()) :: :ok | {:error, term()}
 end

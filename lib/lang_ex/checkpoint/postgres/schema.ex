@@ -14,6 +14,7 @@ if Code.ensure_loaded?(Ecto) do
       field(:metadata, :map, default: %{})
       field(:pending_interrupts, {:array, :map})
       field(:created_at, :utc_datetime_usec)
+      field(:version, :integer, default: 1)
     end
   end
 end

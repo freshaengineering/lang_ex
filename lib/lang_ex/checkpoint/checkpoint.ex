@@ -6,6 +6,8 @@ defmodule LangEx.Checkpoint do
   enabling pause/resume, time-travel, and fault recovery.
   """
 
+  @format_version 1
+
   defstruct [
     :thread_id,
     :checkpoint_id,
@@ -15,7 +17,8 @@ defmodule LangEx.Checkpoint do
     :step,
     :metadata,
     :pending_interrupts,
-    :created_at
+    :created_at,
+    version: @format_version
   ]
 
   @type t :: %__MODULE__{
@@ -27,7 +30,8 @@ defmodule LangEx.Checkpoint do
           step: non_neg_integer(),
           metadata: map(),
           pending_interrupts: [map()] | nil,
-          created_at: DateTime.t()
+          created_at: DateTime.t(),
+          version: pos_integer()
         }
 
   @doc "Builds a new checkpoint with an auto-generated ID and timestamp."
@@ -36,11 +40,15 @@ defmodule LangEx.Checkpoint do
     struct!(
       __MODULE__,
       Keyword.merge(
-        [checkpoint_id: generate_id(), created_at: DateTime.utc_now()],
+        [checkpoint_id: generate_id(), created_at: DateTime.utc_now(), version: @format_version],
         attrs
       )
     )
   end
+
+  @doc "Current checkpoint format version, persisted with every checkpoint."
+  @spec format_version() :: pos_integer()
+  def format_version, do: @format_version
 
   defp generate_id do
     :crypto.strong_rand_bytes(16) |> Base.url_encode64(padding: false)
