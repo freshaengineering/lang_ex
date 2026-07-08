@@ -60,6 +60,8 @@ defmodule LangEx.MixProject do
       {:redix, "~> 1.5", optional: true},
       {:postgrex, "~> 0.19", optional: true},
       {:ecto_sql, "~> 3.12", optional: true},
+      {:opentelemetry_api, "~> 1.2", optional: true},
+      {:opentelemetry_telemetry, "~> 1.1", optional: true},
       {:ex_doc, "~> 0.35", only: :dev, runtime: false},
       {:mimic, "~> 1.10", only: :test}
     ]

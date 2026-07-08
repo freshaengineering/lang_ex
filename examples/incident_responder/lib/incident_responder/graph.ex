@@ -270,36 +270,34 @@ defmodule IncidentResponder.Graph do
     end
   end
 
-  defp chat_with_retry(messages, opts, attempt \\ 0) do
-    case LangEx.LLM.Anthropic.chat(messages, opts) do
-      {:ok, ai} ->
-        ai
+  # Retries, backoff, and the fallback message are handled by
+  # LangEx.LLM.Resilient — no hand-rolled retry loop needed.
+  defp chat_with_retry(messages, opts) do
+    {:ok, ai} =
+      LangEx.LLM.Resilient.chat(
+        LangEx.LLM.Anthropic,
+        messages,
+        opts ++
+          [
+            max_retries: @max_retries,
+            retry_base_ms: @retry_base_ms,
+            on_retry: &log_retry/4,
+            fallback: &fallback_message/0
+          ]
+      )
 
-      {:error, {429, _body}} when attempt < @max_retries ->
-        wait = @retry_base_ms * (attempt + 1)
-        IO.puts("  [Rate limited — retrying in #{div(wait, 1000)}s...]")
-        Process.sleep(wait)
-        chat_with_retry(messages, opts, attempt + 1)
-
-      {:error, {status, _body}} when is_integer(status) and attempt < @max_retries ->
-        wait = @retry_base_ms * (attempt + 1)
-        IO.puts("  [API error #{status} — retrying in #{div(wait, 1000)}s...]")
-        Process.sleep(wait)
-        chat_with_retry(messages, opts, attempt + 1)
-
-      {:error, reason} ->
-        IO.puts("  [LLM error: #{format_error(reason)}]")
-        Message.ai("Sorry, I'm having a technical issue right now. Could you try again?")
-    end
+    ai
   end
 
-  defp format_error({status, %{"error" => %{"message" => msg}}}) when is_binary(msg) do
-    short = msg |> String.split("\n") |> hd() |> String.slice(0, 120)
-    "HTTP #{status}: #{short}"
+  defp log_retry(_attempt, _elapsed_ms, wait_ms, reason) do
+    IO.puts(
+      "  [#{LangEx.LLM.Resilient.format_error(reason)} — retrying in #{div(wait_ms, 1000)}s...]"
+    )
   end
 
-  defp format_error({status, _}), do: "HTTP #{status}"
-  defp format_error(other), do: inspect(other)
+  defp fallback_message do
+    Message.ai("Sorry, I'm having a technical issue right now. Could you try again?")
+  end
 
   @intent_patterns [
     {"incident", ~w(incident alert outage down)},

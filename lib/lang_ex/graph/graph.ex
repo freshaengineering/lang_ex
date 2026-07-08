@@ -20,7 +20,7 @@ defmodule LangEx.Graph do
   @type routing_fn :: (map() -> atom() | String.t())
 
   @type t :: %__MODULE__{
-          nodes: %{atom() => node_fn()},
+          nodes: %{atom() => node_fn() | Compiled.t()},
           edges: %{atom() => [atom()]},
           conditional_edges: %{atom() => {routing_fn(), map() | nil}},
           schema: keyword()
@@ -34,13 +34,17 @@ defmodule LangEx.Graph do
   @spec new(keyword()) :: t()
   def new(schema \\ []), do: %__MODULE__{schema: schema}
 
-  @doc "Adds a named node with its handler function."
+  @doc """
+  Adds a named node with its handler function.
+
+  A compiled graph can be used as a node (subgraph). The runtime
+  context, streaming events, and interrupts propagate through it, and
+  its checkpoints (when it has its own checkpointer) are namespaced
+  under `"{thread_id}/{node_name}"`.
+  """
   @spec add_node(t(), atom(), node_fn() | Compiled.t()) :: t()
   def add_node(%__MODULE__{} = graph, name, %Compiled{} = subgraph) when is_atom(name) do
-    add_node(graph, name, fn state ->
-      {:ok, result} = Compiled.invoke(subgraph, state)
-      result
-    end)
+    %{graph | nodes: Map.put(graph.nodes, name, subgraph)}
   end
 
   def add_node(%__MODULE__{} = graph, name, fun) when is_atom(name) and is_function(fun) do
@@ -82,7 +86,11 @@ defmodule LangEx.Graph do
   Compiles the graph builder into an executable `CompiledGraph`.
 
   Options:
+  - `:name` - stable graph identifier used in telemetry (`:graph_id`)
   - `:checkpointer` - module implementing `LangEx.Checkpointer` behaviour
+  - `:interrupt_before` - node names to pause at before execution
+    (static breakpoints; requires a checkpointer to resume)
+  - `:interrupt_after` - node names to pause at after execution
   """
   @spec compile(t(), keyword()) :: Compiled.t()
   def compile(%__MODULE__{} = graph, opts \\ []) do
@@ -92,12 +100,15 @@ defmodule LangEx.Graph do
     {initial_state, reducers} = State.parse_schema(graph.schema)
 
     %Compiled{
+      name: Keyword.get(opts, :name),
       nodes: graph.nodes,
       edges: graph.edges,
       conditional_edges: graph.conditional_edges,
       initial_state: initial_state,
       reducers: reducers,
-      checkpointer: Keyword.get(opts, :checkpointer)
+      checkpointer: Keyword.get(opts, :checkpointer),
+      interrupt_before: Keyword.get(opts, :interrupt_before, []),
+      interrupt_after: Keyword.get(opts, :interrupt_after, [])
     }
   end
 

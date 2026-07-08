@@ -33,4 +33,18 @@ defmodule LangEx do
 
   @doc "Returns a lazy stream of execution events from the compiled graph."
   defdelegate stream(graph, input, opts \\ []), to: LangEx.Graph.Stream
+
+  @doc "Returns the latest (or a specific) checkpoint for a thread."
+  @spec get_state(Compiled.t(), keyword()) ::
+          {:ok, LangEx.Checkpoint.t()} | :none | {:error, term()}
+  defdelegate get_state(graph, opts), to: Compiled
+
+  @doc "Returns the checkpoint history for a thread, most recent first."
+  @spec get_state_history(Compiled.t(), keyword()) :: [LangEx.Checkpoint.t()]
+  defdelegate get_state_history(graph, opts), to: Compiled
+
+  @doc "Applies an update to checkpointed state, saving a new forked checkpoint."
+  @spec update_state(Compiled.t(), map(), keyword()) ::
+          {:ok, LangEx.Checkpoint.t()} | {:error, term()}
+  defdelegate update_state(graph, update, opts), to: Compiled
 end

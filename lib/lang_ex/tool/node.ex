@@ -38,6 +38,9 @@ defmodule LangEx.Tool.Node do
       - `String.t()` — catch all, return this string as error content
       - `(Exception.t() -> String.t())` — custom handler
     * `:wrap_tool_call` — interceptor `fn(request, execute) -> result`
+    * `:max_concurrency` — cap on parallel tool tasks
+      (default `System.schedulers_online()`)
+    * `:timeout` — per-tool timeout in ms (default `30_000`)
   """
 
   alias LangEx.Message
@@ -79,11 +82,18 @@ defmodule LangEx.Tool.Node do
   executes each `tool_call` in parallel, and returns the results
   as `%Message.Tool{}` messages under the configured messages key.
   """
+  @default_timeout 30_000
+
   @spec node([Tool.t()], keyword()) :: (map() -> map())
   def node(tools, opts \\ []) do
     messages_key = Keyword.get(opts, :messages_key, :messages)
     handle_errors = Keyword.get(opts, :handle_tool_errors, true)
     wrapper = Keyword.get(opts, :wrap_tool_call)
+
+    exec_opts = %{
+      max_concurrency: Keyword.get(opts, :max_concurrency) || System.schedulers_online(),
+      timeout: Keyword.get(opts, :timeout, @default_timeout)
+    }
 
     tools_by_name = Map.new(tools, fn %Tool{name: name} = tool -> {name, tool} end)
 
@@ -91,7 +101,7 @@ defmodule LangEx.Tool.Node do
       state
       |> Map.fetch!(messages_key)
       |> extract_tool_calls()
-      |> then(&execute_all(&1, tools_by_name, state, handle_errors, wrapper))
+      |> then(&execute_all(&1, tools_by_name, state, handle_errors, wrapper, exec_opts))
       |> then(&%{messages_key => &1})
     end
   end
@@ -128,26 +138,17 @@ defmodule LangEx.Tool.Node do
   defp last_tool_calls(%Message.AI{tool_calls: calls}) when calls != [], do: calls
   defp last_tool_calls(_), do: []
 
-  defp execute_all(tool_calls, tools_by_name, state, handle_errors, wrapper) do
-    old_trap = Process.flag(:trap_exit, true)
-
-    try do
-      tool_calls
-      |> Enum.map(fn call ->
-        Task.async(fn -> run_one(call, tools_by_name, state, handle_errors, wrapper) end)
-      end)
-      |> Enum.map(&await_task_result/1)
-    after
-      Process.flag(:trap_exit, old_trap)
-      drain_exits()
-    end
-  end
-
-  defp await_task_result(task) do
-    task
-    |> Task.yield(30_000)
-    |> Kernel.||(Task.shutdown(task))
-    |> handle_task_outcome()
+  defp execute_all(tool_calls, tools_by_name, state, handle_errors, wrapper, exec_opts) do
+    LangEx.TaskSupervisor
+    |> Task.Supervisor.async_stream_nolink(
+      tool_calls,
+      &run_one(&1, tools_by_name, state, handle_errors, wrapper),
+      max_concurrency: exec_opts.max_concurrency,
+      timeout: exec_opts.timeout,
+      on_timeout: :kill_task,
+      ordered: true
+    )
+    |> Enum.map(&handle_task_outcome/1)
   end
 
   defp handle_task_outcome({:ok, result}), do: result
@@ -155,16 +156,8 @@ defmodule LangEx.Tool.Node do
   defp handle_task_outcome({:exit, {exception, stacktrace}}) when is_exception(exception),
     do: reraise(exception, stacktrace)
 
+  defp handle_task_outcome({:exit, :timeout}), do: raise("Tool execution timed out")
   defp handle_task_outcome({:exit, reason}), do: exit(reason)
-  defp handle_task_outcome(nil), do: raise("Tool execution timed out")
-
-  defp drain_exits do
-    receive do
-      {:EXIT, _, _} -> drain_exits()
-    after
-      0 -> :ok
-    end
-  end
 
   defp run_one(call, tools_by_name, state, handle_errors, wrapper) do
     request = %ToolCallRequest{

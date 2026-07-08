@@ -93,7 +93,7 @@ defmodule LangEx.LLM.ToolCallingTest do
     test "LLM → ToolNode → LLM loop produces final text response" do
       call_count = :counters.new(1, [:atomics])
 
-      stub(LangEx.LLM.OpenAI, :chat, fn messages, _opts ->
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn messages, _opts ->
         n = :counters.get(call_count, 1)
         :counters.add(call_count, 1, 1)
 
@@ -107,13 +107,13 @@ defmodule LangEx.LLM.ToolCallingTest do
               args: %{"location" => "London"}
             }
 
-            {:ok, Message.ai(nil, tool_calls: [call])}
+            {:ok, Message.ai(nil, tool_calls: [call]), %{input_tokens: 10, output_tokens: 5}}
 
           {_, true} ->
-            {:ok, Message.ai("It's 22 degrees in London.")}
+            {:ok, Message.ai("It's 22 degrees in London."), %{input_tokens: 10, output_tokens: 5}}
 
           _ ->
-            {:ok, Message.ai("Let me check...")}
+            {:ok, Message.ai("Let me check..."), %{input_tokens: 10, output_tokens: 5}}
         end
       end)
 

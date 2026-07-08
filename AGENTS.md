@@ -3,7 +3,7 @@
 Graph-based agent orchestration for Elixir. Builds stateful, multi-step LLM workflows using nodes, edges, conditional routing, state reducers, human-in-the-loop interrupts, and checkpointing. Inspired by LangGraph, built on BEAM primitives.
 
 - **Version**: 0.5.0, **Elixir**: ~> 1.16
-- **Deps**: `req`, `jason`, `telemetry`; optional `redix`, `postgrex`, `ecto_sql`
+- **Deps**: `req`, `jason`, `telemetry`; optional `redix`, `postgrex`, `ecto_sql`, `opentelemetry_api`, `opentelemetry_telemetry`
 - **Test**: ExUnit with `mimic` for mocking
 
 ## Commands
@@ -22,7 +22,7 @@ Always run `mix compile --warnings-as-errors` before considering work done. Zero
 ## Architecture
 
 ```
-LangEx (facade: invoke/3, stream/3)
+LangEx (facade: invoke/3, stream/3, get_state/2, get_state_history/2, update_state/3)
 ├── Graph                             # Builder: new, add_node, add_edge, compile
 │   ├── Graph.Compiled                # Compiled executable graph
 │   ├── Graph.Pregel                  # Super-step execution engine (internal)
@@ -59,7 +59,7 @@ LangEx (facade: invoke/3, stream/3)
 
 - **No GenServers for domain state** -- graph state lives in function arguments and checkpoints, not processes
 - **Pregel execution model** -- discrete super-steps with parallel node execution via `Task.Supervisor`
-- **Process dictionary for interrupts** -- `Process.put(:lang_ex_resume, value)` enables the interrupt/resume mechanism
+- **Process dictionary for interrupts** -- resume values are keyed by stable interrupt IDs (`"node:index"`) and delivered through the process dictionary per node execution
 - **Reducers for state merging** -- each state key can have a custom reducer `(old, new) -> merged`
 
 ## Module Hierarchy
@@ -73,9 +73,13 @@ lib/lang_ex/
 ├── interrupt.ex                     → LangEx.Interrupt
 ├── send.ex                          → LangEx.Send
 ├── telemetry.ex                     → LangEx.Telemetry
+├── telemetry/
+│   ├── runs.ex                      → LangEx.Telemetry.Runs (run-tree correlation)
+│   └── open_telemetry_bridge.ex     → LangEx.Telemetry.OpenTelemetryBridge (optional)
 ├── checkpoint/
 │   ├── checkpoint.ex                → LangEx.Checkpoint
 │   ├── checkpointer.ex             → LangEx.Checkpointer (behaviour)
+│   ├── serializer.ex                → LangEx.Checkpoint.Serializer
 │   ├── postgres.ex                  → LangEx.Checkpointer.Postgres
 │   └── redis.ex                     → LangEx.Checkpointer.Redis
 ├── graph/
@@ -152,7 +156,7 @@ Inside each module, order declarations as:
 ## Gotchas
 
 - **Optional deps are compile-time guarded**: `postgres.ex`, `redis.ex`, and `v1.ex` are wrapped in `if Code.ensure_loaded?(Ecto)` / `if Code.ensure_loaded?(Redix)`. New optional-dep modules must follow the same pattern.
-- **Process dictionary is used intentionally** in `Graph.Pregel` (interrupt/resume via `:lang_ex_resume`) and `LLM.Anthropic` (SSE streaming state). This is not a code smell here — it's the mechanism for cross-cutting concerns within a single execution.
+- **Process dictionary is used intentionally** in `Graph.Pregel` (interrupt/resume via `:lang_ex_current_node`, `:lang_ex_interrupt_counter`, `:lang_ex_resume_values`; run correlation via `:lang_ex_run_id`) and `LLM.Anthropic` (SSE streaming state). This is not a code smell here — it's the mechanism for cross-cutting concerns within a single execution.
 - **`Mimic.copy` in `test/test_helper.exs`** must be updated when adding new modules that tests need to mock.
 - **Ask before refactoring** beyond the immediate task. Style and structure changes require explicit approval.
 

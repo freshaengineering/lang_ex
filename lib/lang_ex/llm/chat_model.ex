@@ -8,6 +8,7 @@ defmodule LangEx.LLM.ChatModel do
   """
 
   alias LangEx.LLM.Registry
+  alias LangEx.Telemetry.Runs
 
   @doc """
   Returns a node function that calls an LLM provider.
@@ -17,6 +18,8 @@ defmodule LangEx.LLM.ChatModel do
   - `:provider` - module implementing `LangEx.LLM` (explicit)
   - `:model` - model string like `"gpt-4o"` or `"claude-sonnet-4-20250514"` (auto-resolves provider)
   - `:messages_key` - state key holding the message list (default: `:messages`)
+  - `:usage_key` - state key accumulating token usage (default: `:llm_usage`);
+    only written when the key exists in the graph state schema
   - `:tools` - list of `%LangEx.Tool{}` definitions for function calling
   - All other opts forwarded to `provider.chat/2` (`:api_key`, `:temperature`, etc.)
 
@@ -25,6 +28,18 @@ defmodule LangEx.LLM.ChatModel do
 
   Tool execution is handled by a separate `LangEx.Tool.Node` in the graph,
   not by the LLM node itself.
+
+  ## Token usage accounting
+
+  When the provider implements `chat_with_usage/2`, token counts are
+  attached to the `[:lang_ex, :llm, :chat, :stop]` telemetry event as
+  `:usage` metadata. To also accumulate usage in graph state, declare
+  the usage key in the schema with `merge_usage/2` as the reducer:
+
+      Graph.new(
+        messages: {[], &Message.add_messages/2},
+        llm_usage: {%{}, &ChatModel.merge_usage/2}
+      )
 
   ## Examples
 
@@ -37,24 +52,74 @@ defmodule LangEx.LLM.ChatModel do
   def node(opts) do
     {provider, llm_opts} = resolve_provider(opts)
     {messages_key, llm_opts} = Keyword.pop(llm_opts, :messages_key, :messages)
+    {usage_key, llm_opts} = Keyword.pop(llm_opts, :usage_key, :llm_usage)
     model = Keyword.get(llm_opts, :model)
 
     fn state ->
       messages = Map.fetch!(state, messages_key)
       metadata = %{provider: provider, model: model, message_count: length(messages)}
 
-      {:ok, ai_message} =
-        :telemetry.span([:lang_ex, :llm, :chat], metadata, fn ->
-          result = provider.chat(messages, llm_opts)
-          {result, Map.put(metadata, :status, chat_status(result))}
+      {:ok, ai_message, usage} =
+        Runs.span([:lang_ex, :llm, :chat], metadata, fn ->
+          result = call_provider(provider, messages, llm_opts)
+          {result, chat_metadata(metadata, result)}
         end)
 
       %{messages_key => [ai_message]}
+      |> with_usage(state, usage_key, usage)
     end
   end
 
-  defp chat_status({:ok, _}), do: :ok
-  defp chat_status({:error, _}), do: :error
+  @doc """
+  Reducer that accumulates token usage maps by summing numeric fields.
+
+  Use as the schema reducer for the usage key:
+
+      Graph.new(llm_usage: {%{}, &ChatModel.merge_usage/2})
+  """
+  @spec merge_usage(map() | nil, map()) :: map()
+  def merge_usage(nil, new), do: new
+
+  def merge_usage(current, new) when is_map(current) and is_map(new) do
+    Map.merge(current, new, &merge_usage_field/3)
+  end
+
+  defp merge_usage_field(_key, current, new) when is_number(current) and is_number(new),
+    do: current + new
+
+  defp merge_usage_field(_key, _current, new), do: new
+
+  defp call_provider(provider, messages, llm_opts) do
+    provider
+    |> function_exported?(:chat_with_usage, 2)
+    |> dispatch_chat(provider, messages, llm_opts)
+  end
+
+  defp dispatch_chat(true, provider, messages, llm_opts),
+    do: provider.chat_with_usage(messages, llm_opts)
+
+  defp dispatch_chat(false, provider, messages, llm_opts) do
+    messages
+    |> provider.chat(llm_opts)
+    |> zero_usage()
+  end
+
+  defp zero_usage({:ok, ai}), do: {:ok, ai, %{input_tokens: 0, output_tokens: 0}}
+  defp zero_usage({:error, _} = err), do: err
+
+  defp chat_metadata(metadata, {:ok, _ai, usage}),
+    do: metadata |> Map.put(:status, :ok) |> Map.put(:usage, usage)
+
+  defp chat_metadata(metadata, {:error, _reason}), do: Map.put(metadata, :status, :error)
+
+  defp with_usage(update, state, usage_key, usage) do
+    state
+    |> Map.has_key?(usage_key)
+    |> apply_usage(update, usage_key, usage)
+  end
+
+  defp apply_usage(true, update, usage_key, usage), do: Map.put(update, usage_key, usage)
+  defp apply_usage(false, update, _usage_key, _usage), do: update
 
   defp resolve_provider(opts) do
     opts

@@ -13,8 +13,13 @@ defmodule LangEx.Checkpointer do
   @doc "Persists a checkpoint."
   @callback save(config(), Checkpoint.t()) :: :ok | {:error, term()}
 
-  @doc "Loads the latest checkpoint for the given thread."
-  @callback load(config()) :: {:ok, Checkpoint.t()} | :none
+  @doc """
+  Loads the latest checkpoint for the given thread.
+
+  When the config includes a `:checkpoint_id`, that specific checkpoint
+  is loaded instead (time travel / forking).
+  """
+  @callback load(config()) :: {:ok, Checkpoint.t()} | :none | {:error, term()}
 
   @doc "Lists checkpoints for a thread, most recent first."
   @callback list(config(), keyword()) :: [Checkpoint.t()]

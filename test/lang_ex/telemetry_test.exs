@@ -119,8 +119,8 @@ defmodule LangEx.TelemetryTest do
 
   describe "LLM chat events" do
     test "emits chat start/stop with provider metadata" do
-      stub(LangEx.LLM.OpenAI, :chat, fn _messages, _opts ->
-        {:ok, Message.ai("Hello!")}
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, _opts ->
+        {:ok, Message.ai("Hello!"), %{input_tokens: 10, output_tokens: 5}}
       end)
 
       {:ok, _} =
@@ -138,7 +138,84 @@ defmodule LangEx.TelemetryTest do
                        %{provider: LangEx.LLM.OpenAI, model: "gpt-4o", message_count: 1}}
 
       assert_received {:telemetry, [:lang_ex, :llm, :chat, :stop], %{duration: _},
-                       %{provider: LangEx.LLM.OpenAI, model: "gpt-4o", status: :ok}}
+                       %{
+                         provider: LangEx.LLM.OpenAI,
+                         model: "gpt-4o",
+                         status: :ok,
+                         usage: %{input_tokens: 10, output_tokens: 5}
+                       }}
+    end
+  end
+
+  describe "run-tree correlation" do
+    test "spans carry run_id/parent_run_id forming a tree" do
+      {:ok, _} =
+        Graph.new(value: 0)
+        |> Graph.add_node(:inc, fn state -> %{value: state.value + 1} end)
+        |> Graph.add_edge(:__start__, :inc)
+        |> Graph.add_edge(:inc, :__end__)
+        |> Graph.compile()
+        |> LangEx.invoke(%{value: 0})
+
+      assert_received {:telemetry, [:lang_ex, :graph, :invoke, :start], _,
+                       %{run_id: invoke_id, parent_run_id: nil}}
+
+      assert_received {:telemetry, [:lang_ex, :graph, :step, :start], _,
+                       %{run_id: step_id, parent_run_id: ^invoke_id}}
+
+      assert_received {:telemetry, [:lang_ex, :node, :execute, :start], _,
+                       %{run_id: node_id, parent_run_id: ^step_id}}
+
+      assert is_binary(invoke_id) and is_binary(step_id) and is_binary(node_id)
+    end
+
+    test "parallel node spans inherit the step run_id across processes" do
+      {:ok, _} =
+        Graph.new(a_val: nil, b_val: nil)
+        |> Graph.add_node(:a, fn _state -> %{a_val: "a"} end)
+        |> Graph.add_node(:b, fn _state -> %{b_val: "b"} end)
+        |> Graph.add_edge(:__start__, :a)
+        |> Graph.add_edge(:__start__, :b)
+        |> Graph.add_edge(:a, :__end__)
+        |> Graph.add_edge(:b, :__end__)
+        |> Graph.compile()
+        |> LangEx.invoke(%{})
+
+      assert_received {:telemetry, [:lang_ex, :graph, :step, :start], _, %{run_id: step_id}}
+
+      assert_received {:telemetry, [:lang_ex, :node, :execute, :start], _,
+                       %{node: :a, parent_run_id: ^step_id}}
+
+      assert_received {:telemetry, [:lang_ex, :node, :execute, :start], _,
+                       %{node: :b, parent_run_id: ^step_id}}
+    end
+
+    test "compile-time name becomes the graph_id" do
+      {:ok, _} =
+        Graph.new(value: 0)
+        |> Graph.add_node(:inc, fn state -> %{value: state.value + 1} end)
+        |> Graph.add_edge(:__start__, :inc)
+        |> Graph.add_edge(:inc, :__end__)
+        |> Graph.compile(name: :counter_flow)
+        |> LangEx.invoke(%{value: 0})
+
+      assert_received {:telemetry, [:lang_ex, :graph, :invoke, :start], _,
+                       %{graph_id: :counter_flow}}
+    end
+  end
+
+  describe "OpenTelemetry bridge" do
+    test "attaches and handles a full run without a configured SDK" do
+      assert :ok = LangEx.Telemetry.OpenTelemetryBridge.attach()
+      on_exit(fn -> LangEx.Telemetry.OpenTelemetryBridge.detach() end)
+
+      assert {:ok, %{value: 2}} =
+               Graph.new(value: 0)
+               |> Graph.add_node(:double, fn state -> %{value: state.value * 2} end)
+               |> Graph.add_edge(:__start__, :double)
+               |> Graph.add_edge(:double, :__end__)
+               |> Graph.compile()
+               |> LangEx.invoke(%{value: 1})
     end
   end
 
