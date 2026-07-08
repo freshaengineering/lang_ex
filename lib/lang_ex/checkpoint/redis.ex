@@ -9,6 +9,12 @@ if Code.ensure_loaded?(Redix) do
 
     State is encoded with `LangEx.Checkpoint.Serializer`, so structs, atoms,
     and tuples survive the round-trip exactly.
+
+    Ordering uses the checkpoint's `created_at` with microsecond
+    precision as the sorted-set score; checkpoints created in the same
+    microsecond (only possible with `durability: :async` bursts) order
+    lexicographically by checkpoint ID. Use the `parent_id` chain when
+    exact lineage matters.
     """
 
     @behaviour LangEx.Checkpointer

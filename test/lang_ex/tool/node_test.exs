@@ -181,6 +181,25 @@ defmodule LangEx.Tool.NodeTest do
     end
   end
 
+  describe "interrupts inside tool functions" do
+    test "interrupt/1 in a tool surfaces as an error tool message, not a crash" do
+      tool = %Tool{
+        name: "pause",
+        description: "Tries to interrupt",
+        parameters: %{},
+        function: fn _args -> LangEx.Interrupt.interrupt("cannot pause here") end
+      }
+
+      node_fn = ToolNode.node([tool])
+      call = %Message.ToolCall{name: "pause", id: "c1", args: %{}}
+
+      assert %{messages: [%Message.Tool{tool_call_id: "c1", content: content}]} =
+               node_fn.(state_with_tool_calls([call]))
+
+      assert content =~ "outside a graph node"
+    end
+  end
+
   describe "tools_condition/2" do
     test "returns :tools when last message has tool_calls" do
       call = %Message.ToolCall{name: "echo", id: "c1", args: %{}}

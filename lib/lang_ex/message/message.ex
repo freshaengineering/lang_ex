@@ -7,7 +7,7 @@ defmodule LangEx.Message do
   """
 
   defmodule Human do
-    @moduledoc false
+    @moduledoc "A message authored by the human user."
     @derive Jason.Encoder
     defstruct [:content, :id]
     @type t :: %__MODULE__{content: String.t(), id: String.t() | nil}
@@ -26,7 +26,7 @@ defmodule LangEx.Message do
   end
 
   defmodule AI do
-    @moduledoc false
+    @moduledoc "A message authored by the LLM, optionally carrying tool calls."
     @derive Jason.Encoder
     defstruct [:content, :id, tool_calls: []]
 
@@ -38,14 +38,14 @@ defmodule LangEx.Message do
   end
 
   defmodule System do
-    @moduledoc false
+    @moduledoc "A system prompt message."
     @derive Jason.Encoder
     defstruct [:content, :id]
     @type t :: %__MODULE__{content: String.t(), id: String.t() | nil}
   end
 
   defmodule Tool do
-    @moduledoc false
+    @moduledoc "The result of a tool call, correlated by `tool_call_id`."
     @derive Jason.Encoder
     defstruct [:content, :tool_call_id, :id]
     @type t :: %__MODULE__{content: String.t(), tool_call_id: String.t(), id: String.t() | nil}

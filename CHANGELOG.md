@@ -1,6 +1,51 @@
 # Changelog
 
-## v0.6.0 (unreleased)
+## v0.6.0
+
+### Engine hardening
+- Node exceptions surface as `{:error, %LangEx.NodeError{node: ..., reason: ...}}`
+  instead of raising out of `invoke/3`/`stream/3`; the original exception and
+  failing node are preserved (**breaking**: callers matching on raises must
+  match on the error tuple)
+- Checkpoint format v2: `next_nodes` and pending-interrupt entries persist
+  full work items, so `%LangEx.Send{}` payloads survive crash-continue and
+  interrupt-resume (v1 checkpoints still load)
+- Completed parallel siblings keep their routing across an interrupt: their
+  resolved next targets (and any deferred fan-in backlog) are recorded in the
+  interrupt checkpoint and scheduled on resume
+- A Send target that interrupts pauses with the shared graph state (its
+  payload no longer overwrites the checkpointed state) and resumes with its
+  payload intact
+- `:node_timeout` applies to single-node super-steps (previously parallel
+  super-steps only); timeouts raise `LangEx.NodeTimeoutError` per attempt
+- `durability: :exit` writes a final checkpoint on completion and persists
+  the failed super-step on error, so `get_state/2` stays truthful and an
+  empty re-invoke can retry the failure
+- Parallel super-steps emit `node_start`/`node_end` stream events (previously
+  single-node super-steps only)
+- Dynamic resume answers survive static breakpoints: `resume_values` persist
+  through breakpoint checkpoints, and the resumed super-step bypasses
+  breakpoints that already fired
+
+### Validation
+- `add_node/4` rejects duplicate and reserved (`:__start__`/`:__end__`)
+  names, and validates option values; `:cache` cannot combine with `:on_error`
+- `add_edge/3` rejects edges from `:__end__`; `add_conditional_edges/4`
+  rejects a second routing function for the same source
+- `compile/2` validates `interrupt_before`/`interrupt_after` node names
+- Routing to an undefined node (Command goto / Send) raises a descriptive
+  `ArgumentError` naming the known nodes
+
+### Persistence
+- New `LangEx.Checkpointer.Memory` — built-in ETS backend for development
+  and tests
+- Postgres checkpointer stores `next_nodes`/`pending_interrupts` as proper
+  jsonb payloads (previously unusable due to an array/jsonb type mismatch)
+  and breaks `created_at` ordering ties by step and checkpoint id
+- Subgraphs with their own checkpointer resume interrupts from their
+  namespaced checkpoint instead of re-running from `:__start__`
+- `LangEx.Interrupt.interrupt/1` raises a clear error when called outside a
+  graph node process (e.g. from tool functions)
 
 ### Streaming
 - Stream modes: `modes: [:updates, :values, :messages, :custom]` on `LangEx.stream/3`
@@ -11,8 +56,15 @@
 - Interrupts are emitted as `{:interrupt, payload}` stream events
 
 ### Execution policies
-- Per-node options on `Graph.add_node/4`: `retry:` (backoff + `retryable?`),
-  `cache:` (ETS memoization with TTL), `defer:` (fan-in barrier)
+- Per-node options on `Graph.add_node/4`: `retry:` (capped exponential
+  backoff with jitter and `retryable?` — see `LangEx.Graph.RetryPolicy`;
+  `backoff_ms` accepted as a legacy alias for `initial_interval_ms`),
+  `cache:` (ETS memoization with TTL), `defer:` (fan-in barrier),
+  `timeout:` (per-attempt budget, retryable), `on_error:` (fallback handler
+  after retries are exhausted; its return value becomes the node result)
+- Node cache verifies the stored input on lookup (hash collisions miss
+  instead of serving wrong results), deletes expired entries on read, and is
+  size-bounded via the `:node_cache_max_entries` application env
 - `ChatModel.node(resilient: ...)` routes calls through `LLM.Resilient`
 - `:durability` invoke option: `:sync` | `:async` | `:exit` checkpoint writes
 

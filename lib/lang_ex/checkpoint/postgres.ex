@@ -34,7 +34,7 @@ if Code.ensure_loaded?(Ecto) do
         checkpoint_id: cp.checkpoint_id,
         parent_id: cp.parent_id,
         state: Serializer.encode(cp.state),
-        next_nodes: Enum.map(cp.next_nodes, &Atom.to_string/1),
+        next_nodes: Enum.map(cp.next_nodes, &Serializer.encode/1),
         step: cp.step,
         metadata: Serializer.encode(cp.metadata || %{}),
         pending_interrupts: encode_interrupts(cp.pending_interrupts),
@@ -61,7 +61,7 @@ if Code.ensure_loaded?(Ecto) do
       Schema
       |> where([c], c.thread_id == ^thread_id)
       |> scope_checkpoint_id(Keyword.get(config, :checkpoint_id))
-      |> order_by([c], desc: c.created_at)
+      |> order_by([c], desc: c.created_at, desc: c.step, desc: c.checkpoint_id)
       |> limit(1)
       |> repo.one()
       |> to_checkpoint()
@@ -75,7 +75,7 @@ if Code.ensure_loaded?(Ecto) do
 
       Schema
       |> where([c], c.thread_id == ^thread_id)
-      |> order_by([c], desc: c.created_at)
+      |> order_by([c], desc: c.created_at, desc: c.step, desc: c.checkpoint_id)
       |> limit(^row_limit)
       |> repo.all()
       |> Enum.map(&schema_to_checkpoint/1)
@@ -132,7 +132,7 @@ if Code.ensure_loaded?(Ecto) do
         checkpoint_id: row.checkpoint_id,
         parent_id: row.parent_id,
         state: Serializer.decode(row.state),
-        next_nodes: Enum.map(row.next_nodes || [], &String.to_existing_atom/1),
+        next_nodes: Enum.map(row.next_nodes || [], &decode_entry/1),
         step: row.step,
         metadata: Serializer.decode(row.metadata || %{}),
         pending_interrupts: decode_interrupts(row.pending_interrupts),
@@ -140,6 +140,11 @@ if Code.ensure_loaded?(Ecto) do
         version: row.version || 1
       }
     end
+
+    # Format v1 rows stored bare node-name strings; v2 stores
+    # Serializer-encoded entries (node atoms or Send structs).
+    defp decode_entry(name) when is_binary(name), do: String.to_existing_atom(name)
+    defp decode_entry(encoded), do: Serializer.decode(encoded)
 
     defp encode_interrupts(nil), do: nil
 

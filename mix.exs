@@ -1,7 +1,7 @@
 defmodule LangEx.MixProject do
   use Mix.Project
 
-  @version "0.5.0"
+  @version "0.6.0"
   @source_url "https://github.com/surgeventures/lang_ex"
 
   def project do
@@ -37,15 +37,70 @@ defmodule LangEx.MixProject do
     [
       licenses: ["MIT"],
       links: %{"GitHub" => @source_url},
-      files: ~w(lib .formatter.exs mix.exs README.md LICENSE)
+      files: ~w(lib .formatter.exs mix.exs README.md CHANGELOG.md LICENSE)
     ]
   end
 
   defp docs do
     [
       main: "readme",
-      extras: ["README.md"],
-      source_ref: "v#{@version}"
+      extras: ["README.md", "CHANGELOG.md"],
+      source_ref: "v#{@version}",
+      groups_for_modules: [
+        Graph: [
+          LangEx.Graph,
+          LangEx.Graph.Compiled,
+          LangEx.Graph.RetryPolicy,
+          LangEx.Graph.State,
+          LangEx.Graph.Stream
+        ],
+        "Control Flow": [
+          LangEx.Command,
+          LangEx.Interrupt,
+          LangEx.Send
+        ],
+        Errors: [
+          LangEx.NodeError,
+          LangEx.NodeTimeoutError
+        ],
+        Checkpointing: [
+          LangEx.Checkpoint,
+          LangEx.Checkpoint.Serializer,
+          LangEx.Checkpointer,
+          LangEx.Checkpointer.Memory,
+          LangEx.Checkpointer.Postgres,
+          LangEx.Checkpointer.Redis,
+          LangEx.Migration
+        ],
+        Store: [
+          LangEx.Store,
+          LangEx.Store.ETS,
+          LangEx.Store.Postgres
+        ],
+        Messages: [
+          LangEx.Message,
+          LangEx.MessagesState
+        ],
+        LLM: [
+          LangEx.LLM,
+          LangEx.LLM.Anthropic,
+          LangEx.LLM.ChatModel,
+          LangEx.LLM.Gemini,
+          LangEx.LLM.OpenAI,
+          LangEx.LLM.Registry,
+          LangEx.LLM.Resilient
+        ],
+        Tools: [
+          LangEx.Tool,
+          LangEx.Tool.Annotation,
+          LangEx.Tool.Node
+        ],
+        Observability: [
+          LangEx.Telemetry,
+          LangEx.Telemetry.OpenTelemetryBridge,
+          LangEx.Telemetry.Runs
+        ]
+      ]
     ]
   end
 

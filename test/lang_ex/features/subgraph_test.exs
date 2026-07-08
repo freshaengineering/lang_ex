@@ -43,7 +43,7 @@ defmodule LangEx.Features.SubgraphTest do
         |> Graph.add_edge(:__start__, :sub)
         |> Graph.add_edge(:sub, :tag)
         |> Graph.add_edge(:tag, :__end__)
-        |> Graph.compile(checkpointer: LangEx.Checkpointer.Mock)
+        |> Graph.compile(checkpointer: LangEx.Checkpointer.Memory)
 
       config = [thread_id: "subgraph-interrupt-1"]
 
@@ -53,6 +53,40 @@ defmodule LangEx.Features.SubgraphTest do
         LangEx.invoke(outer, %LangEx.Command{resume: true}, config: config)
 
       assert %{approved: true, label: "done"} = result
+    end
+
+    test "a subgraph with its own checkpointer resumes without re-running earlier nodes" do
+      {:ok, prep_runs} = Agent.start_link(fn -> 0 end)
+
+      inner =
+        Graph.new(value: 0, approved: nil)
+        |> Graph.add_node(:prep, fn state ->
+          Agent.update(prep_runs, &(&1 + 1))
+          %{value: state.value + 1}
+        end)
+        |> Graph.add_node(:approve, fn _state ->
+          %{approved: LangEx.Interrupt.interrupt("approve inner?")}
+        end)
+        |> Graph.add_edge(:__start__, :prep)
+        |> Graph.add_edge(:prep, :approve)
+        |> Graph.add_edge(:approve, :__end__)
+        |> Graph.compile(checkpointer: LangEx.Checkpointer.Memory)
+
+      outer =
+        Graph.new(value: 0, approved: nil)
+        |> Graph.add_node(:sub, inner)
+        |> Graph.add_edge(:__start__, :sub)
+        |> Graph.add_edge(:sub, :__end__)
+        |> Graph.compile(checkpointer: LangEx.Checkpointer.Memory)
+
+      config = [thread_id: "subgraph-own-checkpointer-1"]
+
+      {:interrupt, "approve inner?", _} = LangEx.invoke(outer, %{value: 7}, config: config)
+
+      {:ok, result} = LangEx.invoke(outer, %LangEx.Command{resume: true}, config: config)
+
+      assert %{value: 8, approved: true} = result
+      assert Agent.get(prep_runs, & &1) == 1
     end
 
     test "errors inside a subgraph surface as parent errors" do

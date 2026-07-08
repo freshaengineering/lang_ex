@@ -2,11 +2,11 @@ defmodule LangEx.Checkpoint.StateApiTest do
   use ExUnit.Case, async: false
 
   alias LangEx.Checkpoint
-  alias LangEx.Checkpointer.Mock
+  alias LangEx.Checkpointer.Memory
   alias LangEx.Graph
 
   setup do
-    Mock.clear()
+    Memory.clear()
     {:ok, graph: build_graph()}
   end
 
@@ -96,6 +96,6 @@ defmodule LangEx.Checkpoint.StateApiTest do
     |> Graph.add_edge(:__start__, :first)
     |> Graph.add_edge(:first, :second)
     |> Graph.add_edge(:second, :__end__)
-    |> Graph.compile(checkpointer: Mock)
+    |> Graph.compile(checkpointer: Memory)
   end
 end

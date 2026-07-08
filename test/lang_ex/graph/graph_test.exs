@@ -44,6 +44,95 @@ defmodule LangEx.Graph.ValidationTest do
 
       assert warning == ""
     end
+
+    test "interrupt breakpoints must reference defined nodes" do
+      builder =
+        Graph.new(value: 0)
+        |> Graph.add_node(:work, fn state -> state end)
+        |> Graph.add_edge(:__start__, :work)
+        |> Graph.add_edge(:work, :__end__)
+
+      assert_raise ArgumentError, ~r/:interrupt_before references undefined node/, fn ->
+        Graph.compile(builder, interrupt_before: [:missing])
+      end
+
+      assert_raise ArgumentError, ~r/:interrupt_after references undefined node/, fn ->
+        Graph.compile(builder, interrupt_after: [:missing])
+      end
+    end
+  end
+
+  describe "build-time validation" do
+    test "duplicate node names raise" do
+      assert_raise ArgumentError, ~r/node :dup is already defined/, fn ->
+        Graph.new(value: 0)
+        |> Graph.add_node(:dup, fn state -> state end)
+        |> Graph.add_node(:dup, fn state -> state end)
+      end
+    end
+
+    test "reserved node names raise" do
+      assert_raise ArgumentError, ~r/:__start__ is a reserved node name/, fn ->
+        Graph.new(value: 0) |> Graph.add_node(:__start__, fn state -> state end)
+      end
+
+      assert_raise ArgumentError, ~r/:__end__ is a reserved node name/, fn ->
+        Graph.new(value: 0) |> Graph.add_node(:__end__, fn state -> state end)
+      end
+    end
+
+    test "edges cannot start from :__end__" do
+      assert_raise ArgumentError, ~r/:__end__ is terminal/, fn ->
+        Graph.new(value: 0)
+        |> Graph.add_node(:work, fn state -> state end)
+        |> Graph.add_edge(:__end__, :work)
+      end
+    end
+
+    test "a node has at most one routing function" do
+      assert_raise ArgumentError, ~r/conditional edges from :router are already defined/, fn ->
+        Graph.new(value: 0)
+        |> Graph.add_node(:router, fn state -> state end)
+        |> Graph.add_conditional_edges(:router, fn _state -> :__end__ end)
+        |> Graph.add_conditional_edges(:router, fn _state -> :__end__ end)
+      end
+    end
+
+    test "invalid node option values raise" do
+      assert_raise ArgumentError, ~r/invalid value 0 for node option :timeout/, fn ->
+        Graph.new(value: 0) |> Graph.add_node(:bad, fn state -> state end, timeout: 0)
+      end
+
+      assert_raise ArgumentError, ~r/invalid value "yes" for node option :defer/, fn ->
+        Graph.new(value: 0) |> Graph.add_node(:bad, fn state -> state end, defer: "yes")
+      end
+    end
+
+    test "cache and on_error cannot be combined" do
+      assert_raise ArgumentError, ~r/combines :cache with :on_error/, fn ->
+        Graph.new(value: 0)
+        |> Graph.add_node(:bad, fn state -> state end,
+          cache: true,
+          on_error: fn _error, _state -> %{} end
+        )
+      end
+    end
+  end
+
+  describe "runtime target validation" do
+    test "Command goto to an undefined node raises with a clear message" do
+      graph =
+        Graph.new(value: 0)
+        |> Graph.add_node(:router, fn _state ->
+          %LangEx.Command{update: %{}, goto: :missing}
+        end)
+        |> Graph.add_edge(:__start__, :router)
+        |> Graph.compile(warn_unreachable: false)
+
+      assert_raise ArgumentError, ~r/cannot execute undefined node\(s\) \[:missing\]/, fn ->
+        LangEx.invoke(graph, %{})
+      end
+    end
   end
 
   describe "to_mermaid/1" do
@@ -209,7 +298,7 @@ defmodule LangEx.GraphTest do
         |> Graph.add_node(:finish, fn _state -> %{routed: true} end)
         |> Graph.add_edge(:__start__, :decide)
         |> Graph.add_edge(:finish, :__end__)
-        |> Graph.compile()
+        |> Graph.compile(warn_unreachable: false)
         |> LangEx.invoke(%{value: 1})
 
       assert %{value: 101, routed: true} = result

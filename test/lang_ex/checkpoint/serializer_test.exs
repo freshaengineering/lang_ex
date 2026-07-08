@@ -85,6 +85,27 @@ defmodule LangEx.Checkpoint.SerializerTest do
         Serializer.encode(%{callback: fn -> :ok end})
       end
     end
+
+    test "pids are rejected at encode time" do
+      assert_raise ArgumentError, ~r/cannot serialize/, fn ->
+        Serializer.encode(%{owner: self()})
+      end
+    end
+
+    test "Send entries round-trip with their payloads" do
+      entries = [:node_a, %LangEx.Send{node: :worker, state: %{item: "a", weight: 2}}]
+
+      assert [:node_a, %LangEx.Send{node: :worker, state: %{item: "a", weight: 2}}] =
+               round_trip(entries)
+    end
+
+    test "decoding an unknown struct module raises instead of fabricating modules" do
+      payload = Jason.encode!(%{"~s" => "Elixir.Definitely.Not.A.Module", "~f" => %{}})
+
+      assert_raise ArgumentError, fn ->
+        payload |> Jason.decode!() |> Serializer.decode()
+      end
+    end
   end
 
   defp round_trip(term) do

@@ -4,9 +4,15 @@ defmodule LangEx.Checkpoint do
 
   Persisted by checkpointer implementations after each super-step,
   enabling pause/resume, time-travel, and fault recovery.
+
+  `next_nodes` holds full work entries — node names or `%LangEx.Send{}`
+  structs — so Send payloads survive crash-continue and interrupt-resume
+  (format version 2). Version 1 checkpoints, which stored node names
+  only, still load and resume; only Send payloads from that era are
+  unrecoverable.
   """
 
-  @format_version 1
+  @format_version 2
 
   defstruct [
     :thread_id,
@@ -26,7 +32,7 @@ defmodule LangEx.Checkpoint do
           checkpoint_id: String.t(),
           parent_id: String.t() | nil,
           state: map(),
-          next_nodes: [atom()],
+          next_nodes: [atom() | LangEx.Send.t()],
           step: non_neg_integer(),
           metadata: map(),
           pending_interrupts: [map()] | nil,

@@ -17,22 +17,34 @@ defmodule LangEx.Graph.Pregel do
   Resume values are keyed by interrupt ID, so a node can interrupt multiple
   times across resume cycles, and several nodes interrupting in the same
   parallel super-step each keep their own pending entry. Completed sibling
-  results in a parallel super-step are merged into state before pausing —
-  nothing is lost when one branch interrupts.
+  results in a parallel super-step are merged into state before pausing,
+  and their resolved next targets are recorded in the checkpoint — nothing
+  is lost when one branch interrupts.
+
+  ## Error model
+
+  Node exceptions (after the node's retry policy, if any, is exhausted)
+  surface as `{:error, %LangEx.NodeError{}}` rather than raising out of
+  the run. Programmer errors — routing to an undefined node, a missing
+  conditional mapping — still raise.
   """
 
   alias LangEx.Checkpoint
   alias LangEx.Command
   alias LangEx.Graph.Compiled
   alias LangEx.Graph.NodeCache
+  alias LangEx.Graph.RetryPolicy
   alias LangEx.Graph.State
+  alias LangEx.NodeError
+  alias LangEx.NodeTimeoutError
   alias LangEx.Send
   alias LangEx.Telemetry.Runs
 
   @type interrupt :: %{id: String.t(), value: term(), node: atom()}
+  @type entry :: atom() | Send.t()
 
   @type run_opts :: %{
-          optional(:start_nodes) => [atom()] | nil,
+          optional(:start_nodes) => [entry()] | nil,
           optional(:parent_id) => String.t() | nil,
           optional(:bypass_breakpoints) => boolean(),
           optional(:resume_values) => %{String.t() => term()},
@@ -40,13 +52,14 @@ defmodule LangEx.Graph.Pregel do
           optional(:max_concurrency) => pos_integer() | nil,
           optional(:node_timeout) => timeout() | nil,
           optional(:store) => {module(), keyword()} | nil,
-          optional(:deferred_backlog) => [atom() | Send.t()],
+          optional(:deferred_backlog) => [entry()],
+          optional(:completed_next) => [entry()],
           optional(:durability) => :sync | :async | :exit,
           recursion_limit: pos_integer(),
           checkpointer: module() | nil,
           config: keyword(),
           context: term(),
-          resume: %{nodes: [atom()], values: %{String.t() => term()}} | nil,
+          resume: %{nodes: [entry()], values: %{String.t() => term()}} | nil,
           step: non_neg_integer(),
           emit_to: pid() | nil
         }
@@ -89,19 +102,41 @@ defmodule LangEx.Graph.Pregel do
   defp initial_targets(nil, graph, state), do: resolve_targets(graph, :__start__, state)
   defp initial_targets(start_nodes, _graph, _state), do: start_nodes
 
-  defp step([], _graph, state, _opts), do: {:ok, state}
-  defp step([:__end__], _graph, state, _opts), do: {:ok, state}
+  defp step(nodes, graph, state, opts) do
+    nodes
+    |> Enum.reject(&(&1 == :__end__))
+    |> run_active(graph, state, opts)
+  end
 
-  defp step(nodes, _graph, _state, %{recursion_limit: limit, step: count})
+  defp run_active([], graph, state, opts), do: finalize_run(graph, state, opts)
+
+  defp run_active(nodes, _graph, _state, %{recursion_limit: limit, step: count})
        when count >= limit do
     {:error, {:recursion_limit, count, nodes}}
   end
 
-  defp step(active_nodes, graph, state, opts) do
-    active_nodes
-    |> Enum.reject(&(&1 == :__end__))
+  defp run_active(active, graph, state, opts) do
+    :ok = validate_active!(graph, active)
+
+    active
     |> Enum.split_with(&deferred?(graph, &1))
     |> run_ready(graph, state, opts)
+  end
+
+  defp validate_active!(graph, active) do
+    active
+    |> Enum.map(&entry_name/1)
+    |> Enum.reject(&Map.has_key?(graph.nodes, &1))
+    |> assert_known_targets!(graph)
+  end
+
+  defp assert_known_targets!([], _graph), do: :ok
+
+  defp assert_known_targets!(unknown, graph) do
+    raise ArgumentError,
+          "cannot execute undefined node(s) #{inspect(Enum.uniq(unknown))} — " <>
+            "known nodes: #{inspect(Enum.sort(Map.keys(graph.nodes)))}. " <>
+            "Check Command goto and Send targets."
   end
 
   defp deferred?(graph, entry) do
@@ -117,7 +152,7 @@ defmodule LangEx.Graph.Pregel do
   defp run_ready({deferred, ready}, graph, state, opts),
     do: run_super_step(ready, graph, state, Map.put(opts, :deferred_backlog, deferred))
 
-  defp run_super_step([], _graph, state, _opts), do: {:ok, state}
+  defp run_super_step([], graph, state, opts), do: finalize_run(graph, state, opts)
 
   defp run_super_step(active, graph, state, opts) do
     active
@@ -145,10 +180,23 @@ defmodule LangEx.Graph.Pregel do
     interrupts =
       Enum.map(hits, fn entry ->
         name = entry_name(entry)
-        %{id: "before:#{name}", value: {:interrupt_before, name}, node: name, static: true}
+
+        %{
+          id: "before:#{name}",
+          value: {:interrupt_before, name},
+          node: name,
+          entry: entry,
+          static: true
+        }
       end)
 
-    save_interrupts(state, Enum.map(active, &entry_name/1), interrupts, opts)
+    save_interrupts(
+      state,
+      active ++ Map.get(opts, :deferred_backlog, []),
+      interrupts,
+      Map.get(opts, :completed_next, []),
+      opts
+    )
   end
 
   defp execute_super_step(active, graph, state, opts) do
@@ -160,23 +208,37 @@ defmodule LangEx.Graph.Pregel do
         state
         |> inject_managed(opts)
         |> then(&execute_nodes(graph, &1, active, opts))
-        |> handle_super_step_result(graph, active, opts)
+        |> handle_super_step_result(graph, active, state, opts)
 
       {result, metadata}
     end)
   end
 
-  defp handle_super_step_result({:failed, reason}, _graph, _active, _opts), do: {:error, reason}
-
-  defp handle_super_step_result({new_state, _cmds, [_ | _] = interrupts}, graph, _active, opts) do
-    pending_nodes = interrupts |> Enum.map(& &1.node) |> Enum.uniq()
-
-    new_state
-    |> strip_managed(graph)
-    |> save_interrupts(pending_nodes, interrupts, opts)
+  defp handle_super_step_result({:failed, reason}, _graph, active, state, opts) do
+    save_failure_checkpoint(state, active ++ Map.get(opts, :deferred_backlog, []), opts)
+    {:error, reason}
   end
 
-  defp handle_super_step_result({new_state, command_targets, []}, graph, active, opts) do
+  defp handle_super_step_result(
+         {new_state, cmds, [_ | _] = interrupts},
+         graph,
+         active,
+         _state,
+         opts
+       ) do
+    clean = strip_managed(new_state, graph)
+    pending = interrupts |> Enum.map(&interrupt_entry/1) |> dedup_targets()
+
+    save_interrupts(
+      clean,
+      pending,
+      interrupts,
+      completed_targets(graph, clean, active, interrupts, cmds, opts),
+      opts
+    )
+  end
+
+  defp handle_super_step_result({new_state, command_targets, []}, graph, active, _state, opts) do
     clean = strip_managed(new_state, graph)
     emit(opts, {:step_end, opts.step, clean})
 
@@ -184,12 +246,39 @@ defmodule LangEx.Graph.Pregel do
       graph
       |> resolve_next_nodes(clean, active, command_targets)
       |> Kernel.++(Map.get(opts, :deferred_backlog, []))
+      |> Kernel.++(Map.get(opts, :completed_next, []))
       |> dedup_targets()
 
     active
     |> breakpoint_hits(graph.interrupt_after, opts)
-    |> pause_after_or_continue(next, graph, clean, Map.delete(opts, :deferred_backlog))
+    |> pause_after_or_continue(
+      next,
+      graph,
+      clean,
+      opts |> Map.delete(:deferred_backlog) |> Map.delete(:completed_next)
+    )
   end
+
+  # Targets of siblings that finished in a super-step where another
+  # branch interrupted. They are persisted with the interrupt checkpoint
+  # so the resumed run still visits them — resuming re-executes only the
+  # interrupted entries.
+  defp completed_targets(graph, state, active, interrupts, cmds, opts) do
+    carried = Map.get(opts, :completed_next, []) ++ Map.get(opts, :deferred_backlog, [])
+
+    (active -- Enum.map(interrupts, &interrupt_entry/1))
+    |> resolve_completed(graph, state, cmds)
+    |> Kernel.++(carried)
+    |> dedup_targets()
+  end
+
+  defp resolve_completed([], _graph, _state, _cmds), do: []
+
+  defp resolve_completed(completed, graph, state, cmds),
+    do: resolve_next_nodes(graph, state, completed, cmds)
+
+  defp interrupt_entry(%{entry: entry}), do: entry
+  defp interrupt_entry(%{node: node}), do: node
 
   defp pause_after_or_continue([], next, graph, state, opts) do
     checkpoint_id = save_checkpoint(opts, state, next)
@@ -200,17 +289,21 @@ defmodule LangEx.Graph.Pregel do
     interrupts =
       Enum.map(hits, fn entry ->
         name = entry_name(entry)
-        %{id: "after:#{name}", value: {:interrupt_after, name}, node: name, static: true}
+
+        %{
+          id: "after:#{name}",
+          value: {:interrupt_after, name},
+          node: name,
+          entry: entry,
+          static: true
+        }
       end)
 
-    save_interrupts(state, Enum.map(next, &entry_name/1), interrupts, opts)
+    save_interrupts(state, next, interrupts, [], opts)
   end
 
   defp with_parent(opts, nil), do: opts
   defp with_parent(opts, checkpoint_id), do: Map.put(opts, :parent_id, checkpoint_id)
-
-  defp continue([], _graph, state, _opts), do: {:ok, state}
-  defp continue([:__end__ | _], _graph, state, _opts), do: {:ok, state}
 
   defp continue(next, graph, state, opts) do
     step(next, graph, state, %{
@@ -220,10 +313,61 @@ defmodule LangEx.Graph.Pregel do
     })
   end
 
+  defp finalize_run(graph, state, opts) do
+    :ok = save_final_checkpoint(Map.get(opts, :durability, :sync), graph, state, opts)
+    {:ok, state}
+  end
+
+  # Under :exit durability nothing was persisted along the way, so the
+  # completed run gets one final checkpoint — get_state/2 stays truthful.
+  defp save_final_checkpoint(:exit, _graph, state, %{checkpointer: cp, config: config} = opts)
+       when not is_nil(cp) do
+    config
+    |> Keyword.get(:thread_id)
+    |> persist_checkpoint(cp, config, :sync,
+      state: state,
+      next_nodes: [:__end__],
+      step: opts.step,
+      parent_id: Map.get(opts, :parent_id),
+      metadata: %{}
+    )
+
+    :ok
+  end
+
+  defp save_final_checkpoint(_durability, _graph, _state, _opts), do: :ok
+
+  # Under :exit durability a failed run also persists its position, so a
+  # follow-up invoke with empty input can re-run the failed super-step.
+  defp save_failure_checkpoint(state, active, %{checkpointer: cp, config: config} = opts)
+       when not is_nil(cp) do
+    opts
+    |> Map.get(:durability, :sync)
+    |> persist_failure(state, active, cp, config, opts)
+  end
+
+  defp save_failure_checkpoint(_state, _active, _opts), do: :ok
+
+  defp persist_failure(:exit, state, active, cp, config, opts) do
+    config
+    |> Keyword.get(:thread_id)
+    |> persist_checkpoint(cp, config, :sync,
+      state: state,
+      next_nodes: active,
+      step: opts.step,
+      parent_id: Map.get(opts, :parent_id),
+      metadata: %{}
+    )
+
+    :ok
+  end
+
+  defp persist_failure(_durability, _state, _active, _cp, _config, _opts), do: :ok
+
   defp execute_nodes(graph, state, [entry], opts) do
     graph
     |> execute_single_node(state, entry, opts)
-    |> normalize_single_result()
+    |> normalize_single_result(state)
   end
 
   defp execute_nodes(graph, state, entries, opts) do
@@ -234,21 +378,24 @@ defmodule LangEx.Graph.Pregel do
       entries,
       &run_entry_task(graph, &1, state, opts, parent_run_id),
       max_concurrency: max_concurrency(opts),
-      timeout: node_timeout(opts),
-      on_timeout: :kill_task,
+      timeout: :infinity,
       ordered: true
     )
+    |> Enum.zip(entries)
     |> Enum.reduce({state, [], []}, &reduce_task_result(&1, &2, graph.reducers))
   end
 
   defp max_concurrency(opts), do: Map.get(opts, :max_concurrency) || System.schedulers_online()
   defp node_timeout(opts), do: Map.get(opts, :node_timeout) || :infinity
 
-  defp normalize_single_result({:interrupted, interrupt, int_state}),
-    do: {int_state, [], [interrupt]}
+  # An interrupted entry pauses with the shared state, not the node's
+  # input — for a Send entry the input is the payload, which must not
+  # replace the graph state in the checkpoint.
+  defp normalize_single_result({:interrupted, interrupt, _int_state}, shared_state),
+    do: {shared_state, [], [interrupt]}
 
-  defp normalize_single_result({:graph_error, reason}), do: {:failed, reason}
-  defp normalize_single_result({new_state, cmds}), do: {new_state, cmds, []}
+  defp normalize_single_result({:graph_error, reason}, _shared_state), do: {:failed, reason}
+  defp normalize_single_result({new_state, cmds}, _shared_state), do: {new_state, cmds, []}
 
   defp entry_name(%Send{node: node}), do: node
   defp entry_name(node) when is_atom(node), do: node
@@ -259,39 +406,58 @@ defmodule LangEx.Graph.Pregel do
   defp run_entry_task(graph, entry, state, opts, parent_run_id) do
     Runs.inherit_run_id(parent_run_id)
     name = entry_name(entry)
+    emit(opts, {:node_start, name})
     metadata = %{node: name}
 
     Runs.span([:lang_ex, :node, :execute], metadata, fn ->
-      {{name, call_node(graph, name, entry_input(entry, state), opts)}, metadata}
+      result =
+        graph
+        |> call_node(entry, entry_input(entry, state), opts)
+        |> attach_entry(entry)
+
+      emit_node_end(result, name, opts)
+      {{name, result}, metadata}
     end)
   end
+
+  defp attach_entry({:interrupted, interrupt, int_state}, entry),
+    do: {:interrupted, Map.put(interrupt, :entry, entry), int_state}
+
+  defp attach_entry(result, _entry), do: result
+
+  defp emit_node_end({:interrupted, _, _}, _name, _opts), do: :ok
+  defp emit_node_end({:graph_error, _}, _name, _opts), do: :ok
+  defp emit_node_end(result, name, opts), do: emit(opts, {:node_end, name, result})
 
   defp reduce_task_result(_task_result, {:failed, _reason} = halt, _reducers), do: halt
 
   defp reduce_task_result(
-         {:ok, {_name, {:interrupted, interrupt, _int_state}}},
+         {{:ok, {_name, {:interrupted, interrupt, _int_state}}}, _entry},
          {acc, cmds, interrupts},
          _reducers
        ) do
     {acc, cmds, interrupts ++ [interrupt]}
   end
 
-  defp reduce_task_result({:ok, {_name, {:graph_error, reason}}}, _acc, _reducers) do
+  defp reduce_task_result({{:ok, {_name, {:graph_error, reason}}}, _entry}, _acc, _reducers) do
     {:failed, reason}
   end
 
-  defp reduce_task_result({:ok, {_name, result}}, {acc, cmds, interrupts}, reducers) do
+  defp reduce_task_result({{:ok, {name, result}}, _entry}, {acc, cmds, interrupts}, reducers) do
     {new_state, new_cmds} = merge_node_result(result, acc, reducers, cmds)
     {new_state, new_cmds, interrupts}
+  rescue
+    exception -> {:failed, NodeError.wrap(name, exception, __STACKTRACE__)}
   end
 
-  defp reduce_task_result({:exit, :timeout}, _acc, _reducers) do
-    raise "node execution timed out"
+  defp reduce_task_result({{:exit, reason}, entry}, _acc, _reducers) do
+    {:failed, exit_error(entry_name(entry), reason)}
   end
 
-  defp reduce_task_result({:exit, reason}, _acc, _reducers) do
-    raise "node execution failed: #{inspect(reason)}"
-  end
+  defp exit_error(name, {exception, stacktrace}) when is_exception(exception),
+    do: NodeError.wrap(name, exception, stacktrace)
+
+  defp exit_error(name, reason), do: NodeError.wrap(name, reason, [])
 
   defp execute_single_node(graph, state, entry, opts) do
     name = entry_name(entry)
@@ -300,9 +466,13 @@ defmodule LangEx.Graph.Pregel do
 
     Runs.span([:lang_ex, :node, :execute], metadata, fn ->
       graph
-      |> call_node(name, entry_input(entry, state), opts)
+      |> call_node(entry, entry_input(entry, state), opts)
+      |> attach_entry(entry)
       |> finalize_node_call(name, state, graph.reducers, opts, metadata)
     end)
+  rescue
+    exception ->
+      {:graph_error, NodeError.wrap(entry_name(entry), exception, __STACKTRACE__)}
   end
 
   defp finalize_node_call(
@@ -330,13 +500,14 @@ defmodule LangEx.Graph.Pregel do
     {merge_node_result(result, state, reducers, []), metadata}
   end
 
-  defp call_node(graph, name, state, opts) do
-    node = Map.fetch!(graph.nodes, name)
+  defp call_node(graph, entry, state, opts) do
+    name = entry_name(entry)
+    node = fetch_node!(graph, name)
     policy = Map.get(graph.node_opts, name, [])
-    prepare_node_context(name, opts)
+    prepare_node_context(entry, opts)
 
     try do
-      run_with_policies(policy, node, name, state, opts)
+      run_with_policies(policy, node, entry, state, opts)
     catch
       :throw, {:lang_ex_interrupt, id, payload} ->
         {:interrupted, %{id: id, value: payload, node: name}, state}
@@ -348,30 +519,61 @@ defmodule LangEx.Graph.Pregel do
     end
   end
 
-  defp run_with_policies(policy, node, name, state, opts) do
+  defp fetch_node!(graph, name) do
+    graph.nodes
+    |> Map.fetch(name)
+    |> require_node!(name, graph)
+  end
+
+  defp require_node!({:ok, node}, _name, _graph), do: node
+
+  defp require_node!(:error, name, graph) do
+    raise ArgumentError,
+          "cannot execute undefined node #{inspect(name)} — " <>
+            "known nodes: #{inspect(Enum.sort(Map.keys(graph.nodes)))}. " <>
+            "Check Command goto and Send targets."
+  end
+
+  defp run_with_policies(policy, node, entry, state, opts) do
+    policy
+    |> Keyword.get(:on_error)
+    |> run_with_handler(policy, node, entry, state, opts)
+  end
+
+  # The error handler runs after the retry policy is exhausted; its
+  # return value becomes the node result. Interrupts pass through.
+  defp run_with_handler(nil, policy, node, entry, state, opts) do
     policy
     |> Keyword.get(:cache)
-    |> run_cached(policy, node, name, state, opts)
+    |> run_cached(policy, node, entry, state, opts)
   end
 
-  defp run_cached(nil, policy, node, name, state, opts) do
-    run_retried(policy, node, name, state, opts)
+  defp run_with_handler(handler, policy, node, entry, state, opts) do
+    policy
+    |> Keyword.get(:cache)
+    |> run_cached(policy, node, entry, state, opts)
+  rescue
+    exception -> handler.(exception, state)
   end
 
-  defp run_cached(cache_opts, policy, node, name, state, opts) do
-    key = {name, :erlang.phash2({node, state})}
+  defp run_cached(nil, policy, node, entry, state, opts) do
+    run_retried(policy, node, entry, state, opts)
+  end
+
+  defp run_cached(cache_opts, policy, node, entry, state, opts) do
+    key = {entry_name(entry), :erlang.phash2({node, state})}
 
     key
-    |> NodeCache.fetch()
-    |> serve_cached(key, cache_opts, policy, node, name, state, opts)
+    |> NodeCache.fetch({node, state})
+    |> serve_cached(key, cache_opts, policy, node, entry, state, opts)
   end
 
-  defp serve_cached({:ok, result}, _key, _cache_opts, _policy, _node, _name, _state, _opts),
+  defp serve_cached({:ok, result}, _key, _cache_opts, _policy, _node, _entry, _state, _opts),
     do: result
 
-  defp serve_cached(:miss, key, cache_opts, policy, node, name, state, opts) do
-    result = run_retried(policy, node, name, state, opts)
-    NodeCache.store(key, result, cache_ttl(cache_opts))
+  defp serve_cached(:miss, key, cache_opts, policy, node, entry, state, opts) do
+    result = run_retried(policy, node, entry, state, opts)
+    NodeCache.store(key, {node, state}, result, cache_ttl(cache_opts))
     result
   end
 
@@ -380,66 +582,117 @@ defmodule LangEx.Graph.Pregel do
   defp cache_ttl(cache_opts) when is_list(cache_opts),
     do: Keyword.get(cache_opts, :ttl, :infinity)
 
-  defp run_retried(policy, node, name, state, opts) do
+  defp run_retried(policy, node, entry, state, opts) do
+    timeout = Keyword.get(policy, :timeout) || node_timeout(opts)
+
     policy
     |> Keyword.get(:retry)
-    |> normalize_retry()
-    |> attempt_node(node, name, state, opts, 1)
+    |> RetryPolicy.normalize()
+    |> attempt_node(node, entry, state, opts, timeout, 1)
   end
 
-  defp normalize_retry(nil), do: nil
+  defp attempt_node(nil, node, entry, state, opts, timeout, _attempt),
+    do: execute_attempt(timeout, node, entry, state, opts)
 
-  defp normalize_retry(true), do: normalize_retry([])
-
-  defp normalize_retry(retry_opts) when is_list(retry_opts) do
-    %{
-      max_attempts: Keyword.get(retry_opts, :max_attempts, 3),
-      backoff_ms: Keyword.get(retry_opts, :backoff_ms, 100),
-      retryable?: Keyword.get(retry_opts, :retryable?, fn _exception -> true end)
-    }
-  end
-
-  defp attempt_node(nil, node, name, state, opts, _attempt),
-    do: execute_node_value(node, name, state, opts)
-
-  defp attempt_node(retry, node, name, state, opts, attempt) do
+  defp attempt_node(retry, node, entry, state, opts, timeout, attempt) do
     Process.put(:lang_ex_interrupt_counter, 0)
-    execute_node_value(node, name, state, opts)
+    execute_attempt(timeout, node, entry, state, opts)
   rescue
     exception ->
-      retry_or_reraise(retry, node, name, state, opts, attempt, exception, __STACKTRACE__)
+      retry_or_reraise(
+        retry,
+        node,
+        entry,
+        state,
+        opts,
+        timeout,
+        attempt,
+        exception,
+        __STACKTRACE__
+      )
   end
 
-  defp retry_or_reraise(retry, node, name, state, opts, attempt, exception, stacktrace) do
+  defp retry_or_reraise(retry, node, entry, state, opts, timeout, attempt, exception, stacktrace) do
     (attempt < retry.max_attempts and retry.retryable?.(exception))
-    |> continue_retry(retry, node, name, state, opts, attempt, exception, stacktrace)
+    |> continue_retry(retry, node, entry, state, opts, timeout, attempt, exception, stacktrace)
   end
 
-  defp continue_retry(true, retry, node, name, state, opts, attempt, _exception, _stacktrace) do
-    Process.sleep(retry.backoff_ms * attempt)
-    attempt_node(retry, node, name, state, opts, attempt + 1)
+  defp continue_retry(true, retry, node, entry, state, opts, timeout, attempt, _exc, _stacktrace) do
+    Process.sleep(RetryPolicy.delay_ms(retry, attempt))
+    attempt_node(retry, node, entry, state, opts, timeout, attempt + 1)
   end
 
   defp continue_retry(
          false,
          _retry,
          _node,
-         _name,
+         _entry,
          _state,
          _opts,
+         _timeout,
          _attempt,
          exception,
          stacktrace
        ),
        do: reraise(exception, stacktrace)
 
+  defp execute_attempt(:infinity, node, entry, state, opts),
+    do: execute_node_value(node, entry_name(entry), state, opts)
+
+  # A timed attempt runs in a supervised task with its own node context;
+  # interrupt throws are re-thrown in the calling process so the regular
+  # interrupt machinery in call_node/4 applies unchanged.
+  defp execute_attempt(timeout, node, entry, state, opts) do
+    parent_run_id = Runs.current_run_id()
+
+    LangEx.TaskSupervisor
+    |> Task.Supervisor.async_nolink(fn ->
+      Runs.inherit_run_id(parent_run_id)
+      prepare_node_context(entry, opts)
+      catch_attempt_throws(node, entry_name(entry), state, opts)
+    end)
+    |> await_attempt(timeout, entry_name(entry))
+  end
+
+  defp catch_attempt_throws(node, name, state, opts) do
+    {:completed, execute_node_value(node, name, state, opts)}
+  catch
+    :throw, thrown -> {:thrown, thrown}
+  end
+
+  defp await_attempt(task, timeout, name) do
+    task
+    |> Task.yield(timeout)
+    |> settle_attempt(task, timeout, name)
+  end
+
+  defp settle_attempt(nil, task, timeout, name) do
+    task
+    |> Task.shutdown(:brutal_kill)
+    |> settle_shutdown(timeout, name)
+  end
+
+  defp settle_attempt({:ok, {:completed, result}}, _task, _timeout, _name), do: result
+  defp settle_attempt({:ok, {:thrown, thrown}}, _task, _timeout, _name), do: throw(thrown)
+
+  defp settle_attempt({:exit, {exception, stacktrace}}, _task, _timeout, _name)
+       when is_exception(exception),
+       do: reraise(exception, stacktrace)
+
+  defp settle_attempt({:exit, reason}, _task, _timeout, _name), do: exit(reason)
+
+  defp settle_shutdown(nil, timeout, name),
+    do: raise(NodeTimeoutError, node: name, timeout_ms: timeout)
+
+  defp settle_shutdown(late_result, timeout, name),
+    do: settle_attempt(late_result, nil, timeout, name)
+
   defp execute_node_value(%Compiled{} = subgraph, name, state, opts) do
     Process.delete(:lang_ex_parent_goto)
 
     result =
-      subgraph.initial_state
-      |> State.apply_update(state, subgraph.reducers)
-      |> then(&run(subgraph, &1, subgraph_opts(subgraph, name, opts)))
+      subgraph
+      |> start_subgraph(name, state, opts)
       |> unwrap_subgraph()
 
     :lang_ex_parent_goto
@@ -454,6 +707,66 @@ defmodule LangEx.Graph.Pregel do
 
   defp attach_parent_goto(targets, result) when is_map(result),
     do: %Command{update: result, goto: targets}
+
+  defp start_subgraph(subgraph, name, state, opts) do
+    sub_opts = subgraph_opts(subgraph, name, opts)
+
+    subgraph
+    |> saved_subgraph_resume(sub_opts)
+    |> run_subgraph(subgraph, state, sub_opts)
+  end
+
+  # A subgraph with its own checkpointer resumes from its namespaced
+  # checkpoint when the resume values answer one of its pending
+  # interrupts. Without a checkpointer the subgraph re-runs from
+  # :__start__ with resume values injected — all pre-interrupt subgraph
+  # nodes execute again, so their side effects must be idempotent.
+  defp saved_subgraph_resume(%Compiled{checkpointer: nil}, _sub_opts), do: :fresh
+
+  defp saved_subgraph_resume(%Compiled{checkpointer: cp}, sub_opts) do
+    sub_opts
+    |> Map.get(:resume_values, %{})
+    |> load_resumable_checkpoint(cp, sub_opts.config)
+  end
+
+  defp load_resumable_checkpoint(values, _cp, _config) when values == %{}, do: :fresh
+
+  defp load_resumable_checkpoint(values, cp, config) do
+    config
+    |> Keyword.get(:thread_id)
+    |> load_saved_interrupt(cp, config)
+    |> match_pending_resume(values)
+  end
+
+  defp load_saved_interrupt(nil, _cp, _config), do: :none
+  defp load_saved_interrupt(_thread_id, cp, config), do: cp.load(config)
+
+  defp match_pending_resume(
+         {:ok, %Checkpoint{pending_interrupts: [_ | _] = pending} = saved},
+         values
+       ) do
+    pending
+    |> Enum.any?(&Map.has_key?(values, &1.id))
+    |> resumable_checkpoint(saved)
+  end
+
+  defp match_pending_resume(_loaded, _values), do: :fresh
+
+  defp resumable_checkpoint(true, saved), do: {:resume, saved}
+  defp resumable_checkpoint(false, _saved), do: :fresh
+
+  defp run_subgraph(:fresh, subgraph, state, sub_opts) do
+    subgraph.initial_state
+    |> State.apply_update(state, subgraph.reducers)
+    |> then(&run(subgraph, &1, sub_opts))
+  end
+
+  defp run_subgraph({:resume, saved}, subgraph, _state, sub_opts) do
+    {resume_state, overrides} =
+      Compiled.resume_overrides(saved, Map.get(sub_opts, :resume_values, %{}))
+
+    run(subgraph, resume_state, Map.merge(sub_opts, Map.new(overrides)))
+  end
 
   defp subgraph_opts(subgraph, name, opts) do
     %{
@@ -493,8 +806,8 @@ defmodule LangEx.Graph.Pregel do
 
   defp unwrap_subgraph({:error, reason}), do: throw({:lang_ex_graph_error, reason})
 
-  defp prepare_node_context(name, opts) do
-    Process.put(:lang_ex_current_node, name)
+  defp prepare_node_context(entry, opts) do
+    Process.put(:lang_ex_current_node, entry_name(entry))
     Process.put(:lang_ex_interrupt_counter, 0)
     Process.put(:lang_ex_resume_values, resume_values(opts))
     Process.put(:lang_ex_stream_emit, opts.emit_to)
@@ -624,8 +937,9 @@ defmodule LangEx.Graph.Pregel do
     |> save_step_checkpoint(opts, cp, config, step, state, nodes)
   end
 
-  # :exit skips per-step checkpoints entirely — interrupts still persist,
-  # so pause/resume works, but crash recovery restarts from :__start__.
+  # :exit skips per-step checkpoints entirely — interrupts and the final
+  # completion checkpoint still persist, so pause/resume works, but
+  # crash recovery restarts from :__start__.
   defp save_step_checkpoint(:exit, _opts, _cp, _config, _step, _state, _nodes), do: nil
 
   defp save_step_checkpoint(durability, opts, cp, config, step, state, nodes) do
@@ -633,15 +947,12 @@ defmodule LangEx.Graph.Pregel do
     |> Keyword.get(:thread_id)
     |> persist_checkpoint(cp, config, durability,
       state: state,
-      next_nodes: Enum.map(nodes, &entry_name/1),
+      next_nodes: nodes,
       step: step,
       parent_id: Map.get(opts, :parent_id),
       metadata: %{}
     )
   end
-
-  defp persist_checkpoint(thread_id, cp, config, data),
-    do: persist_checkpoint(thread_id, cp, config, :sync, data)
 
   defp persist_checkpoint(nil, _cp, _config, _durability, _data), do: nil
 
@@ -671,7 +982,7 @@ defmodule LangEx.Graph.Pregel do
     :ok
   end
 
-  defp save_interrupts(state, _pending_nodes, interrupts, %{checkpointer: nil} = opts) do
+  defp save_interrupts(state, _pending, interrupts, _completed_next, %{checkpointer: nil} = opts) do
     interrupts
     |> interrupt_payload(opts)
     |> emit_interrupt(state, opts)
@@ -679,8 +990,9 @@ defmodule LangEx.Graph.Pregel do
 
   defp save_interrupts(
          state,
-         pending_nodes,
+         pending,
          interrupts,
+         completed_next,
          %{
            checkpointer: cp,
            config: config,
@@ -689,13 +1001,13 @@ defmodule LangEx.Graph.Pregel do
        ) do
     config
     |> Keyword.get(:thread_id)
-    |> persist_checkpoint(cp, config,
+    |> persist_checkpoint(cp, config, :sync,
       state: state,
-      next_nodes: pending_nodes,
+      next_nodes: pending,
       step: step,
       parent_id: Map.get(opts, :parent_id),
       pending_interrupts: interrupts,
-      metadata: %{resume_values: resume_values(opts)}
+      metadata: %{resume_values: resume_values(opts), completed_next: completed_next}
     )
 
     interrupts

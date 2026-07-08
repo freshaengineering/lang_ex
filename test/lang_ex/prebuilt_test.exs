@@ -66,7 +66,7 @@ defmodule LangEx.PrebuiltTest do
         Prebuilt.agent(
           provider: LangEx.LLM.OpenAI,
           model: "gpt-4o",
-          checkpointer: LangEx.Checkpointer.Mock,
+          checkpointer: LangEx.Checkpointer.Memory,
           interrupt_before: [:agent]
         )
 

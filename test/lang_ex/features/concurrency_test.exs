@@ -21,6 +21,7 @@ defmodule LangEx.Features.ConcurrencyTest do
       assert %{peak: 1} = Agent.get(tracker, & &1)
     end
 
+    @tag :capture_log
     test "node_timeout kills slow parallel nodes" do
       graph =
         Graph.new(a: nil, b: nil)
@@ -35,9 +36,26 @@ defmodule LangEx.Features.ConcurrencyTest do
         |> Graph.add_edge(:slow, :__end__)
         |> Graph.compile()
 
-      assert_raise RuntimeError, "node execution timed out", fn ->
-        LangEx.invoke(graph, %{}, node_timeout: 50)
-      end
+      assert {:error,
+              %LangEx.NodeError{node: :slow, reason: %LangEx.NodeTimeoutError{timeout_ms: 50}}} =
+               LangEx.invoke(graph, %{}, node_timeout: 50)
+    end
+
+    @tag :capture_log
+    test "node_timeout applies to single-node super-steps" do
+      graph =
+        Graph.new(value: nil)
+        |> Graph.add_node(:slow, fn _state ->
+          Process.sleep(500)
+          %{value: :ok}
+        end)
+        |> Graph.add_edge(:__start__, :slow)
+        |> Graph.add_edge(:slow, :__end__)
+        |> Graph.compile()
+
+      assert {:error,
+              %LangEx.NodeError{node: :slow, reason: %LangEx.NodeTimeoutError{timeout_ms: 50}}} =
+               LangEx.invoke(graph, %{}, node_timeout: 50)
     end
   end
 

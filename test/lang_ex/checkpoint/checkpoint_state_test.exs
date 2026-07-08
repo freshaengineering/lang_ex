@@ -1,11 +1,11 @@
 defmodule LangEx.Checkpoint.CheckpointStateTest do
   use ExUnit.Case, async: false
 
-  alias LangEx.Checkpointer.Mock
+  alias LangEx.Checkpointer.Memory
   alias LangEx.Graph
 
   setup do
-    Mock.clear()
+    Memory.clear()
     :ok
   end
 
@@ -16,7 +16,7 @@ defmodule LangEx.Checkpoint.CheckpointStateTest do
         |> Graph.add_node(:passthrough, fn state -> %{label: "done:#{state.value}"} end)
         |> Graph.add_edge(:__start__, :passthrough)
         |> Graph.add_edge(:passthrough, :__end__)
-        |> Graph.compile(checkpointer: Mock)
+        |> Graph.compile(checkpointer: Memory)
 
       {:ok, first} =
         LangEx.invoke(graph, %{value: 1}, config: [thread_id: "merge-test-1"])
@@ -35,7 +35,7 @@ defmodule LangEx.Checkpoint.CheckpointStateTest do
         |> Graph.add_node(:sum, fn state -> %{b: state.a + state.b} end)
         |> Graph.add_edge(:__start__, :sum)
         |> Graph.add_edge(:sum, :__end__)
-        |> Graph.compile(checkpointer: Mock)
+        |> Graph.compile(checkpointer: Memory)
 
       {:ok, first} =
         LangEx.invoke(graph, %{a: 10, b: 5}, config: [thread_id: "merge-test-2"])
@@ -56,7 +56,7 @@ defmodule LangEx.Checkpoint.CheckpointStateTest do
         end)
         |> Graph.add_edge(:__start__, :work)
         |> Graph.add_edge(:work, :__end__)
-        |> Graph.compile(checkpointer: Mock)
+        |> Graph.compile(checkpointer: Memory)
 
       {:ok, first} =
         LangEx.invoke(graph, %{log: ["init"]}, config: [thread_id: "merge-test-3"])
@@ -75,7 +75,7 @@ defmodule LangEx.Checkpoint.CheckpointStateTest do
         |> Graph.add_node(:read, fn state -> %{label: "saw:#{state.value}"} end)
         |> Graph.add_edge(:__start__, :read)
         |> Graph.add_edge(:read, :__end__)
-        |> Graph.compile(checkpointer: Mock)
+        |> Graph.compile(checkpointer: Memory)
 
       {:ok, result} =
         LangEx.invoke(graph, %{value: 42}, config: [thread_id: "fresh-thread"])
@@ -97,15 +97,42 @@ defmodule LangEx.Checkpoint.CheckpointStateTest do
         |> Graph.add_edge(:__start__, :prepare)
         |> Graph.add_edge(:prepare, :flaky)
         |> Graph.add_edge(:flaky, :__end__)
-        |> Graph.compile(checkpointer: Mock)
+        |> Graph.compile(checkpointer: Memory)
 
-      assert_raise RuntimeError, "transient failure", fn ->
-        LangEx.invoke(graph, %{trail: [:input]}, config: [thread_id: "crash-recovery"])
-      end
+      assert {:error, %LangEx.NodeError{node: :flaky, reason: %RuntimeError{}}} =
+               LangEx.invoke(graph, %{trail: [:input]}, config: [thread_id: "crash-recovery"])
 
       {:ok, result} = LangEx.invoke(graph, %{}, config: [thread_id: "crash-recovery"])
 
       assert %{trail: [:input, :prepare, :flaky]} = result
+    end
+
+    test "pending Sends keep their payloads across crash-continue" do
+      {:ok, attempts} = Agent.start_link(fn -> 0 end)
+
+      graph =
+        Graph.new(results: {[], &Kernel.++/2})
+        |> Graph.add_node(:setup, fn _state -> %{} end)
+        |> Graph.add_node(:worker, fn state ->
+          Agent.get_and_update(attempts, &{&1, &1 + 1})
+          |> Kernel.==(0)
+          |> crash_or_process(state.item)
+        end)
+        |> Graph.add_edge(:__start__, :setup)
+        |> Graph.add_conditional_edges(:setup, fn _state ->
+          [%LangEx.Send{node: :worker, state: %{item: "payload"}}]
+        end)
+        |> Graph.add_edge(:worker, :__end__)
+        |> Graph.compile(checkpointer: Memory)
+
+      config = [thread_id: "send-crash-recovery"]
+
+      assert {:error, %LangEx.NodeError{node: :worker}} =
+               LangEx.invoke(graph, %{}, config: config)
+
+      {:ok, result} = LangEx.invoke(graph, %{}, config: config)
+
+      assert %{results: ["payload"]} = result
     end
 
     test "empty input on a completed thread starts a fresh pass" do
@@ -114,7 +141,7 @@ defmodule LangEx.Checkpoint.CheckpointStateTest do
         |> Graph.add_node(:work, fn _state -> %{runs: 1} end)
         |> Graph.add_edge(:__start__, :work)
         |> Graph.add_edge(:work, :__end__)
-        |> Graph.compile(checkpointer: Mock)
+        |> Graph.compile(checkpointer: Memory)
 
       {:ok, %{runs: 1}} = LangEx.invoke(graph, %{}, config: [thread_id: "completed-thread"])
       {:ok, result} = LangEx.invoke(graph, %{}, config: [thread_id: "completed-thread"])
@@ -144,7 +171,7 @@ defmodule LangEx.Checkpoint.CheckpointStateTest do
         |> Graph.add_node(:work, fn state -> %{value: state.value + 1} end)
         |> Graph.add_edge(:__start__, :work)
         |> Graph.add_edge(:work, :__end__)
-        |> Graph.compile(checkpointer: Mock)
+        |> Graph.compile(checkpointer: Memory)
 
       {:ok, %{value: 1}} =
         LangEx.invoke(graph, %{value: 0},
@@ -167,7 +194,7 @@ defmodule LangEx.Checkpoint.CheckpointStateTest do
         |> Graph.add_edge(:__start__, :prepare)
         |> Graph.add_edge(:prepare, :gate)
         |> Graph.add_edge(:gate, :__end__)
-        |> Graph.compile(checkpointer: Mock)
+        |> Graph.compile(checkpointer: Memory)
 
       config = [thread_id: "durability-exit"]
 
@@ -178,6 +205,48 @@ defmodule LangEx.Checkpoint.CheckpointStateTest do
 
       {:ok, %{approved: true}} =
         LangEx.invoke(graph, %LangEx.Command{resume: true}, config: config, durability: :exit)
+    end
+
+    test ":exit writes a final checkpoint when the run completes" do
+      graph =
+        Graph.new(value: 0)
+        |> Graph.add_node(:work, fn state -> %{value: state.value + 1} end)
+        |> Graph.add_edge(:__start__, :work)
+        |> Graph.add_edge(:work, :__end__)
+        |> Graph.compile(checkpointer: Memory)
+
+      config = [thread_id: "exit-final-checkpoint"]
+
+      {:ok, %{value: 1}} = LangEx.invoke(graph, %{value: 0}, config: config, durability: :exit)
+
+      assert {:ok, %LangEx.Checkpoint{state: %{value: 1}, next_nodes: [:__end__]}} =
+               LangEx.get_state(graph, config: config)
+    end
+
+    test ":exit persists the failed super-step so an empty invoke can retry it" do
+      {:ok, attempts} = Agent.start_link(fn -> 0 end)
+
+      graph =
+        Graph.new(trail: {[], &Kernel.++/2})
+        |> Graph.add_node(:prepare, fn _state -> %{trail: [:prepare]} end)
+        |> Graph.add_node(:flaky, fn _state ->
+          Agent.get_and_update(attempts, &{&1, &1 + 1})
+          |> Kernel.==(0)
+          |> crash_first_attempt()
+        end)
+        |> Graph.add_edge(:__start__, :prepare)
+        |> Graph.add_edge(:prepare, :flaky)
+        |> Graph.add_edge(:flaky, :__end__)
+        |> Graph.compile(checkpointer: Memory)
+
+      config = [thread_id: "exit-failure-checkpoint"]
+
+      assert {:error, %LangEx.NodeError{node: :flaky}} =
+               LangEx.invoke(graph, %{}, config: config, durability: :exit)
+
+      {:ok, result} = LangEx.invoke(graph, %{}, config: config, durability: :exit)
+
+      assert %{trail: [:prepare, :flaky]} = result
     end
   end
 
@@ -190,4 +259,7 @@ defmodule LangEx.Checkpoint.CheckpointStateTest do
 
   defp crash_first_attempt(true), do: raise("transient failure")
   defp crash_first_attempt(false), do: %{trail: [:flaky]}
+
+  defp crash_or_process(true, _item), do: raise("worker crash")
+  defp crash_or_process(false, item), do: %{results: [item]}
 end
