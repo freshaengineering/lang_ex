@@ -35,17 +35,19 @@ defmodule LangEx.Features.NodePoliciesTest do
       assert Agent.get(attempts, & &1) == 3
     end
 
-    test "exhausted retries reraise the original exception" do
+    test "exhausted retries surface the original exception as a NodeError" do
       graph =
         Graph.new(value: nil)
         |> Graph.add_node(:doomed, fn _state -> raise "always fails" end,
-          retry: [max_attempts: 2, backoff_ms: 1]
+          retry: [max_attempts: 2, backoff_ms: 1, jitter: false]
         )
         |> Graph.add_edge(:__start__, :doomed)
         |> Graph.add_edge(:doomed, :__end__)
         |> Graph.compile()
 
-      assert_raise RuntimeError, "always fails", fn -> LangEx.invoke(graph, %{}) end
+      assert {:error,
+              %LangEx.NodeError{node: :doomed, reason: %RuntimeError{message: "always fails"}}} =
+               LangEx.invoke(graph, %{})
     end
 
     test "retryable?: false errors are not retried" do
@@ -65,7 +67,9 @@ defmodule LangEx.Features.NodePoliciesTest do
         |> Graph.add_edge(:strict, :__end__)
         |> Graph.compile()
 
-      assert_raise ArgumentError, fn -> LangEx.invoke(graph, %{}) end
+      assert {:error, %LangEx.NodeError{node: :strict, reason: %ArgumentError{}}} =
+               LangEx.invoke(graph, %{})
+
       assert Agent.get(attempts, & &1) == 1
     end
   end
@@ -117,6 +121,132 @@ defmodule LangEx.Features.NodePoliciesTest do
       {:ok, _} = LangEx.invoke(graph, %{})
 
       assert Agent.get(calls, & &1) == 2
+    end
+  end
+
+  describe "timeout: node option" do
+    @tag :capture_log
+    test "a slow node attempt surfaces as a NodeError with a timeout reason" do
+      graph =
+        Graph.new(value: nil)
+        |> Graph.add_node(
+          :slow,
+          fn _state ->
+            Process.sleep(500)
+            %{value: :ok}
+          end,
+          timeout: 50
+        )
+        |> Graph.add_edge(:__start__, :slow)
+        |> Graph.add_edge(:slow, :__end__)
+        |> Graph.compile()
+
+      assert {:error,
+              %LangEx.NodeError{node: :slow, reason: %LangEx.NodeTimeoutError{timeout_ms: 50}}} =
+               LangEx.invoke(graph, %{})
+    end
+
+    @tag :capture_log
+    test "the retry policy retries timed-out attempts" do
+      {:ok, attempts} = Agent.start_link(fn -> 0 end)
+
+      graph =
+        Graph.new(value: nil)
+        |> Graph.add_node(
+          :flaky_slow,
+          fn _state ->
+            Agent.get_and_update(attempts, &{&1 + 1, &1 + 1})
+            |> Kernel.==(1)
+            |> sleep_on_first_attempt()
+          end,
+          timeout: 80,
+          retry: [max_attempts: 2, backoff_ms: 1, jitter: false]
+        )
+        |> Graph.add_edge(:__start__, :flaky_slow)
+        |> Graph.add_edge(:flaky_slow, :__end__)
+        |> Graph.compile()
+
+      assert {:ok, %{value: :recovered}} = LangEx.invoke(graph, %{})
+      assert Agent.get(attempts, & &1) == 2
+    end
+
+    test "interrupts pass through a timed node" do
+      graph =
+        Graph.new(approved: nil)
+        |> Graph.add_node(
+          :gate,
+          fn _state -> %{approved: LangEx.Interrupt.interrupt("ok?")} end,
+          timeout: 5_000
+        )
+        |> Graph.add_edge(:__start__, :gate)
+        |> Graph.add_edge(:gate, :__end__)
+        |> Graph.compile(checkpointer: LangEx.Checkpointer.Memory)
+
+      config = [thread_id: "timed-interrupt-1"]
+
+      assert {:interrupt, "ok?", _} = LangEx.invoke(graph, %{}, config: config)
+
+      assert {:ok, %{approved: true}} =
+               LangEx.invoke(graph, %LangEx.Command{resume: true}, config: config)
+    end
+  end
+
+  describe "on_error: node option" do
+    test "the handler result becomes the node result after retries are exhausted" do
+      {:ok, attempts} = Agent.start_link(fn -> 0 end)
+
+      graph =
+        Graph.new(value: nil, fallback_reason: nil)
+        |> Graph.add_node(
+          :doomed,
+          fn _state ->
+            Agent.update(attempts, &(&1 + 1))
+            raise "provider down"
+          end,
+          retry: [max_attempts: 2, backoff_ms: 1, jitter: false],
+          on_error: fn exception, _state ->
+            %{value: :fallback, fallback_reason: Exception.message(exception)}
+          end
+        )
+        |> Graph.add_edge(:__start__, :doomed)
+        |> Graph.add_edge(:doomed, :__end__)
+        |> Graph.compile()
+
+      assert {:ok, %{value: :fallback, fallback_reason: "provider down"}} =
+               LangEx.invoke(graph, %{})
+
+      assert Agent.get(attempts, & &1) == 2
+    end
+
+    test "the handler can reroute with a Command" do
+      graph =
+        Graph.new(outcome: nil)
+        |> Graph.add_node(:risky, fn _state -> raise "boom" end,
+          on_error: fn _exception, _state ->
+            %LangEx.Command{update: %{}, goto: :recover}
+          end
+        )
+        |> Graph.add_node(:recover, fn _state -> %{outcome: :recovered} end)
+        |> Graph.add_edge(:__start__, :risky)
+        |> Graph.add_edge(:recover, :__end__)
+        |> Graph.compile(warn_unreachable: false)
+
+      assert {:ok, %{outcome: :recovered}} = LangEx.invoke(graph, %{})
+    end
+
+    test "a failing handler propagates as a NodeError" do
+      graph =
+        Graph.new(value: nil)
+        |> Graph.add_node(:doomed, fn _state -> raise "original" end,
+          on_error: fn _exception, _state -> raise "handler failed" end
+        )
+        |> Graph.add_edge(:__start__, :doomed)
+        |> Graph.add_edge(:doomed, :__end__)
+        |> Graph.compile()
+
+      assert {:error,
+              %LangEx.NodeError{node: :doomed, reason: %RuntimeError{message: "handler failed"}}} =
+               LangEx.invoke(graph, %{})
     end
   end
 
@@ -196,6 +326,13 @@ defmodule LangEx.Features.NodePoliciesTest do
 
   defp fail_below_three(true), do: raise("transient")
   defp fail_below_three(false), do: %{value: :recovered}
+
+  defp sleep_on_first_attempt(true) do
+    Process.sleep(500)
+    %{value: :too_slow}
+  end
+
+  defp sleep_on_first_attempt(false), do: %{value: :recovered}
 
   defp rate_limited_then_ok(true), do: {:error, {429, %{}}}
 

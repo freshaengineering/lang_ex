@@ -9,10 +9,10 @@ if Code.ensure_loaded?(Ecto) do
       field(:checkpoint_id, :string)
       field(:parent_id, :string)
       field(:state, :map)
-      field(:next_nodes, {:array, :string})
+      field(:next_nodes, LangEx.Checkpointer.Postgres.JsonbList)
       field(:step, :integer, default: 0)
       field(:metadata, :map, default: %{})
-      field(:pending_interrupts, {:array, :map})
+      field(:pending_interrupts, LangEx.Checkpointer.Postgres.JsonbList)
       field(:created_at, :utc_datetime_usec)
       field(:version, :integer, default: 1)
     end

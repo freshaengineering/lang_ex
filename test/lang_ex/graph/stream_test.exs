@@ -34,6 +34,27 @@ defmodule LangEx.Graph.StreamTest do
       assert Enum.any?(events, &match?({:node_end, :upper, _}, &1))
     end
 
+    test "parallel super-steps emit node_start and node_end for every node" do
+      events =
+        Graph.new(a: nil, b: nil)
+        |> Graph.add_node(:fan, fn _state -> %{} end)
+        |> Graph.add_node(:left, fn _state -> %{a: :ok} end)
+        |> Graph.add_node(:right, fn _state -> %{b: :ok} end)
+        |> Graph.add_edge(:__start__, :fan)
+        |> Graph.add_edge(:fan, :left)
+        |> Graph.add_edge(:fan, :right)
+        |> Graph.add_edge(:left, :__end__)
+        |> Graph.add_edge(:right, :__end__)
+        |> Graph.compile()
+        |> LangEx.stream(%{})
+        |> Enum.to_list()
+
+      for node <- [:left, :right] do
+        assert Enum.any?(events, &match?({:node_start, ^node}, &1))
+        assert Enum.any?(events, &match?({:node_end, ^node, _}, &1))
+      end
+    end
+
     test "stream keeps yielding while a node is slow" do
       events =
         Graph.new(value: 0)
@@ -51,7 +72,7 @@ defmodule LangEx.Graph.StreamTest do
     end
 
     @tag :capture_log
-    test "runner crash surfaces as an error done event" do
+    test "node crash surfaces as an error done event" do
       events =
         Graph.new(value: 0)
         |> Graph.add_node(:boom, fn _state -> raise "kaboom" end)
@@ -61,8 +82,10 @@ defmodule LangEx.Graph.StreamTest do
         |> LangEx.stream(%{value: 0})
         |> Enum.to_list()
 
-      assert [{:done, {:error, {:runner_exit, {%RuntimeError{message: "kaboom"}, _}}}}] =
-               Enum.filter(events, &match?({:done, _}, &1))
+      assert [
+               {:done,
+                {:error, %LangEx.NodeError{node: :boom, reason: %RuntimeError{message: "kaboom"}}}}
+             ] = Enum.filter(events, &match?({:done, _}, &1))
     end
 
     test ":values mode yields full state after each step" do
@@ -135,7 +158,7 @@ defmodule LangEx.Graph.StreamTest do
         end)
         |> Graph.add_edge(:__start__, :check)
         |> Graph.add_edge(:check, :__end__)
-        |> Graph.compile(checkpointer: LangEx.Checkpointer.Mock)
+        |> Graph.compile(checkpointer: LangEx.Checkpointer.Memory)
 
       config = [thread_id: "stream-resume-1"]
 

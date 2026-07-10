@@ -214,51 +214,69 @@ defmodule LangEx.Graph.Compiled do
   defp forked_result({:error, _} = err, _forked), do: err
 
   defp resume_from_checkpoint(
-         {:ok, %Checkpoint{pending_interrupts: [_ | _] = pending} = saved},
+         {:ok, %Checkpoint{pending_interrupts: [_ | _]} = saved},
          graph,
          resume_val,
          opts
        ) do
-    pending
-    |> Enum.any?(&static_interrupt?/1)
-    |> dispatch_resume(saved, graph, resume_val, opts)
+    {state, overrides} = resume_overrides(saved, resume_val)
+    {:run, state, build_run_opts(opts, graph, overrides)}
   end
 
   defp resume_from_checkpoint(_, _graph, _resume_val, _opts),
     do: {:error, :no_pending_interrupt}
+
+  @doc false
+  @spec resume_overrides(Checkpoint.t(), term()) :: {map(), keyword()}
+  def resume_overrides(%Checkpoint{pending_interrupts: pending} = saved, resume_val) do
+    pending
+    |> Enum.any?(&static_interrupt?/1)
+    |> build_resume_overrides(saved, resume_val)
+  end
 
   defp static_interrupt?(%{static: true}), do: true
   defp static_interrupt?(_interrupt), do: false
 
   # Static breakpoints re-run the paused super-step (interrupt_before) or
   # continue with the already-resolved next nodes (interrupt_after); the
-  # first resumed super-step bypasses breakpoints so it does not pause again.
-  defp dispatch_resume(true, saved, graph, _resume_val, opts) do
-    {:run, saved.state,
-     opts
-     |> build_run_opts(graph,
+  # first resumed super-step bypasses breakpoints so it does not pause
+  # again. Earlier dynamic resume answers persist via :resume_values.
+  defp build_resume_overrides(true, saved, _resume_val) do
+    {saved.state,
+     [
        start_nodes: saved.next_nodes,
        step: static_resume_step(saved),
-       parent_id: saved.checkpoint_id
-     )
-     |> Map.put(:bypass_breakpoints, true)}
+       parent_id: saved.checkpoint_id,
+       bypass_breakpoints: true,
+       resume_values: saved_resume_values(saved),
+       completed_next: saved_completed_next(saved)
+     ]}
   end
 
-  defp dispatch_resume(false, saved, graph, resume_val, opts) do
+  # The resumed super-step bypasses static breakpoints too: the paused
+  # nodes were already approved to run when the interrupt fired.
+  defp build_resume_overrides(false, saved, resume_val) do
     values =
       saved
       |> saved_resume_values()
       |> Map.merge(normalize_resume(resume_val, saved.pending_interrupts))
 
-    nodes = saved.pending_interrupts |> Enum.map(& &1.node) |> Enum.uniq()
+    entries = saved.pending_interrupts |> Enum.map(&interrupt_entry/1) |> Enum.uniq()
 
-    {:run, saved.state,
-     build_run_opts(opts, graph,
-       resume: %{nodes: nodes, values: values},
+    {saved.state,
+     [
+       resume: %{nodes: entries, values: values},
        step: saved.step,
-       parent_id: saved.checkpoint_id
-     )}
+       parent_id: saved.checkpoint_id,
+       bypass_breakpoints: true,
+       completed_next: saved_completed_next(saved)
+     ]}
   end
+
+  # Checkpoints written before format v2 lack the :entry key; falling
+  # back to the node name loses Send payloads but keeps resume working.
+  defp interrupt_entry(%{entry: entry}), do: entry
+  defp interrupt_entry(%{node: node}), do: node
 
   defp static_resume_step(
          %Checkpoint{pending_interrupts: [%{value: {:interrupt_after, _}} | _]} = saved
@@ -271,6 +289,12 @@ defmodule LangEx.Graph.Compiled do
     do: values
 
   defp saved_resume_values(_saved), do: %{}
+
+  defp saved_completed_next(%Checkpoint{metadata: %{completed_next: targets}})
+       when is_list(targets),
+       do: targets
+
+  defp saved_completed_next(_saved), do: []
 
   # A resume map is treated as id-addressed when it answers at least one
   # currently pending interrupt id; extra keys pre-answer future interrupts.
@@ -316,6 +340,9 @@ defmodule LangEx.Graph.Compiled do
       emit_to: nil,
       start_nodes: Keyword.get(overrides, :start_nodes),
       parent_id: Keyword.get(overrides, :parent_id),
+      bypass_breakpoints: Keyword.get(overrides, :bypass_breakpoints, false),
+      resume_values: Keyword.get(overrides, :resume_values, %{}),
+      completed_next: Keyword.get(overrides, :completed_next, []),
       max_concurrency: Keyword.get(opts, :max_concurrency),
       node_timeout: Keyword.get(opts, :node_timeout),
       store: graph.store,

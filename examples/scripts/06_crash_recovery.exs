@@ -18,11 +18,11 @@ defmodule PipelineDemo do
   def run do
     graph = build()
 
-    try do
+    # Node failures come back as a structured error, not a raise.
+    {:error, %LangEx.NodeError{node: :upload} = error} =
       LangEx.invoke(graph, %{}, config: @config)
-    rescue
-      error -> IO.puts("crashed: #{Exception.message(error)}")
-    end
+
+    IO.puts("crashed: #{Exception.message(error)}")
 
     # Flaky dependency is back — same thread, empty input, resumes at :upload.
     {:ok, result} = LangEx.invoke(graph, %{}, config: @config)

@@ -48,7 +48,7 @@ Python has [LangGraph](https://www.langchain.com/langgraph). Elixir deserves the
 ```elixir
 def deps do
   [
-    {:lang_ex, "~> 0.5.0"},
+    {:lang_ex, "~> 0.6.0"},
 
     # Optional: for Redis checkpointing
     {:redix, "~> 1.5"},
@@ -124,10 +124,10 @@ graph = Graph.new(...) |> ... |> Graph.compile(checkpointer: LangEx.Checkpointer
 {:ok, result} = LangEx.invoke(graph, input, config: [thread_id: "my-thread"])
 ```
 
-| | Redis | PostgreSQL |
-|---|---|---|
-| **Setup** | Add `redix` dep (auto-starts) | Add `ecto_sql` + run migration |
-| **Best for** | Fast iteration, ephemeral workflows | Durable state, transactional guarantees |
+| | Memory | Redis | PostgreSQL |
+|---|---|---|---|
+| **Setup** | Built in, nothing to add | Add `redix` dep (auto-starts) | Add `ecto_sql` + run migration |
+| **Best for** | Development and tests (per-VM, lost on restart) | Fast iteration, ephemeral workflows | Durable state, transactional guarantees |
 
 For PostgreSQL, generate a migration and call `LangEx.Migration.up()`:
 
@@ -139,6 +139,18 @@ defmodule MyApp.Repo.Migrations.AddLangEx do
   def down, do: LangEx.Migration.down()
 end
 ```
+
+Checkpoint write timing is controlled by the `:durability` invoke option:
+
+| Mode | Writes | Trade-off |
+|---|---|---|
+| `:sync` (default) | After every super-step, on the hot path | Strongest crash recovery |
+| `:async` | After every super-step, in a supervised task | Lower latency; a crash may lose the latest step |
+| `:exit` | Only on interrupts, completion, and failures | Fastest; mid-run crash recovery restarts from `:__start__` |
+
+Under every mode, checkpoints preserve full work entries — including pending
+`%LangEx.Send{}` payloads — so crash-continue and interrupt-resume pick up
+exactly where the run stopped (checkpoint format v2).
 
 ### Human-in-the-Loop Interrupts
 
@@ -165,6 +177,52 @@ graph =
 {:ok, result} =
   LangEx.invoke(graph, %LangEx.Command{resume: true}, config: [thread_id: "approval-1"])
 ```
+
+On resume the interrupted node re-runs from the top: earlier `interrupt/1`
+calls return their recorded answers and execution continues past the pause
+point. Side effects placed before an interrupt therefore execute again —
+keep them idempotent or move them to a later node. `interrupt/1` must be
+called from a graph node function; calling it from tool functions or
+processes spawned inside a node raises.
+
+When a branch of a parallel super-step interrupts, completed siblings keep
+their results *and* their routing: their state updates merge before the
+pause and their next targets are recorded in the checkpoint, so nothing is
+re-executed or dropped on resume.
+
+### Error Handling
+
+Node exceptions never leak as raises out of `invoke/3`. After a node's
+retry policy (if any) is exhausted, the run returns a structured error
+with the failing node and original cause:
+
+```elixir
+{:error, %LangEx.NodeError{node: :fetch, reason: %Req.TransportError{}}} =
+  LangEx.invoke(graph, input)
+```
+
+Per-node execution policies compose on `Graph.add_node/4`:
+
+```elixir
+Graph.add_node(graph, :fetch, &fetch_data/1,
+  timeout: 10_000,
+  retry: [max_attempts: 4, initial_interval_ms: 200, backoff_factor: 2.0, jitter: true],
+  on_error: fn exception, _state -> %{fetch_failed: Exception.message(exception)} end
+)
+```
+
+- `retry:` — exponential backoff with jitter and a `max_interval_ms` cap;
+  retries exceptions only (`{:error, _}` returns are ordinary results)
+- `timeout:` — per-attempt budget; a timed-out attempt raises
+  `LangEx.NodeTimeoutError`, which the retry policy can retry
+- `on_error:` — fallback invoked after retries are exhausted; its return
+  value becomes the node result (a state update or `%LangEx.Command{}`)
+- `cache:` — memoize results by input state (bounded ETS, optional TTL)
+- `defer:` — fan-in barrier for parallel branches converging at
+  different depths
+
+Programmer errors — routing to an undefined node, a missing conditional
+mapping — still raise with descriptive messages.
 
 ### Streaming
 
@@ -209,6 +267,17 @@ outer =
   |> Graph.compile()
 ```
 
+Interrupts, errors, context, and stream events propagate through subgraph
+boundaries. Resuming an interrupt that fired inside a subgraph depends on
+the subgraph's own checkpointing:
+
+- **Subgraph compiled with its own checkpointer** — checkpoints are
+  namespaced under `"{thread_id}/{node_name}"` and the subgraph resumes
+  from its saved position; nodes before the interrupt do not re-run.
+- **No subgraph checkpointer** — the subgraph re-runs from `:__start__`
+  with resume values injected, so all pre-interrupt subgraph nodes
+  execute again and their side effects must be idempotent.
+
 ### Runtime Context
 
 Inject dependencies into nodes without closures:
@@ -247,15 +316,15 @@ end
 LangEx.LLM.Registry.register_provider(:groq, MyApp.LLM.Groq)
 ```
 
-**Custom checkpointer** -- implement `LangEx.Checkpointer` behaviour (`save/2`, `load/1`, `list/2`).
+**Custom checkpointer** -- implement `LangEx.Checkpointer` behaviour (`save/2`, `load/1`, `list/2`, `delete_thread/1`).
 
 ## Examples
 
 | Example | What it demonstrates |
 |---|---|
-| [Feature Scripts](examples/scripts) | Ten tiny, runnable scripts — one per feature, no API keys or databases needed (`elixir examples/scripts/01_quick_start.exs`) |
-| [Incident Responder](examples/incident_responder) | DevOps agent with tool chains, multi-turn conversation, conditional routing, Postgres checkpointing |
-| [Support Triage](examples/support_triage) | Customer support agent with intent classification and escalation |
+| [Feature Scripts](https://github.com/surgeventures/lang_ex/tree/main/examples/scripts) | Ten tiny, runnable scripts — one per feature, no API keys or databases needed (`elixir examples/scripts/01_quick_start.exs`) |
+| [Incident Responder](https://github.com/surgeventures/lang_ex/tree/main/examples/incident_responder) | DevOps agent with tool chains, multi-turn conversation, conditional routing, Postgres checkpointing |
+| [Support Triage](https://github.com/surgeventures/lang_ex/tree/main/examples/support_triage) | Customer support agent with intent classification and escalation |
 
 ## License
 

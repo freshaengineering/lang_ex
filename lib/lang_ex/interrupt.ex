@@ -11,6 +11,19 @@ defmodule LangEx.Interrupt do
   A node may interrupt multiple times: on each resume the node re-runs
   from the top, earlier `interrupt/1` calls return their recorded
   values, and the first unanswered call pauses again.
+
+  Because the node re-runs from the top, side effects placed before an
+  `interrupt/1` call execute again on resume — keep them idempotent or
+  move them to a node after the interrupt.
+
+  ## Call-site restrictions
+
+  `interrupt/1` must run in the process executing the graph node. Tool
+  functions dispatched by `LangEx.Tool.Node` and any process spawned
+  inside a node run outside that context, so calling `interrupt/1`
+  there raises (with the default tool error handling, the raise turns
+  into an error tool message). Interrupt from a dedicated graph node
+  before or after the tool step instead.
   """
 
   @doc """
@@ -23,6 +36,10 @@ defmodule LangEx.Interrupt do
   """
   @spec interrupt(term()) :: term()
   def interrupt(payload \\ nil) do
+    :lang_ex_current_node
+    |> Process.get()
+    |> require_node_context!()
+
     id = next_interrupt_id()
 
     :lang_ex_resume_values
@@ -33,6 +50,15 @@ defmodule LangEx.Interrupt do
 
   defp resolve_resume({:ok, value}, _id, _payload), do: value
   defp resolve_resume(:error, id, payload), do: throw({:lang_ex_interrupt, id, payload})
+
+  defp require_node_context!(nil) do
+    raise RuntimeError,
+          "LangEx.Interrupt.interrupt/1 called outside a graph node — " <>
+            "it cannot pause from tool functions or processes spawned inside a node; " <>
+            "move the interrupt into a graph node function"
+  end
+
+  defp require_node_context!(_node), do: :ok
 
   defp next_interrupt_id do
     node = Process.get(:lang_ex_current_node)

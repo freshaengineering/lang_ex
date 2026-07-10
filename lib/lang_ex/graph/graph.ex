@@ -22,6 +22,8 @@ defmodule LangEx.Graph do
           {:retry, keyword() | true}
           | {:cache, keyword() | true}
           | {:defer, boolean()}
+          | {:timeout, pos_integer()}
+          | {:on_error, (Exception.t(), map() -> map() | LangEx.Command.t())}
 
   @type routing_fn :: (map() -> atom() | String.t())
 
@@ -33,7 +35,8 @@ defmodule LangEx.Graph do
           schema: keyword()
         }
 
-  @node_opt_keys [:retry, :cache, :defer]
+  @node_opt_keys [:retry, :cache, :defer, :timeout, :on_error]
+  @reserved_names [:__start__, :__end__]
 
   @doc """
   Creates a new graph builder with the given state schema.
@@ -53,14 +56,23 @@ defmodule LangEx.Graph do
 
   ## Execution policy options
 
-  - `:retry` - retry the node on exceptions. `true` for defaults, or
-    `[max_attempts: 3, backoff_ms: 100, retryable?: fn exception -> ... end]`
-    (linear backoff: `attempt * backoff_ms`).
+  - `:retry` - retry the node on exceptions. `true` for defaults, or a
+    keyword list — see `LangEx.Graph.RetryPolicy` for options
+    (`max_attempts:`, `initial_interval_ms:`, `backoff_factor:`,
+    `max_interval_ms:`, `jitter:`, `retryable?:`).
   - `:cache` - memoize successful results keyed by the node's input
-    state. `true` for no expiry, or `[ttl: milliseconds]`.
+    state. `true` for no expiry, or `[ttl: milliseconds]`. Cannot be
+    combined with `:on_error`.
   - `:defer` - when `true`, the node runs only once no other
     (non-deferred) nodes are active — a fan-in barrier for parallel
     branches that converge at different depths.
+  - `:timeout` - per-attempt time budget in milliseconds. A timed-out
+    attempt raises `LangEx.NodeTimeoutError`, which the retry policy
+    can retry; when exhausted it surfaces as `{:error, %LangEx.NodeError{}}`.
+  - `:on_error` - `fn exception, state -> update end` invoked after the
+    retry policy is exhausted; its return value becomes the node result
+    (a state update map or `%LangEx.Command{}`). Failures inside the
+    handler propagate.
   """
   @spec add_node(t(), atom(), node_fn() | Compiled.t(), [node_opt()]) :: t()
   def add_node(graph, name, node_value, node_opts \\ [])
@@ -79,7 +91,23 @@ defmodule LangEx.Graph do
     |> put_node_opts(name, node_opts)
   end
 
-  defp put_node(graph, name, value), do: %{graph | nodes: Map.put(graph.nodes, name, value)}
+  defp put_node(graph, name, value) do
+    :ok = validate_node_name!(graph, name)
+    %{graph | nodes: Map.put(graph.nodes, name, value)}
+  end
+
+  defp validate_node_name!(_graph, name) when name in @reserved_names do
+    raise ArgumentError,
+          "#{inspect(name)} is a reserved node name — " <>
+            "graphs start at :__start__ and finish at :__end__ implicitly"
+  end
+
+  defp validate_node_name!(%__MODULE__{nodes: nodes}, name) when is_map_key(nodes, name) do
+    raise ArgumentError,
+          "node #{inspect(name)} is already defined — node names must be unique"
+  end
+
+  defp validate_node_name!(_graph, _name), do: :ok
 
   defp put_node_opts(graph, _name, []), do: graph
 
@@ -93,6 +121,9 @@ defmodule LangEx.Graph do
     |> Keyword.keys()
     |> Enum.reject(&(&1 in @node_opt_keys))
     |> assert_no_unknown_opts!(name)
+
+    Enum.each(node_opts, &validate_node_opt!(name, &1))
+    assert_compatible_opts!(name, node_opts)
   end
 
   defp assert_no_unknown_opts!([], _name), do: :ok
@@ -103,8 +134,41 @@ defmodule LangEx.Graph do
             "supported: #{inspect(@node_opt_keys)}"
   end
 
+  defp validate_node_opt!(_name, {:retry, value}) when value == true or is_list(value), do: :ok
+  defp validate_node_opt!(_name, {:cache, value}) when value == true or is_list(value), do: :ok
+  defp validate_node_opt!(_name, {:defer, value}) when is_boolean(value), do: :ok
+
+  defp validate_node_opt!(_name, {:timeout, value}) when is_integer(value) and value > 0,
+    do: :ok
+
+  defp validate_node_opt!(_name, {:on_error, handler}) when is_function(handler, 2), do: :ok
+
+  defp validate_node_opt!(name, {key, value}) do
+    raise ArgumentError,
+          "invalid value #{inspect(value)} for node option #{inspect(key)} on #{inspect(name)}"
+  end
+
+  defp assert_compatible_opts!(name, node_opts) do
+    node_opts
+    |> Keyword.has_key?(:cache)
+    |> Kernel.and(Keyword.has_key?(node_opts, :on_error))
+    |> assert_no_cache_with_handler!(name)
+  end
+
+  defp assert_no_cache_with_handler!(false, _name), do: :ok
+
+  defp assert_no_cache_with_handler!(true, name) do
+    raise ArgumentError,
+          "node #{inspect(name)} combines :cache with :on_error — " <>
+            "caching error-handler results is unsafe"
+  end
+
   @doc "Adds a fixed edge from `from` to `to`."
   @spec add_edge(t(), atom(), atom()) :: t()
+  def add_edge(%__MODULE__{}, :__end__, _to) do
+    raise ArgumentError, ":__end__ is terminal — edges cannot start from it"
+  end
+
   def add_edge(%__MODULE__{} = graph, from, to) when is_atom(from) and is_atom(to) do
     %{graph | edges: Map.update(graph.edges, from, [to], &(&1 ++ [to]))}
   end
@@ -131,8 +195,18 @@ defmodule LangEx.Graph do
   @spec add_conditional_edges(t(), atom(), routing_fn(), map() | nil) :: t()
   def add_conditional_edges(%__MODULE__{} = graph, source, routing_fn, mapping \\ nil)
       when is_atom(source) and is_function(routing_fn, 1) do
+    :ok = validate_conditional_source!(graph, source)
     %{graph | conditional_edges: Map.put(graph.conditional_edges, source, {routing_fn, mapping})}
   end
+
+  defp validate_conditional_source!(%__MODULE__{conditional_edges: existing}, source)
+       when is_map_key(existing, source) do
+    raise ArgumentError,
+          "conditional edges from #{inspect(source)} are already defined — " <>
+            "a node has at most one routing function"
+  end
+
+  defp validate_conditional_source!(_graph, _source), do: :ok
 
   @doc """
   Compiles the graph builder into an executable `CompiledGraph`.
@@ -153,6 +227,8 @@ defmodule LangEx.Graph do
     :ok = validate_entry_point(graph)
     :ok = validate_edge_targets(graph)
     :ok = validate_conditional_targets(graph)
+    :ok = validate_breakpoints(graph, opts, :interrupt_before)
+    :ok = validate_breakpoints(graph, opts, :interrupt_after)
     :ok = warn_on_unreachable_nodes(graph, Keyword.get(opts, :warn_unreachable, true))
 
     {initial_state, reducers} = State.parse_schema(graph.schema)
@@ -201,6 +277,20 @@ defmodule LangEx.Graph do
 
   defp assert_node_exists!(false, name, context) do
     raise ArgumentError, "#{context} #{inspect(name)} is not a defined node"
+  end
+
+  defp validate_breakpoints(%__MODULE__{nodes: nodes}, opts, key) do
+    opts
+    |> Keyword.get(key, [])
+    |> Enum.reject(&Map.has_key?(nodes, &1))
+    |> assert_breakpoints_exist!(key)
+  end
+
+  defp assert_breakpoints_exist!([], _key), do: :ok
+
+  defp assert_breakpoints_exist!(unknown, key) do
+    raise ArgumentError,
+          "#{inspect(key)} references undefined node(s) #{inspect(unknown)}"
   end
 
   defp validate_conditional_targets(%__MODULE__{} = graph) do
