@@ -58,7 +58,7 @@ jobs:
           git config --global --add safe.directory /__w/${{ env.REPOSITORY }}/${{ env.REPOSITORY }}
           HASH="$(git ls-tree ${{ env.SHA }} -- ${{ env.RELEVANT_FILES }} | sha1sum | cut -d' ' -f1)"
           echo "HASH=$HASH" >> $GITHUB_OUTPUT
-      - uses: runs-on/cache@a5f51d6f3fece787d03b7b4e981c82538a0654ed # v4
+      - uses: step-security/runs-on-cache@c5b0cba15d05488ebc630ad8d1e95b3d9b35ac73 # v5.0.7
         id: deps-cache
         with:
           path: |
@@ -72,7 +72,7 @@ jobs:
         run: |
           mix deps.get
           mix deps.compile
-      - uses: runs-on/cache@a5f51d6f3fece787d03b7b4e981c82538a0654ed # v4
+      - uses: step-security/runs-on-cache@c5b0cba15d05488ebc630ad8d1e95b3d9b35ac73 # v5.0.7
         id: build-cache
         with:
           path: "**/*"
@@ -117,7 +117,7 @@ jobs:
           git config --global --add safe.directory /__w/${{ env.REPOSITORY }}/${{ env.REPOSITORY }}
           HASH="$(git ls-tree ${{ env.SHA }} -- ${{ env.RELEVANT_FILES }} | sha1sum | cut -d' ' -f1)"
           echo "HASH=$HASH" >> $GITHUB_OUTPUT
-      - uses: runs-on/cache@a5f51d6f3fece787d03b7b4e981c82538a0654ed # v4
+      - uses: step-security/runs-on-cache@c5b0cba15d05488ebc630ad8d1e95b3d9b35ac73 # v5.0.7
         id: deps-cache
         with:
           path: |
@@ -131,7 +131,7 @@ jobs:
         run: |
           mix deps.get
           mix deps.compile
-      - uses: runs-on/cache@a5f51d6f3fece787d03b7b4e981c82538a0654ed # v4
+      - uses: step-security/runs-on-cache@c5b0cba15d05488ebc630ad8d1e95b3d9b35ac73 # v5.0.7
         id: build-cache
         with:
           path: "**/*"
@@ -195,7 +195,7 @@ jobs:
           echo ""
           echo "==============================================="
       - name: Cache Approval File
-        uses: runs-on/cache/save@a5f51d6f3fece787d03b7b4e981c82538a0654ed # v4
+        uses: step-security/runs-on-cache/save@c5b0cba15d05488ebc630ad8d1e95b3d9b35ac73 # v5.0.7
         with:
           path: approval.txt
           key: ${{ runner.os }}-${{ env.REPOSITORY }}-approval-${{ needs.static.outputs.HASH }}
