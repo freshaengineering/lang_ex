@@ -24,6 +24,13 @@ on:
       - synchronize
       - opened
       - reopened
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the current package version
+        required: true
+        type: boolean
+        default: false
 
 jobs:
   static:
@@ -84,7 +91,7 @@ jobs:
         run: mix format --check-formatted --dry-run
       - name: Run publish --dry-run
         env:
-          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+          HEX_API_KEY: ${{ secrets.GH_FRESHAENGINEERING_LANG_EX_HEX_PM_API_KEY }}
         run: mix hex.publish --dry-run
 
   test:
@@ -204,9 +211,11 @@ jobs:
     name: Publish Hex Package
     needs: [permit]
     env:
-      HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+      HEX_API_KEY: ${{ secrets.GH_FRESHAENGINEERING_LANG_EX_HEX_PM_API_KEY }}
     runs-on: runs-on,runner=2cpu-linux-x64
-    if: needs.permit.outputs.PUBLISH == 'true' && github.event_name == 'push'
+    if: >-
+      (needs.permit.outputs.PUBLISH == 'true' && github.event_name == 'push') ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish)
     steps:
       - name: Harden the runner
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2
