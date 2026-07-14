@@ -24,7 +24,7 @@ Run them in order — each builds on the ideas of the previous one.
 | [09_subgraphs.exs](09_subgraphs.exs) | A compiled graph as a node — interrupts pause and resume through it |
 | [10_observability.exs](10_observability.exs) | Rebuilding the run tree from `run_id`/`parent_run_id` telemetry |
 | [11_multi_agent.exs](11_multi_agent.exs) | A swarm of agents handing the conversation to one another — scripted LLM, no key needed |
-| [12_multi_agent_live.exs](12_multi_agent_live.exs) | A supervisor team delegating to specialist agents — **requires a real `ANTHROPIC_API_KEY`** |
+| [12_multi_agent_live.exs](12_multi_agent_live.exs) | A customer-support swarm: front-line triage hands off to Billing/Tech specialists (with tools), active agent persisted across turns — **requires a real `ANTHROPIC_API_KEY`** |
 
 The scripts that pause and resume use
 [`support/in_memory_checkpointer.exs`](support/in_memory_checkpointer.exs),

@@ -1,9 +1,10 @@
-# Live multi-agent supervisor team, powered by a real Anthropic model.
+# Live customer-support swarm, powered by a real Anthropic model.
 #
-# A coordinator delegates to two specialists — a math agent and a weather
-# agent — each with its own tool. The coordinator hands off with
-# `transfer_to_<agent>` tools, the workers do their work and return, and
-# the coordinator gives a final combined answer.
+# A front-line agent triages the customer and hands off to a Billing or
+# Tech specialist. Each specialist has its own tools. The active agent is
+# persisted per conversation (via a checkpointer), so a follow-up message
+# stays with whoever is handling the customer — and specialists can hand
+# off to each other as the conversation shifts.
 #
 # Requires an API key:
 #   export ANTHROPIC_API_KEY=sk-ant-...
@@ -11,100 +12,122 @@
 
 Mix.install([{:lang_ex, path: Path.expand("../..", __DIR__)}])
 
-defmodule LiveTeam do
+defmodule SupportTeam do
+  alias LangEx.Checkpointer
   alias LangEx.Message
-  alias LangEx.Prebuilt.Supervisor
+  alias LangEx.Prebuilt.Swarm
   alias LangEx.Tool
 
   @model "claude-opus-4-8"
+  @thread [thread_id: "support-session-1"]
 
   def run do
     graph = build()
-    question = "What is a 18% tip on an 84 dollar bill, and what's the weather in Tokyo?"
 
-    IO.puts("User: #{question}\n")
+    ask(graph, "Hi — I was charged twice for order A-1234. Can I get a refund?")
+    ask(graph, "Thanks! Also, our team dashboard has been down all morning. Is there an outage?")
+  end
+
+  defp ask(graph, question) do
+    IO.puts("\n=== Customer ===\n#{question}\n")
 
     graph
-    |> LangEx.stream(%{messages: [Message.human(question)]})
+    |> LangEx.stream(%{messages: [Message.human(question)]}, config: @thread)
     |> Enum.each(&trace/1)
   end
 
-  defp trace({:node_start, node}), do: IO.puts("  -> #{node} working...")
-  defp trace({:node_end, node, _update}), do: IO.puts("  <- #{node} done")
+  defp trace({:node_start, agent}), do: IO.puts("  ...#{agent} is handling it")
 
   defp trace({:done, {:ok, state}}) do
-    IO.puts("\nFinal answer:\n#{List.last(state.messages).content}")
-    IO.puts("\nToken usage: #{inspect(state.llm_usage)}")
+    IO.puts("\n=== #{state.active_agent} ===\n#{List.last(state.messages).content}")
   end
 
-  defp trace({:done, {:error, reason}}), do: IO.puts("\nRun error: #{inspect(reason)}")
+  defp trace({:done, {:error, reason}}), do: IO.puts("\n[error] #{inspect(reason)}")
   defp trace(_event), do: :ok
 
   defp build do
-    Supervisor.create(
-      model: @model,
-      max_tokens: 1024,
-      prompt:
-        "You coordinate two specialists: a `math` agent and a `weather` agent. " <>
-          "Delegate to exactly ONE specialist at a time by calling a single " <>
-          "transfer tool, then wait for the result before delegating again. " <>
-          "Delegate math questions to the math agent and weather questions to " <>
-          "the weather agent. Once both have answered, reply to the user with a " <>
-          "single combined summary.",
+    Swarm.create(
+      checkpointer: Checkpointer.Memory,
+      default_active_agent: :frontline,
       agents: [
         [
-          name: :math,
+          name: :frontline,
           model: @model,
           max_tokens: 1024,
-          system_prompt: "You are a math specialist. Use the calculate tool for arithmetic.",
-          tools: [calculate_tool()]
+          system_prompt:
+            "You are the front-line support agent. Greet briefly, then transfer " <>
+              "billing questions (charges, refunds, invoices) to the billing agent " <>
+              "and technical questions (outages, logins, bugs) to the tech agent. " <>
+              "Do not try to resolve specialist issues yourself."
         ],
         [
-          name: :weather,
+          name: :billing,
           model: @model,
           max_tokens: 1024,
-          system_prompt: "You are a weather specialist. Use the get_weather tool.",
-          tools: [weather_tool()]
+          system_prompt:
+            "You are the billing specialist. Use lookup_order and issue_refund to " <>
+              "resolve charge and refund issues. If the customer raises a technical " <>
+              "problem, transfer to the tech agent.",
+          tools: [lookup_order_tool(), issue_refund_tool()]
+        ],
+        [
+          name: :tech,
+          model: @model,
+          max_tokens: 1024,
+          system_prompt:
+            "You are the technical support specialist. Use check_service_status to " <>
+              "investigate outages. If the customer raises a billing issue, transfer " <>
+              "to the billing agent.",
+          tools: [service_status_tool()]
         ]
       ]
     )
   end
 
-  defp calculate_tool do
+  defp lookup_order_tool do
     %Tool{
-      name: "calculate",
-      description: "Evaluate a simple arithmetic operation on two numbers.",
+      name: "lookup_order",
+      description: "Look up an order by its id.",
       parameters: %{
         type: "object",
-        properties: %{
-          a: %{type: "number"},
-          op: %{type: "string", enum: ["+", "-", "*", "/"]},
-          b: %{type: "number"}
-        },
-        required: ["a", "op", "b"]
+        properties: %{order_id: %{type: "string"}},
+        required: ["order_id"]
       },
-      function: fn %{"a" => a, "op" => op, "b" => b} -> %{result: calc(a, op, b)} end
+      function: fn %{"order_id" => id} ->
+        %{order_id: id, amount: "$49.99", charges: 2, status: "duplicate charge detected"}
+      end
     }
   end
 
-  defp calc(a, "+", b), do: a + b
-  defp calc(a, "-", b), do: a - b
-  defp calc(a, "*", b), do: a * b
-  defp calc(_a, "/", 0), do: "undefined (division by zero)"
-  defp calc(a, "/", b), do: a / b
-
-  defp weather_tool do
+  defp issue_refund_tool do
     %Tool{
-      name: "get_weather",
-      description: "Get the current weather for a city.",
+      name: "issue_refund",
+      description: "Issue a refund for an order.",
       parameters: %{
         type: "object",
-        properties: %{city: %{type: "string"}},
-        required: ["city"]
+        properties: %{order_id: %{type: "string"}, amount: %{type: "string"}},
+        required: ["order_id", "amount"]
       },
-      function: fn %{"city" => city} -> %{city: city, temp_c: 22, sky: "clear"} end
+      function: fn %{"order_id" => id, "amount" => amount} ->
+        %{order_id: id, refunded: amount, confirmation: "RFND-2026-0714", eta_days: 5}
+      end
+    }
+  end
+
+  defp service_status_tool do
+    %Tool{
+      name: "check_service_status",
+      description: "Check the current status of a service.",
+      parameters: %{
+        type: "object",
+        properties: %{service: %{type: "string"}},
+        required: ["service"]
+      },
+      function: fn %{"service" => service} ->
+        %{service: service, status: "degraded", incident: "INC-4821", eta_minutes: 30}
+      end
     }
   end
 end
 
-LiveTeam.run()
+SupportTeam.run()
