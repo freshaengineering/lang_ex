@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.7.0
+
+### Release
+- Fix package-scoped Hex publishing pipeline and cut the first published
+  release (no library API changes since v0.6.0)
+
 ## v0.6.0
 
 ### Engine hardening
