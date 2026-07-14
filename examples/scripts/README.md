@@ -22,6 +22,7 @@ Run them in order — each builds on the ideas of the previous one.
 | [08_breakpoints.exs](08_breakpoints.exs) | Static `interrupt_before` breakpoints declared at compile time |
 | [09_subgraphs.exs](09_subgraphs.exs) | A compiled graph as a node — interrupts pause and resume through it |
 | [10_observability.exs](10_observability.exs) | Rebuilding the run tree from `run_id`/`parent_run_id` telemetry |
+| [11_multi_agent.exs](11_multi_agent.exs) | A swarm of agents handing the conversation to one another — scripted LLM, no key needed |
 
 The scripts that pause and resume use
 [`support/in_memory_checkpointer.exs`](support/in_memory_checkpointer.exs),

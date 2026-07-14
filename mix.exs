@@ -95,6 +95,12 @@ defmodule LangEx.MixProject do
           LangEx.Tool.Annotation,
           LangEx.Tool.Node
         ],
+        "Multi-Agent": [
+          LangEx.Prebuilt.Handoff,
+          LangEx.Prebuilt.Member,
+          LangEx.Prebuilt.Supervisor,
+          LangEx.Prebuilt.Swarm
+        ],
         Observability: [
           LangEx.Telemetry,
           LangEx.Telemetry.OpenTelemetryBridge,
