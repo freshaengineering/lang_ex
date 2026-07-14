@@ -87,10 +87,10 @@ defmodule LangEx.Prebuilt.SupervisorTest do
 
       {:ok, state} = LangEx.invoke(graph, %{messages: [Message.human("do the thing")]})
 
-      assert Enum.any?(
-               state.messages,
-               &match?(%Message.AI{content: "Control returned to supervisor."}, &1)
-             )
+      assert Enum.any?(state.messages, fn
+               %Message.Human{content: content} -> content =~ "Control returned to supervisor"
+               _ -> false
+             end)
     end
 
     test "last_message output mode contributes only the worker's final message" do

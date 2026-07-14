@@ -1,7 +1,8 @@
 # Feature Scripts
 
 Small, self-contained scripts — one per feature. Every script runs
-offline: no API keys, no databases, no docker. Dependencies resolve via
+offline (no API keys, no databases, no docker) except the live example
+noted below, which calls a real model. Dependencies resolve via
 `Mix.install/1` against the library in this repository.
 
 ```bash
@@ -23,6 +24,7 @@ Run them in order — each builds on the ideas of the previous one.
 | [09_subgraphs.exs](09_subgraphs.exs) | A compiled graph as a node — interrupts pause and resume through it |
 | [10_observability.exs](10_observability.exs) | Rebuilding the run tree from `run_id`/`parent_run_id` telemetry |
 | [11_multi_agent.exs](11_multi_agent.exs) | A swarm of agents handing the conversation to one another — scripted LLM, no key needed |
+| [12_multi_agent_live.exs](12_multi_agent_live.exs) | A supervisor team delegating to specialist agents — **requires a real `ANTHROPIC_API_KEY`** |
 
 The scripts that pause and resume use
 [`support/in_memory_checkpointer.exs`](support/in_memory_checkpointer.exs),

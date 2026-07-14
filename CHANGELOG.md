@@ -33,7 +33,10 @@
   (and `:prefix` on `Handoff.tool/2`) customizes generated handoff tool
   names
 - `:add_handoff_back_messages` on `Supervisor.create/1` records a note in
-  the conversation each time control returns to the supervisor
+  the conversation each time control returns to the supervisor. A user-role
+  continuation prompt is always added on return so the supervisor's next
+  turn stays valid for providers (e.g. Anthropic) that reject a
+  conversation ending on an assistant message
 - Conflicting state writes from parallel tool calls in one batch keep the
   earliest value and log a warning (a single super-step cannot honour two
   divergent handoffs at once)

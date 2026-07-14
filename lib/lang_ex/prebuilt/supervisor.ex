@@ -32,9 +32,11 @@ defmodule LangEx.Prebuilt.Supervisor do
     the worker's final message
   - `:handoff_tool_prefix` - prefix for generated handoff tool names
     (default names are `"transfer_to_<worker>"`)
-  - `:add_handoff_back_messages` - when `true`, appends a note to the
-    conversation each time control returns to the supervisor
-    (default `false`)
+  - `:add_handoff_back_messages` - when `true`, the continuation prompt
+    added each time control returns to the supervisor explicitly names the
+    return (default `false`). A user-role continuation prompt is always
+    added on return so the supervisor's next turn is valid for providers
+    that reject a trailing assistant message.
   - `:checkpointer` / `:store` - persistence and shared memory
   - other options (`:temperature`, `:api_key`, ...) are forwarded to the
     supervisor's LLM node
@@ -114,16 +116,32 @@ defmodule LangEx.Prebuilt.Supervisor do
     |> reset_active(sup_name)
   end
 
-  defp reset_active(false, sup_name), do: fn _state -> %{@active_agent_key => sup_name} end
+  # A user-role continuation prompt is always appended when control
+  # returns to the supervisor: the worker's contribution ends on an
+  # assistant message, and providers such as Anthropic reject an LLM call
+  # whose conversation ends on an assistant turn. `add_handoff_back_messages`
+  # makes that prompt explicitly name the return.
+  defp reset_active(false, sup_name) do
+    fn _state ->
+      %{
+        @active_agent_key => sup_name,
+        :messages => [Message.human(continue_prompt())]
+      }
+    end
+  end
 
   defp reset_active(true, sup_name) do
     fn _state ->
       %{
         @active_agent_key => sup_name,
-        :messages => [Message.ai("Control returned to #{sup_name}.")]
+        :messages => [Message.human("Control returned to #{sup_name}. #{continue_prompt()}")]
       }
     end
   end
+
+  defp continue_prompt,
+    do:
+      "Review the responses above, then delegate again if needed or give the user a final answer."
 
   defp route_from_supervisor(graph, sup_name, worker_names) do
     mapping = worker_names |> Map.new(&{&1, &1}) |> Map.put(:__end__, :__end__)
