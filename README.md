@@ -48,7 +48,7 @@ Python has [LangGraph](https://www.langchain.com/langgraph). Elixir deserves the
 ```elixir
 def deps do
   [
-    {:lang_ex, "~> 0.6.0"},
+    {:lang_ex, "~> 0.8.0"},
 
     # Optional: for Redis checkpointing
     {:redix, "~> 1.5"},
