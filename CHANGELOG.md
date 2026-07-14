@@ -22,8 +22,13 @@
   off to one another; the active agent is tracked in `:active_agent` and
   persisted across invocations via the checkpointer
 - `LangEx.Prebuilt.Supervisor.create/1` — hub-and-spoke team where a
-  supervisor delegates to workers and workers return control; supports
-  `:output_mode` (`:full_history` | `:last_message`)
+  supervisor delegates to workers and workers report back. A worker runs
+  on a task-focused view (handoff plumbing stripped) and its output is
+  reported back as a user-role message attributed to that worker
+  (`"Response from the <name> agent: ..."`), so the supervisor can tell
+  specialist findings apart from its own reasoning and the conversation
+  stays valid for providers that reject a trailing assistant turn.
+  Supports `:output_mode` (`:full_history` | `:last_message`)
 - `LangEx.Prebuilt.Member` — the routable team-member agent shared by
   both topologies; supports a string or `(state -> string)` callable
   `:system_prompt`, forwards the team's runtime `:context` into each turn,
@@ -32,11 +37,6 @@
 - `:handoff_tool_prefix` on `Swarm.create/1` and `Supervisor.create/1`
   (and `:prefix` on `Handoff.tool/2`) customizes generated handoff tool
   names
-- `:add_handoff_back_messages` on `Supervisor.create/1` records a note in
-  the conversation each time control returns to the supervisor. A user-role
-  continuation prompt is always added on return so the supervisor's next
-  turn stays valid for providers (e.g. Anthropic) that reject a
-  conversation ending on an assistant message
 - Conflicting state writes from parallel tool calls in one batch keep the
   earliest value and log a warning (a single super-step cannot honour two
   divergent handoffs at once)

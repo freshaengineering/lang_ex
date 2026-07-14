@@ -1,12 +1,14 @@
 defmodule LangEx.Prebuilt.Supervisor do
   @moduledoc """
   Builds a hub-and-spoke team: a supervisor agent delegates to workers
-  and workers return control to the supervisor.
+  and workers report back to the supervisor.
 
   The supervisor is a tool-calling agent whose tools are handoffs to each
   worker. When it calls one, control moves to that worker for a turn;
-  when the worker finishes, control returns to the supervisor, which
-  either delegates again or answers and ends the run.
+  the worker does its work and its result is reported back to the
+  supervisor as an attributed message, so the supervisor can tell each
+  specialist's findings apart from its own reasoning. The supervisor then
+  delegates again or answers and ends the run.
 
       graph =
         LangEx.Prebuilt.Supervisor.create(
@@ -19,6 +21,17 @@ defmodule LangEx.Prebuilt.Supervisor do
           checkpointer: LangEx.Checkpointer.Memory
         )
 
+  ## How workers see the conversation
+
+  Each worker runs on a task-focused view of the conversation — the user
+  request, prior specialist responses, and the supervisor's plain replies
+  — with handoff plumbing (transfer tool calls and their acknowledgements)
+  stripped out, so a worker is not confused by routing it did not perform.
+  A worker's output is reported back as a user-role message attributed to
+  that worker (`"Response from the <name> agent: ..."`). Attribution both
+  keeps specialist findings distinguishable and leaves the conversation on
+  a user turn, which providers such as Anthropic require.
+
   ## Options
 
   - `:model` / `:provider` (required) - the supervisor's LLM
@@ -27,41 +40,35 @@ defmodule LangEx.Prebuilt.Supervisor do
   - `:prompt` - supervisor system prompt
   - `:tools` - extra non-handoff tools for the supervisor (default `[]`)
   - `:supervisor_name` - supervisor node/agent name (default `:supervisor`)
-  - `:output_mode` - `:full_history` (default) contributes every worker
-    message back to the conversation; `:last_message` contributes only
-    the worker's final message
+  - `:output_mode` - `:full_history` (default) reports a worker's full
+    textual output back to the supervisor; `:last_message` reports only its
+    final message
   - `:handoff_tool_prefix` - prefix for generated handoff tool names
     (default names are `"transfer_to_<worker>"`)
-  - `:add_handoff_back_messages` - when `true`, the continuation prompt
-    added each time control returns to the supervisor explicitly names the
-    return (default `false`). A user-role continuation prompt is always
-    added on return so the supervisor's next turn is valid for providers
-    that reject a trailing assistant message.
   - `:checkpointer` / `:store` - persistence and shared memory
   - other options (`:temperature`, `:api_key`, ...) are forwarded to the
     supervisor's LLM node
   """
 
   alias LangEx.Graph
+  alias LangEx.Graph.Compiled
   alias LangEx.LLM.ChatModel
   alias LangEx.Message
   alias LangEx.Prebuilt.Handoff
   alias LangEx.Prebuilt.Member
 
   @active_agent_key :active_agent
-  @return_node :return_to_supervisor
   @reserved_keys [
     :agents,
     :supervisor_name,
     :output_mode,
     :checkpointer,
     :prompt,
-    :handoff_tool_prefix,
-    :add_handoff_back_messages
+    :handoff_tool_prefix
   ]
 
   @doc "Builds and compiles a supervisor team graph."
-  @spec create(keyword()) :: Graph.Compiled.t()
+  @spec create(keyword()) :: Compiled.t()
   def create(opts) do
     workers = Keyword.fetch!(opts, :agents)
     sup_name = Keyword.get(opts, :supervisor_name, :supervisor)
@@ -75,11 +82,10 @@ defmodule LangEx.Prebuilt.Supervisor do
       active_agent: sup_name
     )
     |> Graph.add_node(sup_name, supervisor_node(opts, sup_name, worker_names, store))
-    |> add_worker_nodes(workers, output_mode, store)
-    |> Graph.add_node(@return_node, return_node(sup_name, opts))
+    |> add_worker_nodes(workers, sup_name, output_mode, store)
     |> Graph.add_edge(:__start__, sup_name)
     |> route_from_supervisor(sup_name, worker_names)
-    |> return_to_supervisor(sup_name, worker_names)
+    |> report_to_supervisor(sup_name, worker_names)
     |> Graph.compile(
       name: :supervisor,
       checkpointer: Keyword.get(opts, :checkpointer),
@@ -102,56 +108,71 @@ defmodule LangEx.Prebuilt.Supervisor do
     |> Member.node(sup_name, :full_history)
   end
 
-  defp add_worker_nodes(graph, workers, output_mode, store) do
+  defp add_worker_nodes(graph, workers, sup_name, output_mode, store) do
     Enum.reduce(workers, graph, fn spec, acc ->
       name = Keyword.fetch!(spec, :name)
       member = Member.build(Keyword.merge(spec, store: store))
-      Graph.add_node(acc, name, Member.node(member, name, output_mode))
+      Graph.add_node(acc, name, worker_node(member, name, sup_name, output_mode))
     end)
   end
 
-  defp return_node(sup_name, opts) do
-    opts
-    |> Keyword.get(:add_handoff_back_messages, false)
-    |> reset_active(sup_name)
-  end
+  # A worker runs on a task-focused view, then reports its output back to
+  # the supervisor as an attributed user-role message.
+  defp worker_node(member, name, sup_name, output_mode) do
+    fn state, context ->
+      view = task_view(state.messages)
 
-  # A user-role continuation prompt is always appended when control
-  # returns to the supervisor: the worker's contribution ends on an
-  # assistant message, and providers such as Anthropic reject an LLM call
-  # whose conversation ends on an assistant turn. `add_handoff_back_messages`
-  # makes that prompt explicitly name the return.
-  defp reset_active(false, sup_name) do
-    fn _state ->
-      %{
-        @active_agent_key => sup_name,
-        :messages => [Message.human(continue_prompt())]
-      }
+      member
+      |> Compiled.invoke(%{:messages => view, @active_agent_key => name}, context: context)
+      |> report(view, name, sup_name, output_mode)
     end
   end
 
-  defp reset_active(true, sup_name) do
-    fn _state ->
-      %{
-        @active_agent_key => sup_name,
-        :messages => [Message.human("Control returned to #{sup_name}. #{continue_prompt()}")]
-      }
-    end
+  defp report({:ok, result}, view, name, sup_name, output_mode) do
+    text = result.messages |> Enum.drop(length(view)) |> summarize(output_mode)
+
+    %{
+      :messages => [Message.human("Response from the #{name} agent:\n\n#{text}")],
+      @active_agent_key => sup_name
+    }
   end
 
-  defp continue_prompt,
-    do:
-      "Review the responses above, then delegate again if needed or give the user a final answer."
+  # A worker runs as a nested execution, so an interrupt or error inside it
+  # cannot resume across the team boundary — surface it as an error.
+  defp report(outcome, _view, name, _sup_name, _output_mode) do
+    raise "worker #{inspect(name)} did not complete normally: #{inspect(outcome)}"
+  end
+
+  # Workers see the user request, prior specialist responses, and the
+  # supervisor's plain replies — but not handoff plumbing (transfer tool
+  # calls and their acknowledgements) or a seeded system prompt, which
+  # would shadow the worker's own role prompt.
+  defp task_view(messages), do: Enum.filter(messages, &task_relevant?/1)
+
+  defp task_relevant?(%Message.Human{}), do: true
+
+  defp task_relevant?(%Message.AI{tool_calls: [], content: content})
+       when is_binary(content) and content != "",
+       do: true
+
+  defp task_relevant?(_message), do: false
+
+  defp summarize(delta, :last_message), do: delta |> ai_texts() |> List.last() |> to_string()
+  defp summarize(delta, _full_history), do: delta |> ai_texts() |> Enum.join("\n\n")
+
+  defp ai_texts(messages) do
+    for %Message.AI{content: content} <- messages,
+        is_binary(content) and content != "",
+        do: content
+  end
 
   defp route_from_supervisor(graph, sup_name, worker_names) do
     mapping = worker_names |> Map.new(&{&1, &1}) |> Map.put(:__end__, :__end__)
     Graph.add_conditional_edges(graph, sup_name, supervisor_router(sup_name), mapping)
   end
 
-  defp return_to_supervisor(graph, sup_name, worker_names) do
-    worker_names
-    |> Enum.reduce(graph, fn name, acc -> Graph.add_edge(acc, name, @return_node) end)
-    |> Graph.add_edge(@return_node, sup_name)
+  defp report_to_supervisor(graph, sup_name, worker_names) do
+    Enum.reduce(worker_names, graph, fn name, acc -> Graph.add_edge(acc, name, sup_name) end)
   end
 
   defp supervisor_router(sup_name) do

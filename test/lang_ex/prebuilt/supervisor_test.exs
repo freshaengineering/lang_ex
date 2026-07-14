@@ -15,7 +15,8 @@ defmodule LangEx.Prebuilt.SupervisorTest do
 
       assert %{active_agent: :supervisor} = state
       assert %Message.AI{content: "all done"} = List.last(state.messages)
-      assert Enum.any?(state.messages, &match?(%Message.AI{content: "worker done"}, &1))
+      assert mentions?(state.messages, "Response from the worker agent")
+      assert mentions?(state.messages, "worker done")
     end
 
     test "the supervisor can answer directly without delegating" do
@@ -57,8 +58,8 @@ defmodule LangEx.Prebuilt.SupervisorTest do
 
       assert %{active_agent: :supervisor} = state
       assert %Message.AI{content: "all complete"} = List.last(state.messages)
-      assert Enum.any?(state.messages, &match?(%Message.AI{content: "research done"}, &1))
-      assert Enum.any?(state.messages, &match?(%Message.AI{content: "math done"}, &1))
+      assert mentions?(state.messages, "research done")
+      assert mentions?(state.messages, "math done")
     end
 
     test "a custom supervisor name is used for routing" do
@@ -80,32 +81,88 @@ defmodule LangEx.Prebuilt.SupervisorTest do
       assert %Message.AI{content: "done by boss"} = List.last(state.messages)
     end
 
-    test "add_handoff_back_messages records each return to the supervisor" do
+    test "a worker's output is reported back attributed to that worker" do
       stub(LangEx.LLM.OpenAI, :chat_with_usage, &scripted/2)
 
-      graph = supervisor(add_handoff_back_messages: true)
+      {:ok, state} = LangEx.invoke(supervisor(), %{messages: [Message.human("do the thing")]})
 
-      {:ok, state} = LangEx.invoke(graph, %{messages: [Message.human("do the thing")]})
+      reports =
+        Enum.filter(state.messages, fn
+          %Message.Human{content: c} -> c =~ "Response from the worker agent"
+          _ -> false
+        end)
 
-      assert Enum.any?(state.messages, fn
-               %Message.Human{content: content} -> content =~ "Control returned to supervisor"
-               _ -> false
-             end)
+      assert [%Message.Human{content: content}] = reports
+      assert content =~ "worker done"
     end
 
-    test "last_message output mode contributes only the worker's final message" do
+    test "last_message output mode reports only the worker's final message" do
       stub(LangEx.LLM.OpenAI, :chat_with_usage, &scripted/2)
 
       graph = supervisor(output_mode: :last_message)
 
       {:ok, state} = LangEx.invoke(graph, %{messages: [Message.human("do the thing")]})
 
-      worker_messages =
-        Enum.filter(state.messages, &match?(%Message.AI{content: "worker done"}, &1))
+      assert mentions?(state.messages, "worker done")
+    end
 
-      assert length(worker_messages) == 1
+    test "workers run on a task view that drops handoff plumbing but keeps context" do
+      test_pid = self()
+
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn messages, opts ->
+        capture_worker_view(messages, test_pid)
+        scripted(messages, opts)
+      end)
+
+      seed = [
+        Message.ai("Earlier context: the customer is a VIP."),
+        Message.human("do the thing")
+      ]
+
+      {:ok, _state} = LangEx.invoke(supervisor(), %{messages: seed})
+
+      assert_received {:worker_view, view}
+
+      assert Enum.any?(
+               view,
+               &match?(%Message.AI{content: "Earlier context: the customer is a VIP."}, &1)
+             )
+
+      assert Enum.any?(view, &match?(%Message.Human{content: "do the thing"}, &1))
+      refute Enum.any?(view, fn m -> content(m) =~ "Successfully transferred" end)
+    end
+
+    @tag capture_log: true
+    test "a worker that fails surfaces a clear error" do
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn messages, opts ->
+        worker_or(role(messages), messages, opts)
+      end)
+
+      assert {:error, %LangEx.NodeError{reason: %RuntimeError{message: message}}} =
+               LangEx.invoke(supervisor(), %{messages: [Message.human("do the thing")]})
+
+      assert message =~ "worker :worker did not complete normally"
     end
   end
+
+  defp worker_or(:worker, _messages, _opts), do: {:error, :simulated_failure}
+  defp worker_or(_role, messages, opts), do: scripted(messages, opts)
+
+  defp capture_worker_view(messages, test_pid) do
+    forward_worker_view(role(messages), messages, test_pid)
+  end
+
+  defp forward_worker_view(:worker, messages, test_pid),
+    do: send(test_pid, {:worker_view, messages})
+
+  defp forward_worker_view(_role, _messages, _test_pid), do: :ok
+
+  defp mentions?(messages, text) do
+    Enum.any?(messages, fn message -> message |> content() |> String.contains?(text) end)
+  end
+
+  defp content(%{content: c}) when is_binary(c), do: c
+  defp content(_message), do: ""
 
   defp supervisor(opts \\ []) do
     Supervisor.create(
@@ -143,7 +200,7 @@ defmodule LangEx.Prebuilt.SupervisorTest do
 
   defp respond(:supervisor, messages) do
     messages
-    |> Enum.any?(&match?(%Message.AI{content: "worker done"}, &1))
+    |> mentions?("worker done")
     |> supervisor_turn()
   end
 
@@ -173,16 +230,13 @@ defmodule LangEx.Prebuilt.SupervisorTest do
   defp two_worker_respond(:math, _messages), do: {:ok, Message.ai("math done"), usage()}
 
   defp two_worker_respond(:supervisor, messages) do
-    {seen?(messages, "research done"), seen?(messages, "math done")}
+    {mentions?(messages, "research done"), mentions?(messages, "math done")}
     |> supervisor_step()
   end
 
   defp supervisor_step({false, _math}), do: transfer_call(:research)
   defp supervisor_step({true, false}), do: transfer_call(:math)
   defp supervisor_step({true, true}), do: {:ok, Message.ai("all complete"), usage()}
-
-  defp seen?(messages, content),
-    do: Enum.any?(messages, &match?(%Message.AI{content: ^content}, &1))
 
   defp transfer_call(worker) do
     call = %Message.ToolCall{name: "transfer_to_#{worker}", id: "t-#{worker}", args: %{}}
