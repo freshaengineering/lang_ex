@@ -17,13 +17,19 @@
   plain `%{messages_key => [...]}` update when no tool returns a command
   (backwards compatible)
 - `LangEx.Prebuilt.Handoff.tool/2` builds a `transfer_to_<agent>` tool
-  that moves the conversation to another agent
+  that moves the conversation to another agent; with
+  `task_description: true` the tool also accepts a task brief passed to
+  the target agent
+- `Swarm.create/1` and `Supervisor.create/1` validate inputs at build
+  time (non-empty `:agents`, unique names, valid `:default_active_agent` /
+  `:supervisor_name`)
 - `LangEx.Prebuilt.Swarm.create/1` — peer-to-peer team where agents hand
   off to one another; the active agent is tracked in `:active_agent` and
   persisted across invocations via the checkpointer
 - `LangEx.Prebuilt.Supervisor.create/1` — hub-and-spoke team where a
-  supervisor delegates to workers and workers report back. A worker runs
-  on a task-focused view (handoff plumbing stripped) and its output is
+  supervisor delegates to workers (with a task brief) and workers report
+  back. A worker runs on a task-focused view (handoff plumbing stripped)
+  and its output is
   reported back as a user-role message attributed to that worker
   (`"Response from the <name> agent: ..."`), so the supervisor can tell
   specialist findings apart from its own reasoning and the conversation

@@ -200,7 +200,8 @@ defmodule LangEx.Tool.Node do
   defp build_node_result(false, results, messages_key), do: %{messages_key => results}
 
   defp build_node_result(true, results, messages_key) do
-    messages = Enum.flat_map(results, &result_messages(&1, messages_key))
+    messages =
+      results |> Enum.flat_map(&result_messages(&1, messages_key)) |> tool_replies_first()
 
     updates =
       results |> Enum.filter(&match?(%Command{}, &1)) |> merge_command_updates(messages_key)
@@ -212,6 +213,15 @@ defmodule LangEx.Tool.Node do
     do: Map.get(update, messages_key, [])
 
   defp result_messages(%Message.Tool{} = message, _messages_key), do: [message]
+
+  # Every `%Message.Tool{}` reply must sit immediately after the AI's
+  # tool-call message (some providers reject a tool call whose result is
+  # separated from it), so replies lead and any extra command messages
+  # (e.g. a handoff task brief) follow.
+  defp tool_replies_first(messages) do
+    {replies, rest} = Enum.split_with(messages, &match?(%Message.Tool{}, &1))
+    replies ++ rest
+  end
 
   # Parallel tool calls in one batch can each write state. When two write
   # different values to the same key (e.g. two handoffs both setting

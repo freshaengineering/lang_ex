@@ -43,5 +43,29 @@ defmodule LangEx.Prebuilt.HandoffTest do
     test "an explicit name overrides the prefix" do
       assert %Tool{name: "escalate"} = Handoff.tool(:billing, name: "escalate", prefix: "x_")
     end
+
+    test "task_description adds a parameter and briefs the target agent" do
+      %Tool{parameters: parameters, function: transfer} =
+        Handoff.tool(:billing, task_description: true)
+
+      assert %{properties: %{task_description: %{type: "string"}}} = parameters
+
+      assert %Command{
+               update: %{
+                 active_agent: :billing,
+                 messages: [
+                   %Message.Tool{},
+                   %Message.Human{content: "Task for billing: issue a refund"}
+                 ]
+               }
+             } = transfer.(%{"task_description" => "issue a refund"}, %{tool_call_id: "c1"})
+    end
+
+    test "a task-capable tool without a task given is a plain routing handoff" do
+      %Tool{function: transfer} = Handoff.tool(:billing, task_description: true)
+
+      assert %Command{update: %{active_agent: :billing, messages: [%Message.Tool{}]}} =
+               transfer.(%{}, %{tool_call_id: "c1"})
+    end
   end
 end

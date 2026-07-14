@@ -5,6 +5,33 @@ defmodule LangEx.Prebuilt.SupervisorTest do
   alias LangEx.Message
   alias LangEx.Prebuilt.Supervisor
 
+  describe "create/1 validation" do
+    test "rejects an empty agent list" do
+      assert_raise ArgumentError, ~r/at least one worker/, fn ->
+        Supervisor.create(model: "gpt-4o", agents: [])
+      end
+    end
+
+    test "rejects duplicate worker names" do
+      assert_raise ArgumentError, ~r/duplicate agent name/, fn ->
+        Supervisor.create(
+          model: "gpt-4o",
+          agents: [[name: :w, model: "gpt-4o"], [name: :w, model: "gpt-4o"]]
+        )
+      end
+    end
+
+    test "rejects a supervisor name that collides with a worker" do
+      assert_raise ArgumentError, ~r/collides with a worker/, fn ->
+        Supervisor.create(
+          model: "gpt-4o",
+          supervisor_name: :w,
+          agents: [[name: :w, model: "gpt-4o"]]
+        )
+      end
+    end
+  end
+
   describe "create/1" do
     test "delegates to a worker, then finalizes when control returns" do
       stub(LangEx.LLM.OpenAI, :chat_with_usage, &scripted/2)
@@ -132,6 +159,20 @@ defmodule LangEx.Prebuilt.SupervisorTest do
       refute Enum.any?(view, fn m -> content(m) =~ "Successfully transferred" end)
     end
 
+    test "the supervisor's task brief reaches the worker" do
+      test_pid = self()
+
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn messages, opts ->
+        capture_worker_view(messages, test_pid)
+        task_scripted(messages, opts)
+      end)
+
+      {:ok, _state} = LangEx.invoke(supervisor(), %{messages: [Message.human("help")]})
+
+      assert_received {:worker_view, view}
+      assert Enum.any?(view, fn m -> content(m) =~ "Task for worker: investigate the outage" end)
+    end
+
     @tag capture_log: true
     test "a worker that fails surfaces a clear error" do
       stub(LangEx.LLM.OpenAI, :chat_with_usage, fn messages, opts ->
@@ -147,6 +188,28 @@ defmodule LangEx.Prebuilt.SupervisorTest do
 
   defp reply_for(:worker, _messages, _opts), do: {:error, :simulated_failure}
   defp reply_for(_role, messages, opts), do: scripted(messages, opts)
+
+  defp task_scripted(messages, opts), do: task_reply(role(messages), messages, opts)
+
+  defp task_reply(:worker, _messages, _opts), do: {:ok, Message.ai("worker done"), usage()}
+
+  defp task_reply(:supervisor, messages, _opts) do
+    messages
+    |> mentions?("worker done")
+    |> task_turn()
+  end
+
+  defp task_turn(true), do: {:ok, Message.ai("all done"), usage()}
+
+  defp task_turn(false) do
+    call = %Message.ToolCall{
+      name: "transfer_to_worker",
+      id: "t1",
+      args: %{"task_description" => "investigate the outage"}
+    }
+
+    {:ok, Message.ai(nil, tool_calls: [call]), usage()}
+  end
 
   defp capture_worker_view(messages, test_pid) do
     forward_worker_view(role(messages), messages, test_pid)

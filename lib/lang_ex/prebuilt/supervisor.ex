@@ -4,11 +4,12 @@ defmodule LangEx.Prebuilt.Supervisor do
   and workers report back to the supervisor.
 
   The supervisor is a tool-calling agent whose tools are handoffs to each
-  worker. When it calls one, control moves to that worker for a turn;
-  the worker does its work and its result is reported back to the
-  supervisor as an attributed message, so the supervisor can tell each
-  specialist's findings apart from its own reasoning. The supervisor then
-  delegates again or answers and ends the run.
+  worker. When it calls one it can attach a task brief; control moves to
+  that worker for a turn; the worker does its work and its result is
+  reported back to the supervisor as an attributed message, so the
+  supervisor can tell each specialist's findings apart from its own
+  reasoning. The supervisor then delegates again or answers and ends the
+  run.
 
       graph =
         LangEx.Prebuilt.Supervisor.create(
@@ -76,6 +77,9 @@ defmodule LangEx.Prebuilt.Supervisor do
     store = Keyword.get(opts, :store)
     worker_names = Enum.map(workers, &Keyword.fetch!(&1, :name))
 
+    :ok = validate_workers!(worker_names)
+    :ok = validate_supervisor_name!(sup_name, worker_names)
+
     Graph.new(
       messages: {[], &Message.add_messages/2},
       llm_usage: {%{}, &ChatModel.merge_usage/2},
@@ -101,7 +105,8 @@ defmodule LangEx.Prebuilt.Supervisor do
     |> Keyword.merge(
       name: sup_name,
       system_prompt: Keyword.get(opts, :prompt),
-      handoff_tools: Enum.map(worker_names, &Handoff.tool(&1, prefix: prefix)),
+      handoff_tools:
+        Enum.map(worker_names, &Handoff.tool(&1, prefix: prefix, task_description: true)),
       store: store
     )
     |> Member.build()
@@ -181,4 +186,39 @@ defmodule LangEx.Prebuilt.Supervisor do
 
   defp route_supervisor(active, sup_name) when active in [nil, sup_name], do: :__end__
   defp route_supervisor(active, _sup_name), do: active
+
+  defp validate_workers!([]) do
+    raise ArgumentError, "Supervisor.create/1 requires at least one worker in :agents"
+  end
+
+  defp validate_workers!(names) do
+    names
+    |> duplicates()
+    |> assert_no_duplicates!()
+  end
+
+  defp assert_no_duplicates!([]), do: :ok
+
+  defp assert_no_duplicates!(dups) do
+    raise ArgumentError, "duplicate agent name(s) in :agents: #{inspect(dups)}"
+  end
+
+  defp validate_supervisor_name!(sup_name, worker_names) do
+    sup_name
+    |> Kernel.in(worker_names)
+    |> assert_distinct_supervisor!(sup_name)
+  end
+
+  defp assert_distinct_supervisor!(false, _sup_name), do: :ok
+
+  defp assert_distinct_supervisor!(true, sup_name) do
+    raise ArgumentError, ":supervisor_name #{inspect(sup_name)} collides with a worker name"
+  end
+
+  defp duplicates(names) do
+    names
+    |> Enum.frequencies()
+    |> Enum.filter(fn {_name, count} -> count > 1 end)
+    |> Enum.map(fn {name, _count} -> name end)
+  end
 end

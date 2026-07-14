@@ -57,6 +57,9 @@ defmodule LangEx.Prebuilt.Swarm do
     prefix = Keyword.get(opts, :handoff_tool_prefix)
     names = Enum.map(specs, &Keyword.fetch!(&1, :name))
 
+    :ok = validate_agents!(names)
+    :ok = validate_default!(default, names)
+
     Graph.new(
       messages: {[], &Message.add_messages/2},
       llm_usage: {%{}, &ChatModel.merge_usage/2},
@@ -106,4 +109,40 @@ defmodule LangEx.Prebuilt.Swarm do
 
   defp route_active(active, agent) when active in [nil, agent], do: :__end__
   defp route_active(active, _agent), do: active
+
+  defp validate_agents!([]) do
+    raise ArgumentError, "Swarm.create/1 requires at least one agent in :agents"
+  end
+
+  defp validate_agents!(names) do
+    names
+    |> duplicates()
+    |> assert_no_duplicates!()
+  end
+
+  defp assert_no_duplicates!([]), do: :ok
+
+  defp assert_no_duplicates!(dups) do
+    raise ArgumentError, "duplicate agent name(s) in :agents: #{inspect(dups)}"
+  end
+
+  defp validate_default!(default, names) do
+    default
+    |> Kernel.in(names)
+    |> assert_default_member!(default, names)
+  end
+
+  defp assert_default_member!(true, _default, _names), do: :ok
+
+  defp assert_default_member!(false, default, names) do
+    raise ArgumentError,
+          ":default_active_agent #{inspect(default)} must be one of #{inspect(names)}"
+  end
+
+  defp duplicates(names) do
+    names
+    |> Enum.frequencies()
+    |> Enum.filter(fn {_name, count} -> count > 1 end)
+    |> Enum.map(fn {name, _count} -> name end)
+  end
 end

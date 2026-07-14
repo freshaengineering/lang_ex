@@ -5,6 +5,29 @@ defmodule LangEx.Prebuilt.SwarmTest do
   alias LangEx.Message
   alias LangEx.Prebuilt.Swarm
 
+  describe "create/1 validation" do
+    test "rejects an empty agent list" do
+      assert_raise ArgumentError, ~r/at least one agent/, fn ->
+        Swarm.create(agents: [], default_active_agent: :a)
+      end
+    end
+
+    test "rejects duplicate agent names" do
+      assert_raise ArgumentError, ~r/duplicate agent name/, fn ->
+        Swarm.create(
+          agents: [[name: :a, model: "gpt-4o"], [name: :a, model: "gpt-4o"]],
+          default_active_agent: :a
+        )
+      end
+    end
+
+    test "rejects a default that is not one of the agents" do
+      assert_raise ArgumentError, ~r/default_active_agent :ghost must be one of/, fn ->
+        Swarm.create(agents: [[name: :a, model: "gpt-4o"]], default_active_agent: :ghost)
+      end
+    end
+  end
+
   describe "create/1" do
     test "the default agent handles the turn until it hands off to a peer" do
       stub(LangEx.LLM.OpenAI, :chat_with_usage, &scripted/2)

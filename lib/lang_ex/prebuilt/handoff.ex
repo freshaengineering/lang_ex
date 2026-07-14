@@ -29,6 +29,9 @@ defmodule LangEx.Prebuilt.Handoff do
   - `:prefix` - prepended to the target name to form the tool name
     (e.g. `"delegate_to_"` yields `"delegate_to_<target>"`)
   - `:description` - tool description (default asks the target for help)
+  - `:task_description` - when `true`, the tool accepts a
+    `task_description` argument that is passed to the target agent as an
+    explicit task brief (default `false`, a pure routing handoff)
   - `:active_agent_key` - state key holding the active agent
     (default `:active_agent`)
   """
@@ -37,8 +40,23 @@ defmodule LangEx.Prebuilt.Handoff do
     %Tool{
       name: tool_name(target, opts),
       description: Keyword.get(opts, :description, "Ask agent '#{target}' for help."),
-      parameters: %{type: "object", properties: %{}, required: []},
+      parameters: parameters(Keyword.get(opts, :task_description, false), target),
       function: transfer_fn(target, Keyword.get(opts, :active_agent_key, :active_agent))
+    }
+  end
+
+  defp parameters(false, _target), do: %{type: "object", properties: %{}, required: []}
+
+  defp parameters(true, target) do
+    %{
+      type: "object",
+      properties: %{
+        task_description: %{
+          type: "string",
+          description: "Describe the task or question for the #{target} agent to handle."
+        }
+      },
+      required: []
     }
   end
 
@@ -51,13 +69,24 @@ defmodule LangEx.Prebuilt.Handoff do
   defp tool_name(name, _prefix, _target), do: name
 
   defp transfer_fn(target, key) do
-    fn _args, %{tool_call_id: id} ->
+    fn args, %{tool_call_id: id} ->
       %Command{
         update: %{
           key => target,
-          messages: [Message.tool("Successfully transferred to #{target}.", id)]
+          messages: transfer_messages(target, id, Map.get(args, "task_description"))
         }
       }
     end
+  end
+
+  defp transfer_messages(target, id, task) when is_binary(task) and task != "" do
+    [
+      Message.tool("Successfully transferred to #{target}.", id),
+      Message.human("Task for #{target}: #{task}")
+    ]
+  end
+
+  defp transfer_messages(target, id, _task) do
+    [Message.tool("Successfully transferred to #{target}.", id)]
   end
 end

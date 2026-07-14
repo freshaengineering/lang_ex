@@ -510,6 +510,38 @@ defmodule LangEx.Tool.NodeTest do
                node_fn.(state_with_tool_calls([first, second]))
     end
 
+    test "tool replies lead, extra command messages follow (provider adjacency)" do
+      briefing = fn target ->
+        %Tool{
+          name: "to_#{target}",
+          description: "Routes to #{target}",
+          parameters: %{},
+          function: fn _args, %{tool_call_id: id} ->
+            %LangEx.Command{
+              update: %{
+                active_agent: target,
+                messages: [Message.tool("routed", id), Message.human("brief for #{target}")]
+              }
+            }
+          end
+        }
+      end
+
+      node_fn = ToolNode.node([briefing.(:a), briefing.(:b)])
+      first = %Message.ToolCall{name: "to_a", id: "c1", args: %{}}
+      second = %Message.ToolCall{name: "to_b", id: "c2", args: %{}}
+
+      %LangEx.Command{update: %{messages: messages}} =
+        node_fn.(state_with_tool_calls([first, second]))
+
+      assert [
+               %Message.Tool{tool_call_id: "c1"},
+               %Message.Tool{tool_call_id: "c2"},
+               %Message.Human{},
+               %Message.Human{}
+             ] = messages
+    end
+
     test "a command returned through an interceptor is preserved" do
       interceptor = fn %ToolCallRequest{tool_call: call}, _execute ->
         %LangEx.Command{
