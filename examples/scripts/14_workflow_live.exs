@@ -112,9 +112,12 @@ defmodule Helpdesk do
   defp assess(state, context) do
     proposal = state.messages |> last_proposal() |> String.downcase()
     high? = String.contains?(proposal, "admin") or String.contains?(proposal, "password")
-    IO.puts("    risk gate (approver: #{context.approver}) -> #{if high?, do: "HIGH", else: "low"}")
+    IO.puts("    risk gate (approver: #{context.approver}) -> #{risk_label(high?)}")
     route(high?)
   end
+
+  defp risk_label(true), do: "HIGH"
+  defp risk_label(false), do: "low"
 
   defp route(true), do: %Command{goto: :approval, update: %{risk: :high}}
   defp route(false), do: %Command{goto: :fulfill, update: %{risk: :low}}

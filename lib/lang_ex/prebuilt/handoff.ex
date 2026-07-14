@@ -34,25 +34,21 @@ defmodule LangEx.Prebuilt.Handoff do
   """
   @spec tool(atom(), keyword()) :: Tool.t()
   def tool(target, opts \\ []) when is_atom(target) do
-    key = Keyword.get(opts, :active_agent_key, :active_agent)
-
     %Tool{
       name: tool_name(target, opts),
       description: Keyword.get(opts, :description, "Ask agent '#{target}' for help."),
       parameters: %{type: "object", properties: %{}, required: []},
-      function: transfer_fn(target, key)
+      function: transfer_fn(target, Keyword.get(opts, :active_agent_key, :active_agent))
     }
   end
 
   defp tool_name(target, opts) do
-    opts
-    |> Keyword.get(:name)
-    |> named_or_prefixed(target, Keyword.get(opts, :prefix))
+    tool_name(Keyword.get(opts, :name), Keyword.get(opts, :prefix), target)
   end
 
-  defp named_or_prefixed(nil, target, nil), do: "transfer_to_#{target}"
-  defp named_or_prefixed(nil, target, prefix), do: "#{prefix}#{target}"
-  defp named_or_prefixed(name, _target, _prefix), do: name
+  defp tool_name(nil, nil, target), do: "transfer_to_#{target}"
+  defp tool_name(nil, prefix, target), do: "#{prefix}#{target}"
+  defp tool_name(name, _prefix, _target), do: name
 
   defp transfer_fn(target, key) do
     fn _args, %{tool_call_id: id} ->

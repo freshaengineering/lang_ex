@@ -100,10 +100,10 @@ defmodule LangEx.Prebuilt.Swarm do
     fn state -> Map.get(state, @active_agent_key) || default end
   end
 
-  defp agent_router(self) do
-    fn state -> route_active(Map.get(state, @active_agent_key), self) end
+  defp agent_router(agent) do
+    fn state -> route_active(Map.get(state, @active_agent_key), agent) end
   end
 
-  defp route_active(active, self) when active in [nil, self], do: :__end__
-  defp route_active(active, _self), do: active
+  defp route_active(active, agent) when active in [nil, agent], do: :__end__
+  defp route_active(active, _agent), do: active
 end

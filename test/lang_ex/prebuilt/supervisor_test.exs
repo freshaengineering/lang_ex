@@ -135,7 +135,7 @@ defmodule LangEx.Prebuilt.SupervisorTest do
     @tag capture_log: true
     test "a worker that fails surfaces a clear error" do
       stub(LangEx.LLM.OpenAI, :chat_with_usage, fn messages, opts ->
-        worker_or(role(messages), messages, opts)
+        reply_for(role(messages), messages, opts)
       end)
 
       assert {:error, %LangEx.NodeError{reason: %RuntimeError{message: message}}} =
@@ -145,8 +145,8 @@ defmodule LangEx.Prebuilt.SupervisorTest do
     end
   end
 
-  defp worker_or(:worker, _messages, _opts), do: {:error, :simulated_failure}
-  defp worker_or(_role, messages, opts), do: scripted(messages, opts)
+  defp reply_for(:worker, _messages, _opts), do: {:error, :simulated_failure}
+  defp reply_for(_role, messages, opts), do: scripted(messages, opts)
 
   defp capture_worker_view(messages, test_pid) do
     forward_worker_view(role(messages), messages, test_pid)
