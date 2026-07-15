@@ -34,8 +34,12 @@ defmodule LangEx.Prebuilt do
     :compaction,
     :interrupt_before,
     :interrupt_after,
+    :pre_model_hook,
+    :post_model_hook,
+    :response_format,
     :tool_opts
   ]
+  @structured_node :structured_output
 
   @doc """
   Builds and compiles a tool-calling agent graph.
@@ -58,6 +62,13 @@ defmodule LangEx.Prebuilt do
     (default `[]` — compaction with defaults)
   - `:interrupt_before` / `:interrupt_after` - static breakpoints,
     forwarded to `Graph.compile/2` (nodes: `:agent`, `:tools`)
+  - `:pre_model_hook` - `(messages -> messages)` applied to the message
+    list just before the LLM call (e.g. trimming or extra instructions)
+  - `:post_model_hook` - `(update -> update)` applied to the node result
+    map after the LLM call (e.g. guardrails)
+  - `:response_format` - a JSON-schema map; when set, a final structured
+    step decodes the answer into the `:structured_response` state key (via
+    `LangEx.LLM.ChatModel.structured_node/1`) before the graph ends
   - `:tool_opts` - options for `LangEx.Tool.Node.node/2`
     (`:handle_tool_errors`, `:max_concurrency`, `:timeout`, ...)
   - All other options (`:resilient`, `:temperature`, `:api_key`, ...)
@@ -67,14 +78,15 @@ defmodule LangEx.Prebuilt do
   def agent(opts) do
     {agent_opts, llm_opts} = Keyword.split(opts, @agent_opt_keys)
     tools = Keyword.get(agent_opts, :tools, [])
+    response_format = Keyword.get(agent_opts, :response_format)
 
-    Graph.new(
-      messages: {[], &Message.add_messages/2},
-      llm_usage: {%{}, &ChatModel.merge_usage/2}
-    )
+    ([messages: {[], &Message.add_messages/2}, llm_usage: {%{}, &ChatModel.merge_usage/2}] ++
+       structured_schema(response_format))
+    |> Graph.new()
     |> Graph.add_node(:agent, agent_node(llm_opts, tools, agent_opts))
     |> Graph.add_edge(:__start__, :agent)
-    |> add_tool_loop(tools, agent_opts)
+    |> add_tool_loop(tools, agent_opts, finish_node(response_format))
+    |> add_structured_step(response_format, llm_opts)
     |> Graph.compile(
       name: Keyword.get(agent_opts, :name, :agent),
       checkpointer: Keyword.get(agent_opts, :checkpointer),
@@ -84,22 +96,46 @@ defmodule LangEx.Prebuilt do
     )
   end
 
+  defp structured_schema(nil), do: []
+  defp structured_schema(_schema), do: [structured_response: nil]
+
+  defp finish_node(nil), do: :__end__
+  defp finish_node(_schema), do: @structured_node
+
+  defp add_structured_step(graph, nil, _llm_opts), do: graph
+
+  defp add_structured_step(graph, schema, llm_opts) do
+    graph
+    |> Graph.add_node(
+      @structured_node,
+      ChatModel.structured_node(llm_opts ++ [schema: schema, into: :structured_response])
+    )
+    |> Graph.add_edge(@structured_node, :__end__)
+  end
+
   defp agent_node(llm_opts, tools, agent_opts) do
     chat = ChatModel.node(llm_opts ++ [tools: tools])
     system_prompt = Keyword.get(agent_opts, :system_prompt)
     compaction = Keyword.get(agent_opts, :compaction, [])
+    pre_hook = Keyword.get(agent_opts, :pre_model_hook)
+    post_hook = Keyword.get(agent_opts, :post_model_hook)
 
     fn state ->
       state.messages
       |> ensure_system(system_prompt)
       |> compact(compaction)
+      |> apply_hook(pre_hook)
       |> then(&chat.(%{state | messages: &1}))
+      |> apply_hook(post_hook)
     end
   end
 
-  defp add_tool_loop(graph, [], _agent_opts), do: Graph.add_edge(graph, :agent, :__end__)
+  defp apply_hook(value, nil), do: value
+  defp apply_hook(value, hook) when is_function(hook, 1), do: hook.(value)
 
-  defp add_tool_loop(graph, tools, agent_opts) do
+  defp add_tool_loop(graph, [], _agent_opts, finish), do: Graph.add_edge(graph, :agent, finish)
+
+  defp add_tool_loop(graph, tools, agent_opts, finish) do
     graph
     |> Graph.add_node(
       :tools,
@@ -107,7 +143,7 @@ defmodule LangEx.Prebuilt do
     )
     |> Graph.add_conditional_edges(:agent, &LangEx.Tool.Node.tools_condition/1, %{
       tools: :tools,
-      __end__: :__end__
+      __end__: finish
     })
     |> Graph.add_edge(:tools, :agent)
   end

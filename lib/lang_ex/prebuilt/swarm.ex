@@ -50,6 +50,13 @@ defmodule LangEx.Prebuilt.Swarm do
     (default names are `"transfer_to_<peer>"`)
   - `:add_agent_name` - when `true`, each agent's replies are prefixed with
     `"[<name>] "` so peers can tell who said what (default `false`)
+  - `:state_schema` - extra state keys the team shares beyond `:messages`,
+    `:llm_usage`, and `:active_agent` (`key: default` or
+    `key: {default, reducer}`, same shape as `LangEx.Graph.new/1`); each
+    agent's tools can read and update them
+  - `:interrupt_before` / `:interrupt_after` - agent names to pause at
+    before/after that agent runs (static breakpoints; requires a
+    `:checkpointer`, resume with `%LangEx.Command{resume: value}`)
   """
   @spec create(keyword()) :: Graph.Compiled.t()
   def create(opts) do
@@ -58,26 +65,35 @@ defmodule LangEx.Prebuilt.Swarm do
     store = Keyword.get(opts, :store)
     prefix = Keyword.get(opts, :handoff_tool_prefix)
     add_name? = Keyword.get(opts, :add_agent_name, false)
+    state_schema = Keyword.get(opts, :state_schema, [])
     names = Enum.map(specs, &Keyword.fetch!(&1, :name))
 
     :ok = validate_agents!(names)
     :ok = validate_default!(default, names)
+    :ok = validate_state_schema!(state_schema)
 
-    Graph.new(
-      messages: {[], &Message.add_messages/2},
-      llm_usage: {%{}, &ChatModel.merge_usage/2},
-      active_agent: default
-    )
-    |> add_agent_nodes(specs, names, store, prefix, add_name?)
+    ([
+       messages: {[], &Message.add_messages/2},
+       llm_usage: {%{}, &ChatModel.merge_usage/2},
+       active_agent: default
+     ] ++ state_schema)
+    |> Graph.new()
+    |> add_agent_nodes(specs, names, store, prefix, add_name?, state_schema)
     |> route_from_start(names, default)
     |> route_between_agents(names)
-    |> Graph.compile(name: :swarm, checkpointer: Keyword.get(opts, :checkpointer), store: store)
+    |> Graph.compile(
+      name: :swarm,
+      checkpointer: Keyword.get(opts, :checkpointer),
+      store: store,
+      interrupt_before: Keyword.get(opts, :interrupt_before, []),
+      interrupt_after: Keyword.get(opts, :interrupt_after, [])
+    )
   end
 
-  defp add_agent_nodes(graph, specs, names, store, prefix, add_name?) do
+  defp add_agent_nodes(graph, specs, names, store, prefix, add_name?, state_schema) do
     Enum.reduce(specs, graph, fn spec, acc ->
       name = Keyword.fetch!(spec, :name)
-      member = Member.build(member_spec(spec, names, store, prefix))
+      member = Member.build(member_spec(spec, names, store, prefix, state_schema))
       Graph.add_node(acc, name, agent_node(member, name, add_name?))
     end)
   end
@@ -99,10 +115,10 @@ defmodule LangEx.Prebuilt.Swarm do
 
   defp tag(message, _name), do: message
 
-  defp member_spec(spec, names, store, prefix) do
+  defp member_spec(spec, names, store, prefix, state_schema) do
     peers = List.delete(names, Keyword.fetch!(spec, :name))
     handoffs = Enum.map(peers, &Handoff.tool(&1, prefix: prefix))
-    Keyword.merge(spec, handoff_tools: handoffs, store: store)
+    Keyword.merge(spec, handoff_tools: handoffs, store: store, state_schema: state_schema)
   end
 
   defp route_from_start(graph, names, default) do
@@ -144,6 +160,20 @@ defmodule LangEx.Prebuilt.Swarm do
 
   defp assert_no_duplicates!(dups) do
     raise ArgumentError, "duplicate agent name(s) in :agents: #{inspect(dups)}"
+  end
+
+  defp validate_state_schema!(state_schema) do
+    state_schema
+    |> Keyword.keys()
+    |> Enum.filter(&(&1 in [:messages, :llm_usage, :active_agent]))
+    |> assert_no_reserved_keys!()
+  end
+
+  defp assert_no_reserved_keys!([]), do: :ok
+
+  defp assert_no_reserved_keys!(reserved) do
+    raise ArgumentError,
+          ":state_schema cannot redefine reserved team key(s): #{inspect(reserved)}"
   end
 
   defp validate_default!(default, names) do
