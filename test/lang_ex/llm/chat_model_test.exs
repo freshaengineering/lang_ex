@@ -173,4 +173,110 @@ defmodule LangEx.LLM.ChatModelTest do
              } = result
     end
   end
+
+  describe "structured_node/1" do
+    test "decodes the respond tool call into the target key and appends clean JSON" do
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, _opts ->
+        call = %Message.ToolCall{
+          name: "respond",
+          id: "r1",
+          args: %{"sentiment" => "positive", "score" => 0.9}
+        }
+
+        {:ok, Message.ai(nil, tool_calls: [call]), %{input_tokens: 5, output_tokens: 2}}
+      end)
+
+      node =
+        ChatModel.structured_node(
+          provider: LangEx.LLM.OpenAI,
+          model: "gpt-4o",
+          into: :analysis,
+          schema: %{type: "object", properties: %{sentiment: %{type: "string"}}}
+        )
+
+      result = node.(%{messages: [Message.human("I love it")]})
+
+      assert %{analysis: %{"sentiment" => "positive", "score" => 0.9}} = result
+      assert [%Message.AI{content: content}] = result.messages
+      assert Jason.decode!(content) == %{"sentiment" => "positive", "score" => 0.9}
+    end
+
+    test "falls back to decoding JSON from the text response" do
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, _opts ->
+        {:ok, Message.ai(~s({"ok": true})), %{input_tokens: 1, output_tokens: 1}}
+      end)
+
+      node =
+        ChatModel.structured_node(
+          provider: LangEx.LLM.OpenAI,
+          model: "gpt-4o",
+          schema: %{type: "object"}
+        )
+
+      assert %{structured: %{"ok" => true}} = node.(%{messages: [Message.human("hi")]})
+    end
+
+    test "non-JSON prose yields a nil structured value and keeps the message" do
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, _opts ->
+        {:ok, Message.ai("just prose"), %{input_tokens: 1, output_tokens: 1}}
+      end)
+
+      node =
+        ChatModel.structured_node(
+          provider: LangEx.LLM.OpenAI,
+          model: "gpt-4o",
+          schema: %{type: "object"}
+        )
+
+      assert %{structured: nil, messages: [%Message.AI{content: "just prose"}]} =
+               node.(%{messages: [Message.human("hi")]})
+    end
+
+    test "a non-respond tool call yields nil" do
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, _opts ->
+        call = %Message.ToolCall{name: "other", id: "o1", args: %{}}
+        {:ok, Message.ai("here you go", tool_calls: [call]), %{input_tokens: 1, output_tokens: 1}}
+      end)
+
+      node =
+        ChatModel.structured_node(
+          provider: LangEx.LLM.OpenAI,
+          model: "gpt-4o",
+          schema: %{type: "object"}
+        )
+
+      assert %{structured: nil} = node.(%{messages: [Message.human("hi")]})
+    end
+
+    test "an empty response yields nil and an empty message" do
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, _opts ->
+        {:ok, Message.ai(nil), %{input_tokens: 1, output_tokens: 1}}
+      end)
+
+      node =
+        ChatModel.structured_node(
+          provider: LangEx.LLM.OpenAI,
+          model: "gpt-4o",
+          schema: %{type: "object"}
+        )
+
+      assert %{structured: nil, messages: [%Message.AI{content: ""}]} =
+               node.(%{messages: [Message.human("hi")]})
+    end
+
+    test "a provider error is surfaced" do
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, _opts -> {:error, :boom} end)
+
+      node =
+        ChatModel.structured_node(
+          provider: LangEx.LLM.OpenAI,
+          model: "gpt-4o",
+          schema: %{type: "object"}
+        )
+
+      assert_raise RuntimeError, ~r/structured output request failed/, fn ->
+        node.(%{messages: [Message.human("hi")]})
+      end
+    end
+  end
 end

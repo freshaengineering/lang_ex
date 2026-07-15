@@ -19,6 +19,19 @@ defmodule LangEx.Features.ContextTest do
       assert %{greeting: "Hello World from OpenAI!"} = result
     end
 
+    test "arity-2 node receives nil context when the run sets none" do
+      graph =
+        Graph.new(seen: :unset)
+        |> Graph.add_node(:capture, fn _state, context -> %{seen: context} end)
+        |> Graph.add_edge(:__start__, :capture)
+        |> Graph.add_edge(:capture, :__end__)
+        |> Graph.compile()
+
+      {:ok, result} = LangEx.invoke(graph, %{seen: :unset})
+
+      assert %{seen: nil} = result
+    end
+
     test "arity-1 node works with context present" do
       graph =
         Graph.new(x: 0)

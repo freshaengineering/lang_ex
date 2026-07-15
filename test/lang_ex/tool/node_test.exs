@@ -179,6 +179,71 @@ defmodule LangEx.Tool.NodeTest do
 
       %{messages: [%Message.Tool{content: "Custom: boom"}]} = node_fn.(state)
     end
+
+    @tag capture_log: true
+    test "a tool exceeding the timeout raises" do
+      slow = %Tool{
+        name: "slow",
+        description: "Sleeps past the timeout",
+        parameters: %{},
+        function: fn _args -> Process.sleep(200) end
+      }
+
+      node_fn = ToolNode.node([slow], timeout: 10)
+      call = %Message.ToolCall{name: "slow", id: "c1", args: %{}}
+
+      assert_raise RuntimeError, ~r/timed out/, fn ->
+        node_fn.(state_with_tool_calls([call]))
+      end
+    end
+
+    @tag capture_log: true
+    test "an abnormal task exit propagates" do
+      dying = %Tool{
+        name: "die",
+        description: "Exits abnormally",
+        parameters: %{},
+        function: fn _args -> exit(:boom) end
+      }
+
+      node_fn = ToolNode.node([dying])
+      call = %Message.ToolCall{name: "die", id: "c1", args: %{}}
+
+      assert catch_exit(node_fn.(state_with_tool_calls([call]))) == :boom
+    end
+
+    @tag capture_log: true
+    test "an interceptor that raises is caught by handle_tool_errors" do
+      interceptor = fn _request, _execute -> raise "wrap boom" end
+      node_fn = ToolNode.node([echo_tool()], wrap_tool_call: interceptor)
+      call = %Message.ToolCall{name: "echo", id: "c1", args: %{"text" => "x"}}
+
+      %{messages: [%Message.Tool{content: content}]} = node_fn.(state_with_tool_calls([call]))
+      assert content =~ "wrap boom"
+    end
+  end
+
+  describe "result encoding" do
+    test "an empty update is returned when the last message has no tool calls" do
+      node_fn = ToolNode.node([echo_tool()])
+
+      assert %{messages: []} = node_fn.(%{messages: [Message.human("hi")]})
+    end
+
+    test "a non-JSON-encodable result falls back to inspect" do
+      tuple_tool = %Tool{
+        name: "tuple",
+        description: "Returns a tuple",
+        parameters: %{},
+        function: fn _args -> {:a, :b} end
+      }
+
+      node_fn = ToolNode.node([tuple_tool])
+      call = %Message.ToolCall{name: "tuple", id: "c1", args: %{}}
+
+      %{messages: [%Message.Tool{content: content}]} = node_fn.(state_with_tool_calls([call]))
+      assert content == inspect({:a, :b})
+    end
   end
 
   describe "interrupts inside tool functions" do
@@ -318,5 +383,191 @@ defmodule LangEx.Tool.NodeTest do
 
       %{messages: [%Message.Tool{content: "plain text"}]} = node_fn.(state)
     end
+  end
+
+  describe "tools returning a command" do
+    test "a command result becomes a node-level command with its update and reply" do
+      node_fn = ToolNode.node([handoff_tool()])
+      call = %Message.ToolCall{name: "handoff", id: "c1", args: %{}}
+
+      result = node_fn.(state_with_tool_calls([call]))
+
+      assert %LangEx.Command{
+               goto: [],
+               update: %{active_agent: :billing, messages: [%Message.Tool{tool_call_id: "c1"}]}
+             } = result
+    end
+
+    test "a missing reply for the call is synthesized" do
+      silent = %Tool{
+        name: "silent",
+        description: "Hands off without a reply",
+        parameters: %{},
+        function: fn _args, _ctx -> %LangEx.Command{update: %{active_agent: :billing}} end
+      }
+
+      node_fn = ToolNode.node([silent])
+      call = %Message.ToolCall{name: "silent", id: "c9", args: %{}}
+
+      assert %LangEx.Command{update: %{messages: [%Message.Tool{tool_call_id: "c9"}]}} =
+               node_fn.(state_with_tool_calls([call]))
+    end
+
+    test "a mixed batch keeps plain replies and merges the command" do
+      node_fn = ToolNode.node([echo_tool(), handoff_tool()])
+      echo = %Message.ToolCall{name: "echo", id: "c1", args: %{"text" => "hi"}}
+      hand = %Message.ToolCall{name: "handoff", id: "c2", args: %{}}
+
+      result = node_fn.(state_with_tool_calls([echo, hand]))
+
+      assert %LangEx.Command{
+               update: %{
+                 active_agent: :billing,
+                 messages: [%Message.Tool{tool_call_id: "c1"}, %Message.Tool{tool_call_id: "c2"}]
+               }
+             } = result
+    end
+
+    test "a command's goto is surfaced on the node-level command" do
+      goto_tool = %Tool{
+        name: "route",
+        description: "Routes elsewhere",
+        parameters: %{},
+        function: fn _args, %{tool_call_id: id} ->
+          %LangEx.Command{goto: :elsewhere, update: %{messages: [Message.tool("ok", id)]}}
+        end
+      }
+
+      node_fn = ToolNode.node([goto_tool])
+      call = %Message.ToolCall{name: "route", id: "c1", args: %{}}
+
+      assert %LangEx.Command{goto: [:elsewhere]} = node_fn.(state_with_tool_calls([call]))
+    end
+
+    test "distinct update keys from several commands are merged" do
+      flag_tool = %Tool{
+        name: "flag",
+        description: "Sets a flag",
+        parameters: %{},
+        function: fn _args, %{tool_call_id: id} ->
+          %LangEx.Command{update: %{flagged: true, messages: [Message.tool("flagged", id)]}}
+        end
+      }
+
+      node_fn = ToolNode.node([handoff_tool(), flag_tool])
+      hand = %Message.ToolCall{name: "handoff", id: "c1", args: %{}}
+      flag = %Message.ToolCall{name: "flag", id: "c2", args: %{}}
+
+      assert %LangEx.Command{update: %{active_agent: :billing, flagged: true}} =
+               node_fn.(state_with_tool_calls([hand, flag]))
+    end
+
+    test "matching parallel updates merge without warning" do
+      set_a = fn key ->
+        %Tool{
+          name: "set_#{key}",
+          description: "Sets active agent to a",
+          parameters: %{},
+          function: fn _args, %{tool_call_id: id} ->
+            %LangEx.Command{update: %{active_agent: :a, messages: [Message.tool("ok", id)]}}
+          end
+        }
+      end
+
+      node_fn = ToolNode.node([set_a.("x"), set_a.("y")])
+      first = %Message.ToolCall{name: "set_x", id: "c1", args: %{}}
+      second = %Message.ToolCall{name: "set_y", id: "c2", args: %{}}
+
+      assert %LangEx.Command{update: %{active_agent: :a}} =
+               node_fn.(state_with_tool_calls([first, second]))
+    end
+
+    @tag capture_log: true
+    test "conflicting parallel updates keep the earliest and drop the rest" do
+      to_a = %Tool{
+        name: "to_a",
+        description: "Routes to a",
+        parameters: %{},
+        function: fn _args, %{tool_call_id: id} ->
+          %LangEx.Command{update: %{active_agent: :a, messages: [Message.tool("a", id)]}}
+        end
+      }
+
+      to_b = %Tool{
+        name: "to_b",
+        description: "Routes to b",
+        parameters: %{},
+        function: fn _args, %{tool_call_id: id} ->
+          %LangEx.Command{update: %{active_agent: :b, messages: [Message.tool("b", id)]}}
+        end
+      }
+
+      node_fn = ToolNode.node([to_a, to_b])
+      first = %Message.ToolCall{name: "to_a", id: "c1", args: %{}}
+      second = %Message.ToolCall{name: "to_b", id: "c2", args: %{}}
+
+      assert %LangEx.Command{update: %{active_agent: :a}} =
+               node_fn.(state_with_tool_calls([first, second]))
+    end
+
+    test "tool replies lead, extra command messages follow (provider adjacency)" do
+      briefing = fn target ->
+        %Tool{
+          name: "to_#{target}",
+          description: "Routes to #{target}",
+          parameters: %{},
+          function: fn _args, %{tool_call_id: id} ->
+            %LangEx.Command{
+              update: %{
+                active_agent: target,
+                messages: [Message.tool("routed", id), Message.human("brief for #{target}")]
+              }
+            }
+          end
+        }
+      end
+
+      node_fn = ToolNode.node([briefing.(:a), briefing.(:b)])
+      first = %Message.ToolCall{name: "to_a", id: "c1", args: %{}}
+      second = %Message.ToolCall{name: "to_b", id: "c2", args: %{}}
+
+      %LangEx.Command{update: %{messages: messages}} =
+        node_fn.(state_with_tool_calls([first, second]))
+
+      assert [
+               %Message.Tool{tool_call_id: "c1"},
+               %Message.Tool{tool_call_id: "c2"},
+               %Message.Human{},
+               %Message.Human{}
+             ] = messages
+    end
+
+    test "a command returned through an interceptor is preserved" do
+      interceptor = fn %ToolCallRequest{tool_call: call}, _execute ->
+        %LangEx.Command{
+          update: %{active_agent: :billing, messages: [Message.tool("via wrap", call.id)]}
+        }
+      end
+
+      node_fn = ToolNode.node([handoff_tool()], wrap_tool_call: interceptor)
+      call = %Message.ToolCall{name: "handoff", id: "c1", args: %{}}
+
+      assert %LangEx.Command{
+               update: %{active_agent: :billing, messages: [%Message.Tool{content: "via wrap"}]}
+             } = node_fn.(state_with_tool_calls([call]))
+    end
+  end
+
+  defp handoff_tool do
+    %Tool{
+      name: "handoff",
+      description: "Transfers to billing",
+      parameters: %{},
+      function: fn _args, %{tool_call_id: id} ->
+        %LangEx.Command{
+          update: %{active_agent: :billing, messages: [Message.tool("transferred", id)]}
+        }
+      end
+    }
   end
 end

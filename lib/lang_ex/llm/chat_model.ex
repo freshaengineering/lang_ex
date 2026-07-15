@@ -8,7 +8,9 @@ defmodule LangEx.LLM.ChatModel do
   """
 
   alias LangEx.LLM.Registry
+  alias LangEx.Message
   alias LangEx.Telemetry.Runs
+  alias LangEx.Tool
 
   @doc """
   Returns a node function that calls an LLM provider.
@@ -73,6 +75,100 @@ defmodule LangEx.LLM.ChatModel do
       |> with_usage(state, usage_key, usage)
     end
   end
+
+  @doc """
+  Returns a node function that asks the LLM for a structured result.
+
+  The model is given a synthetic `respond` tool whose parameters are the
+  provided JSON-schema; calling it yields the structured data, which is
+  decoded and written to the `:into` state key (default `:structured`). A
+  clean assistant message carrying the JSON is appended to the messages so
+  the conversation stays valid. Works with any provider that supports tool
+  calling — no provider-specific configuration required.
+
+  ## Options
+
+  - `:schema` (required) - JSON-schema map describing the desired shape
+  - `:into` - state key to write the decoded result to (default `:structured`)
+  - `:messages_key` - state key holding the message list (default `:messages`)
+  - `:provider` / `:model` and other options are forwarded to the provider,
+    exactly like `node/1`
+
+  ## Example
+
+      Graph.add_node(:extract, ChatModel.structured_node(
+        model: "gpt-4o",
+        into: :analysis,
+        schema: %{
+          type: "object",
+          properties: %{sentiment: %{type: "string"}, score: %{type: "number"}},
+          required: ["sentiment", "score"]
+        }
+      ))
+  """
+  @spec structured_node(keyword()) :: (map() -> map())
+  def structured_node(opts) do
+    {schema, opts} = Keyword.pop!(opts, :schema)
+    {into, opts} = Keyword.pop(opts, :into, :structured)
+    {messages_key, opts} = Keyword.pop(opts, :messages_key, :messages)
+    {provider, llm_opts} = resolve_provider(opts)
+    respond = respond_tool(schema)
+
+    fn state ->
+      state
+      |> Map.fetch!(messages_key)
+      |> then(&call_provider(provider, &1, Keyword.put(llm_opts, :tools, [respond])))
+      |> build_structured_update(messages_key, into)
+    end
+  end
+
+  defp respond_tool(schema) do
+    %Tool{
+      name: "respond",
+      description: "Return the final answer as structured data matching the required schema.",
+      parameters: schema
+    }
+  end
+
+  defp build_structured_update({:ok, ai_message, _usage}, messages_key, into) do
+    structured = extract_structured(ai_message)
+    %{messages_key => [structured_message(ai_message, structured)], into => structured}
+  end
+
+  defp build_structured_update({:error, reason}, _messages_key, _into) do
+    raise "structured output request failed: #{inspect(reason)}"
+  end
+
+  defp extract_structured(%Message.AI{tool_calls: [_ | _] = calls}) do
+    calls
+    |> Enum.find(&(&1.name == "respond"))
+    |> respond_args()
+  end
+
+  defp extract_structured(%Message.AI{content: content}) when is_binary(content),
+    do: decode_structured(content)
+
+  defp extract_structured(_ai_message), do: nil
+
+  defp respond_args(%Message.ToolCall{args: args}), do: args
+  defp respond_args(nil), do: nil
+
+  defp decode_structured(content) do
+    content
+    |> Jason.decode()
+    |> structured_or_nil()
+  end
+
+  defp structured_or_nil({:ok, decoded}), do: decoded
+  defp structured_or_nil({:error, _reason}), do: nil
+
+  defp structured_message(_ai_message, structured) when not is_nil(structured),
+    do: Message.ai(Jason.encode!(structured))
+
+  defp structured_message(%Message.AI{content: content}, nil) when is_binary(content),
+    do: Message.ai(content)
+
+  defp structured_message(_ai_message, nil), do: Message.ai("")
 
   defp dispatch_call(nil, provider, messages, llm_opts),
     do: call_provider(provider, messages, llm_opts)

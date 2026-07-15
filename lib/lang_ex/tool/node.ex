@@ -6,6 +6,17 @@ defmodule LangEx.Tool.Node do
   call to its matching `%LangEx.Tool{}` in parallel, and returns
   `%Message.Tool{}` results.
 
+  ## Control-flow tools
+
+  A tool function may return a `%LangEx.Command{}` instead of a plain
+  value. The command's `:update` is merged into the graph state (a tool
+  updating `active_agent`, appending its own messages, etc.) and its
+  `:goto` joins the node's routing. A `%Message.Tool{}` correlated by
+  `tool_call_id` is guaranteed for every call — one is synthesized when
+  the command does not carry it — so the provider always sees a reply
+  for each requested call. When no tool returns a command the node keeps
+  returning a plain `%{messages_key => [...]}` update.
+
   ## Usage in a graph
 
       tools = [
@@ -43,6 +54,9 @@ defmodule LangEx.Tool.Node do
     * `:timeout` — per-tool timeout in ms (default `30_000`)
   """
 
+  require Logger
+
+  alias LangEx.Command
   alias LangEx.Message
   alias LangEx.Tool
 
@@ -103,8 +117,19 @@ defmodule LangEx.Tool.Node do
       state
       |> Map.fetch!(messages_key)
       |> extract_tool_calls()
-      |> then(&execute_all(&1, tools_by_name, state, store, handle_errors, wrapper, exec_opts))
-      |> then(&%{messages_key => &1})
+      |> then(
+        &execute_all(
+          &1,
+          tools_by_name,
+          state,
+          store,
+          handle_errors,
+          wrapper,
+          messages_key,
+          exec_opts
+        )
+      )
+      |> then(&assemble_result(&1, messages_key))
     end
   end
 
@@ -140,17 +165,93 @@ defmodule LangEx.Tool.Node do
   defp last_tool_calls(%Message.AI{tool_calls: calls}) when calls != [], do: calls
   defp last_tool_calls(_), do: []
 
-  defp execute_all(tool_calls, tools_by_name, state, store, handle_errors, wrapper, exec_opts) do
+  defp execute_all(
+         tool_calls,
+         tools_by_name,
+         state,
+         store,
+         handle_errors,
+         wrapper,
+         messages_key,
+         exec_opts
+       ) do
     LangEx.TaskSupervisor
     |> Task.Supervisor.async_stream_nolink(
       tool_calls,
-      &run_one(&1, tools_by_name, state, store, handle_errors, wrapper),
+      &run_one(&1, tools_by_name, state, store, handle_errors, wrapper, messages_key),
       max_concurrency: exec_opts.max_concurrency,
       timeout: exec_opts.timeout,
       on_timeout: :kill_task,
       ordered: true
     )
     |> Enum.map(&handle_task_outcome/1)
+  end
+
+  # A batch of tool results is either plain `%Message.Tool{}` values (the
+  # common case, returned as a messages update) or a mix that includes
+  # `%LangEx.Command{}` results, which collapse into one node-level
+  # command carrying every reply plus the merged updates and gotos.
+  defp assemble_result(results, messages_key) do
+    results
+    |> Enum.any?(&match?(%Command{}, &1))
+    |> build_node_result(results, messages_key)
+  end
+
+  defp build_node_result(false, results, messages_key), do: %{messages_key => results}
+
+  defp build_node_result(true, results, messages_key) do
+    messages =
+      results |> Enum.flat_map(&result_messages(&1, messages_key)) |> tool_replies_first()
+
+    updates =
+      results |> Enum.filter(&match?(%Command{}, &1)) |> merge_command_updates(messages_key)
+
+    %Command{update: Map.put(updates, messages_key, messages), goto: collect_gotos(results)}
+  end
+
+  defp result_messages(%Command{update: update}, messages_key),
+    do: Map.get(update, messages_key, [])
+
+  defp result_messages(%Message.Tool{} = message, _messages_key), do: [message]
+
+  # Every `%Message.Tool{}` reply must sit immediately after the AI's
+  # tool-call message (some providers reject a tool call whose result is
+  # separated from it), so replies lead and any extra command messages
+  # (e.g. a handoff task brief) follow.
+  defp tool_replies_first(messages) do
+    {replies, rest} = Enum.split_with(messages, &match?(%Message.Tool{}, &1))
+    replies ++ rest
+  end
+
+  # Parallel tool calls in one batch can each write state. When two write
+  # different values to the same key (e.g. two handoffs both setting
+  # `:active_agent`), the earliest call wins and the conflict is logged —
+  # a single super-step cannot honour two divergent routings at once.
+  defp merge_command_updates(commands, messages_key) do
+    Enum.reduce(commands, %{}, fn %Command{update: update}, acc ->
+      update
+      |> Map.delete(messages_key)
+      |> merge_into(acc)
+    end)
+  end
+
+  defp merge_into(update, acc), do: Map.merge(acc, update, &keep_earliest/3)
+
+  defp keep_earliest(_key, existing, existing), do: existing
+
+  defp keep_earliest(key, existing, dropped) do
+    Logger.warning(
+      "Tool.Node: conflicting updates for #{inspect(key)} from parallel tool calls — " <>
+        "keeping #{inspect(existing)}, dropping #{inspect(dropped)}"
+    )
+
+    existing
+  end
+
+  defp collect_gotos(results) do
+    results
+    |> Enum.filter(&match?(%Command{}, &1))
+    |> Enum.flat_map(fn %Command{goto: goto} -> List.wrap(goto) end)
   end
 
   defp handle_task_outcome({:ok, result}), do: result
@@ -161,7 +262,7 @@ defmodule LangEx.Tool.Node do
   defp handle_task_outcome({:exit, :timeout}), do: raise("Tool execution timed out")
   defp handle_task_outcome({:exit, reason}), do: exit(reason)
 
-  defp run_one(call, tools_by_name, state, store, handle_errors, wrapper) do
+  defp run_one(call, tools_by_name, state, store, handle_errors, wrapper, messages_key) do
     Process.put(:lang_ex_store, store)
 
     request = %ToolCallRequest{
@@ -171,13 +272,37 @@ defmodule LangEx.Tool.Node do
       store: store
     }
 
-    dispatch_tool_call(
-      request,
+    request
+    |> dispatch_tool_call(
       fn req -> execute_tool(req, tools_by_name, handle_errors) end,
       wrapper,
       handle_errors,
       call
     )
+    |> ensure_tool_message(call, messages_key)
+  end
+
+  # Every requested call must get a reply for the provider. A command
+  # result that already carries its own `%Message.Tool{}` is left alone;
+  # otherwise a default reply is prepended to its messages update.
+  defp ensure_tool_message(%Command{update: update} = command, call, messages_key) do
+    update
+    |> Map.get(messages_key, [])
+    |> tool_message?(call.id)
+    |> put_default_reply(command, call, messages_key)
+  end
+
+  defp ensure_tool_message(result, _call, _messages_key), do: result
+
+  defp tool_message?(messages, id),
+    do: Enum.any?(messages, &match?(%Message.Tool{tool_call_id: ^id}, &1))
+
+  defp put_default_reply(true, command, _call, _messages_key), do: command
+
+  defp put_default_reply(false, %Command{update: update} = command, call, messages_key) do
+    reply = Message.tool("Transferred to #{call.name}.", call.id)
+    replies = [reply | Map.get(update, messages_key, [])]
+    %{command | update: Map.put(update, messages_key, replies)}
   end
 
   defp dispatch_tool_call(request, execute_fn, nil, _handle_errors, _call),
@@ -211,13 +336,15 @@ defmodule LangEx.Tool.Node do
        ) do
     tool.function
     |> call_function(call.args, state, store, call.id)
-    |> encode_result()
-    |> Message.tool(call.id)
+    |> to_tool_result(call)
   rescue
     e ->
       propagate_error(handle_errors, e, __STACKTRACE__)
       format_error(e, call, handle_errors)
   end
+
+  defp to_tool_result(%Command{} = command, _call), do: command
+  defp to_tool_result(result, call), do: result |> encode_result() |> Message.tool(call.id)
 
   defp propagate_error(false, e, stacktrace), do: reraise(e, stacktrace)
   defp propagate_error(_, _e, _stacktrace), do: :ok

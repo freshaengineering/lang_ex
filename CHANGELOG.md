@@ -1,5 +1,65 @@
 # Changelog
 
+## v0.8.0
+
+### Engine
+
+- Arity-2 node functions now receive `nil` when a run sets no `:context`
+  (previously they crashed on a context-less invoke); arity dispatch, not
+  context presence, decides the call shape
+
+### LLM
+
+- `LangEx.LLM.ChatModel.structured_node/1` — provider-agnostic structured
+  output. The model is given a synthetic `respond` tool whose parameters
+  are a JSON-schema; the decoded result is written to an `:into` state key
+  and a clean JSON assistant message is appended. Works with any
+  tool-calling provider, no per-provider configuration
+
+### Multi-agent
+
+- Tool functions may return a `%LangEx.Command{}` — its `:update` is
+  merged into graph state and its `:goto` joins the node's routing.
+  `LangEx.Tool.Node` guarantees a `%Message.Tool{}` reply for every call
+  (synthesizing one when the command omits it) and keeps returning a
+  plain `%{messages_key => [...]}` update when no tool returns a command
+  (backwards compatible)
+- `LangEx.Prebuilt.Handoff.tool/2` builds a `transfer_to_<agent>` tool
+  that moves the conversation to another agent; with
+  `task_description: true` the tool also accepts a task brief passed to
+  the target agent
+- `Swarm.create/1` and `Supervisor.create/1` validate inputs at build
+  time (non-empty `:agents`, unique names, valid `:default_active_agent` /
+  `:supervisor_name`)
+- `LangEx.Prebuilt.Swarm.create/1` — peer-to-peer team where agents hand
+  off to one another; the active agent is tracked in `:active_agent` and
+  persisted across invocations via the checkpointer
+- `LangEx.Prebuilt.Supervisor.create/1` — hub-and-spoke team where a
+  supervisor delegates to workers (with a task brief) and workers report
+  back. A worker runs on a task-focused view (handoff plumbing stripped)
+  and its output is
+  reported back as a user-role message attributed to that worker
+  (`"Response from the <name> agent: ..."`), so the supervisor can tell
+  specialist findings apart from its own reasoning and the conversation
+  stays valid for providers that reject a trailing assistant turn.
+  Supports `:output_mode` (`:full_history` | `:last_message`)
+- `LangEx.Prebuilt.Member` — the routable team-member agent shared by
+  both topologies; supports a string or `(state -> string)` callable
+  `:system_prompt`, forwards the team's runtime `:context` into each turn,
+  and contributes each turn's token usage back under `:llm_usage`
+  (teams accumulate usage across turns)
+- `:handoff_tool_prefix` on `Swarm.create/1` and `Supervisor.create/1`
+  (and `:prefix` on `Handoff.tool/2`) customizes generated handoff tool
+  names
+- `Member` accepts `:pre_model_hook` (`messages -> messages`) and
+  `:post_model_hook` (`update -> update`) for message trimming, extra
+  instructions, or guardrails around the LLM call
+- `Swarm.create/1` accepts `:add_agent_name` — each agent's replies are
+  prefixed with `"[<name>] "` so peers can attribute who said what
+- Conflicting state writes from parallel tool calls in one batch keep the
+  earliest value and log a warning (a single super-step cannot honour two
+  divergent handoffs at once)
+
 ## v0.7.0
 
 ### Release

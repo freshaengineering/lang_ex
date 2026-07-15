@@ -826,8 +826,9 @@ defmodule LangEx.Graph.Pregel do
   defp resume_values(%{resume_values: values}) when is_map(values), do: values
   defp resume_values(_opts), do: %{}
 
-  defp invoke_node_fn(fun, state, nil), do: fun.(state)
-
+  # Arity dispatch, not context presence, decides the call shape: an
+  # arity-2 node receives the context (which may be nil when the run set
+  # none), so context-aware nodes never crash on a context-less invoke.
   defp invoke_node_fn(fun, state, context) do
     fun
     |> Function.info(:arity)

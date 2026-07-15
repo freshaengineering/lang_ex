@@ -48,7 +48,7 @@ Python has [LangGraph](https://www.langchain.com/langgraph). Elixir deserves the
 ```elixir
 def deps do
   [
-    {:lang_ex, "~> 0.6.0"},
+    {:lang_ex, "~> 0.8.0"},
 
     # Optional: for Redis checkpointing
     {:redix, "~> 1.5"},
@@ -277,6 +277,44 @@ the subgraph's own checkpointing:
 - **No subgraph checkpointer** — the subgraph re-runs from `:__start__`
   with resume values injected, so all pre-interrupt subgraph nodes
   execute again and their side effects must be idempotent.
+
+### Multi-Agent Teams
+
+Build teams of cooperating agents that pass the conversation between one another. A **swarm** lets any agent hand off to any peer; the active agent is tracked in state and persisted across turns:
+
+```elixir
+graph =
+  LangEx.Prebuilt.Swarm.create(
+    agents: [
+      [model: "gpt-4o", name: :router, system_prompt: "Route the user to the right specialist."],
+      [model: "gpt-4o", name: :refunds, system_prompt: "Handle refund requests."]
+    ],
+    default_active_agent: :router,
+    checkpointer: LangEx.Checkpointer.Memory
+  )
+
+{:ok, state} =
+  LangEx.invoke(graph, %{messages: [Message.human("I want a refund")]},
+    config: [thread_id: "t-1"]
+  )
+```
+
+Each agent automatically gets a `transfer_to_<peer>` tool for every other agent. A **supervisor** instead delegates to workers that return control when done:
+
+```elixir
+graph =
+  LangEx.Prebuilt.Supervisor.create(
+    model: "gpt-4o",
+    prompt: "You manage a research agent and a math agent. Delegate to them.",
+    agents: [
+      [model: "gpt-4o", name: :research, tools: [search_tool]],
+      [model: "gpt-4o", name: :math, tools: [calc_tool]]
+    ],
+    checkpointer: LangEx.Checkpointer.Memory
+  )
+```
+
+Handoffs are ordinary tools: a tool function returning a `%LangEx.Command{}` updates state (e.g. the active agent) and steers routing. Build one directly with `LangEx.Prebuilt.Handoff.tool/2`.
 
 ### Runtime Context
 
