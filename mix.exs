@@ -36,15 +36,65 @@ defmodule LangEx.MixProject do
   defp package do
     [
       licenses: ["MIT"],
-      links: %{"GitHub" => @source_url},
-      files: ~w(lib .formatter.exs mix.exs README.md CHANGELOG.md LICENSE)
+      links: %{
+        "GitHub" => @source_url,
+        "Changelog" => "#{@source_url}/blob/main/CHANGELOG.md"
+      },
+      files: ~w(lib guides .formatter.exs mix.exs README.md CHANGELOG.md LICENSE)
     ]
   end
 
   defp docs do
     [
       main: "readme",
-      extras: ["README.md", "CHANGELOG.md"],
+      extras: [
+        "README.md",
+        "CHANGELOG.md",
+        "guides/introduction.md",
+        "guides/getting_started.md",
+        "guides/graphs.md",
+        "guides/state.md",
+        "guides/agents_and_tools.md",
+        "guides/checkpointing.md",
+        "guides/human_in_the_loop.md",
+        "guides/streaming.md",
+        "guides/subgraphs.md",
+        "guides/multi_agent.md",
+        "guides/send_and_fanout.md",
+        "guides/errors_and_policies.md",
+        "guides/store.md",
+        "guides/observability.md",
+        "guides/configuration.md",
+        "guides/extending.md",
+        "guides/from_langgraph.md",
+        "guides/examples.md"
+      ],
+      groups_for_extras: [
+        Guides: [
+          "guides/introduction.md",
+          "guides/getting_started.md",
+          "guides/from_langgraph.md",
+          "guides/examples.md"
+        ],
+        Concepts: [
+          "guides/graphs.md",
+          "guides/state.md",
+          "guides/send_and_fanout.md",
+          "guides/errors_and_policies.md"
+        ],
+        "How-to": [
+          "guides/agents_and_tools.md",
+          "guides/checkpointing.md",
+          "guides/human_in_the_loop.md",
+          "guides/streaming.md",
+          "guides/subgraphs.md",
+          "guides/multi_agent.md",
+          "guides/store.md",
+          "guides/observability.md",
+          "guides/configuration.md",
+          "guides/extending.md"
+        ]
+      ],
       source_ref: "v#{@version}",
       groups_for_modules: [
         Graph: [

@@ -6,6 +6,16 @@ defmodule LangEx do
   Build stateful, multi-step LLM workflows using nodes, edges,
   conditional routing, and composable state reducers.
 
+  ## Guides
+
+  Start with the [Getting Started](getting_started.html) guide, or jump to:
+
+  - [Introduction](introduction.html) — philosophy and mental model
+  - [Graphs](graphs.html) — builder API, compile, invoke
+  - [Agents and Tools](agents_and_tools.html) — tool-calling loops
+  - [Checkpointing](checkpointing.html) — pause, resume, crash recovery
+  - [Coming from LangGraph?](from_langgraph.html) — concept map
+
   ## Quick Start
 
       alias LangEx.Graph
