@@ -8,6 +8,14 @@
   (previously they crashed on a context-less invoke); arity dispatch, not
   context presence, decides the call shape
 
+### LLM
+
+- `LangEx.LLM.ChatModel.structured_node/1` — provider-agnostic structured
+  output. The model is given a synthetic `respond` tool whose parameters
+  are a JSON-schema; the decoded result is written to an `:into` state key
+  and a clean JSON assistant message is appended. Works with any
+  tool-calling provider, no per-provider configuration
+
 ### Multi-agent
 
 - Tool functions may return a `%LangEx.Command{}` — its `:update` is
