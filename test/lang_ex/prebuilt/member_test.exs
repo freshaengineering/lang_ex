@@ -188,6 +188,50 @@ defmodule LangEx.Prebuilt.MemberTest do
       assert %{llm_usage: %{input_tokens: 7, output_tokens: 3}} = result
     end
 
+    test "pre_model_hook transforms the messages before the LLM call" do
+      test_pid = self()
+
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn messages, _opts ->
+        send(test_pid, {:seen, messages})
+        {:ok, Message.ai("ok"), usage()}
+      end)
+
+      member =
+        Member.build(
+          provider: LangEx.LLM.OpenAI,
+          model: "gpt-4o",
+          name: :solo,
+          pre_model_hook: fn messages -> messages ++ [Message.system("HOOKED")] end
+        )
+
+      Member.node(member, :solo, :full_history).(%{messages: [Message.human("hi")]}, nil)
+
+      assert_received {:seen, seen}
+      assert Enum.any?(seen, &match?(%Message.System{content: "HOOKED"}, &1))
+    end
+
+    test "post_model_hook transforms the produced messages" do
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, _opts ->
+        {:ok, Message.ai("raw"), usage()}
+      end)
+
+      member =
+        Member.build(
+          provider: LangEx.LLM.OpenAI,
+          model: "gpt-4o",
+          name: :solo,
+          post_model_hook: fn update ->
+            Map.update!(update, :messages, fn msgs ->
+              Enum.map(msgs, fn m -> %{m | content: m.content <> " [checked]"} end)
+            end)
+          end
+        )
+
+      result = Member.node(member, :solo, :full_history).(%{messages: [Message.human("hi")]}, nil)
+
+      assert %{messages: [%Message.AI{content: "raw [checked]"}]} = result
+    end
+
     test "last_message mode contributes only the final message" do
       stub(LangEx.LLM.OpenAI, :chat_with_usage, &tool_then_answer/2)
 

@@ -48,6 +48,8 @@ defmodule LangEx.Prebuilt.Swarm do
   - `:store` - long-term memory backend shared by all members
   - `:handoff_tool_prefix` - prefix for generated handoff tool names
     (default names are `"transfer_to_<peer>"`)
+  - `:add_agent_name` - when `true`, each agent's replies are prefixed with
+    `"[<name>] "` so peers can tell who said what (default `false`)
   """
   @spec create(keyword()) :: Graph.Compiled.t()
   def create(opts) do
@@ -55,6 +57,7 @@ defmodule LangEx.Prebuilt.Swarm do
     default = Keyword.fetch!(opts, :default_active_agent)
     store = Keyword.get(opts, :store)
     prefix = Keyword.get(opts, :handoff_tool_prefix)
+    add_name? = Keyword.get(opts, :add_agent_name, false)
     names = Enum.map(specs, &Keyword.fetch!(&1, :name))
 
     :ok = validate_agents!(names)
@@ -65,19 +68,36 @@ defmodule LangEx.Prebuilt.Swarm do
       llm_usage: {%{}, &ChatModel.merge_usage/2},
       active_agent: default
     )
-    |> add_agent_nodes(specs, names, store, prefix)
+    |> add_agent_nodes(specs, names, store, prefix, add_name?)
     |> route_from_start(names, default)
     |> route_between_agents(names)
     |> Graph.compile(name: :swarm, checkpointer: Keyword.get(opts, :checkpointer), store: store)
   end
 
-  defp add_agent_nodes(graph, specs, names, store, prefix) do
+  defp add_agent_nodes(graph, specs, names, store, prefix, add_name?) do
     Enum.reduce(specs, graph, fn spec, acc ->
       name = Keyword.fetch!(spec, :name)
       member = Member.build(member_spec(spec, names, store, prefix))
-      Graph.add_node(acc, name, Member.node(member, name, :full_history))
+      Graph.add_node(acc, name, agent_node(member, name, add_name?))
     end)
   end
+
+  defp agent_node(member, name, add_name?) do
+    base = Member.node(member, name, :full_history)
+    fn state, context -> base.(state, context) |> attribute(name, add_name?) end
+  end
+
+  defp attribute(update, _name, false), do: update
+
+  defp attribute(update, name, true) do
+    Map.update(update, :messages, [], fn messages -> Enum.map(messages, &tag(&1, name)) end)
+  end
+
+  defp tag(%Message.AI{content: content} = message, name)
+       when is_binary(content) and content != "",
+       do: %{message | content: "[#{name}] #{content}"}
+
+  defp tag(message, _name), do: message
 
   defp member_spec(spec, names, store, prefix) do
     peers = List.delete(names, Keyword.fetch!(spec, :name))

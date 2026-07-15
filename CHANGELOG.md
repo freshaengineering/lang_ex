@@ -51,6 +51,11 @@
 - `:handoff_tool_prefix` on `Swarm.create/1` and `Supervisor.create/1`
   (and `:prefix` on `Handoff.tool/2`) customizes generated handoff tool
   names
+- `Member` accepts `:pre_model_hook` (`messages -> messages`) and
+  `:post_model_hook` (`update -> update`) for message trimming, extra
+  instructions, or guardrails around the LLM call
+- `Swarm.create/1` accepts `:add_agent_name` — each agent's replies are
+  prefixed with `"[<name>] "` so peers can attribute who said what
 - Conflicting state writes from parallel tool calls in one batch keep the
   earliest value and log a warning (a single super-step cannot honour two
   divergent handoffs at once)

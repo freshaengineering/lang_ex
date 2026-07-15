@@ -46,6 +46,58 @@ defmodule LangEx.Prebuilt.SwarmTest do
              ] = state.messages
     end
 
+    test "add_agent_name prefixes each agent's replies" do
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, _opts ->
+        {:ok, Message.ai("handled"), usage()}
+      end)
+
+      graph =
+        Swarm.create(
+          agents: [
+            [
+              provider: LangEx.LLM.OpenAI,
+              model: "gpt-4o",
+              name: :alice,
+              system_prompt: "You are alice."
+            ]
+          ],
+          default_active_agent: :alice,
+          add_agent_name: true
+        )
+
+      {:ok, state} = LangEx.invoke(graph, %{messages: [Message.human("hi")]})
+
+      assert %Message.AI{content: "[alice] handled"} = List.last(state.messages)
+    end
+
+    test "add_agent_name leaves tool and empty messages untouched" do
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, &lookup_then_answer/2)
+
+      graph =
+        Swarm.create(
+          agents: [
+            [
+              provider: LangEx.LLM.OpenAI,
+              model: "gpt-4o",
+              name: :alice,
+              system_prompt: "You are alice.",
+              tools: [lookup_tool()]
+            ]
+          ],
+          default_active_agent: :alice,
+          add_agent_name: true
+        )
+
+      {:ok, state} = LangEx.invoke(graph, %{messages: [Message.human("look it up")]})
+
+      assert %Message.AI{content: "[alice] found it"} = List.last(state.messages)
+
+      assert Enum.any?(state.messages, fn
+               %Message.Tool{content: c} -> c =~ "data" and not String.starts_with?(c, "[alice]")
+               _ -> false
+             end)
+    end
+
     test "an agent that does not hand off ends the turn itself" do
       stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, _opts ->
         {:ok, Message.ai("handled by alice"), usage()}
@@ -243,6 +295,19 @@ defmodule LangEx.Prebuilt.SwarmTest do
       function: fn _args -> %{result: "data"} end
     }
   end
+
+  defp lookup_then_answer(messages, _opts) do
+    messages
+    |> Enum.any?(&match?(%Message.Tool{}, &1))
+    |> answer_step()
+  end
+
+  defp answer_step(false) do
+    call = %Message.ToolCall{name: "lookup", id: "l1", args: %{}}
+    {:ok, Message.ai(nil, tool_calls: [call]), usage()}
+  end
+
+  defp answer_step(true), do: {:ok, Message.ai("found it"), usage()}
 
   defp usage, do: %{input_tokens: 1, output_tokens: 1}
 end

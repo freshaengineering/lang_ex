@@ -35,7 +35,9 @@ defmodule LangEx.Prebuilt.Member do
     :system_prompt,
     :compaction,
     :tool_opts,
-    :store
+    :store,
+    :pre_model_hook,
+    :post_model_hook
   ]
 
   @typedoc "How much of a member's turn is contributed back to the team."
@@ -61,6 +63,10 @@ defmodule LangEx.Prebuilt.Member do
     `LangEx.ContextCompaction.compact_if_needed/2`; `false` disables
   - `:tool_opts` - forwarded to `LangEx.Tool.Node.node/2`
   - `:store` - long-term memory backend
+  - `:pre_model_hook` - `(messages -> messages)` applied to the message
+    list just before the LLM call (e.g. trimming or extra instructions)
+  - `:post_model_hook` - `(update -> update)` applied to the node result
+    map after the LLM call (e.g. guardrails)
   - all other options (`:model`/`:provider`, `:temperature`, ...) are
     forwarded to `LangEx.LLM.ChatModel.node/1`
   """
@@ -140,14 +146,21 @@ defmodule LangEx.Prebuilt.Member do
     chat = ChatModel.node(llm_opts ++ [tools: tools])
     prompt = Keyword.get(member_opts, :system_prompt)
     compaction = Keyword.get(member_opts, :compaction, [])
+    pre_hook = Keyword.get(member_opts, :pre_model_hook)
+    post_hook = Keyword.get(member_opts, :post_model_hook)
 
     fn state ->
       state.messages
       |> ensure_system(resolve_prompt(prompt, state))
       |> compact(compaction)
+      |> apply_hook(pre_hook)
       |> then(&chat.(%{state | messages: &1}))
+      |> apply_hook(post_hook)
     end
   end
+
+  defp apply_hook(value, nil), do: value
+  defp apply_hook(value, hook) when is_function(hook, 1), do: hook.(value)
 
   defp resolve_prompt(prompt, state) when is_function(prompt, 1), do: prompt.(state)
   defp resolve_prompt(prompt, _state), do: prompt
