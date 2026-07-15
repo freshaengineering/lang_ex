@@ -64,6 +64,55 @@ defmodule LangEx.Graph.Pregel do
           emit_to: pid() | nil
         }
 
+  @child_recursion_limit 25
+
+  @doc """
+  Runs `child` as a nested execution of the currently executing node.
+
+  The child inherits the enclosing node's streaming sink, resume values,
+  and store from the process context, so token deltas and node events
+  stream out of a team member and an interrupt raised inside the child
+  pauses the enclosing run. `seed_state` is applied onto the child's
+  initial state through the child's reducers.
+
+  Returns `{:ok, final_state}`. An interrupt inside the child is
+  re-thrown so the enclosing run pauses (resume it with
+  `%LangEx.Command{resume: ...}`); a child error is re-thrown as a graph
+  error surfaced by the enclosing node.
+  """
+  @spec run_child(Compiled.t(), map(), keyword()) :: {:ok, map()}
+  def run_child(%Compiled{} = child, seed_state, opts \\ []) do
+    child
+    |> run(
+      State.apply_update(child.initial_state, seed_state, child.reducers),
+      child_run_opts(child, opts)
+    )
+    |> unwrap_child()
+  end
+
+  defp child_run_opts(child, opts) do
+    %{
+      recursion_limit: Keyword.get(opts, :recursion_limit, @child_recursion_limit),
+      checkpointer: child.checkpointer,
+      config: Keyword.get(opts, :config, []),
+      context: Keyword.get(opts, :context),
+      resume: nil,
+      resume_values: Process.get(:lang_ex_resume_values, %{}),
+      step: 0,
+      emit_to: Process.get(:lang_ex_stream_emit),
+      raw_interrupts: true,
+      store: child.store || Process.get(:lang_ex_store),
+      durability: :exit
+    }
+  end
+
+  defp unwrap_child({:ok, state}), do: {:ok, state}
+
+  defp unwrap_child({:interrupt, [%{id: id, value: value} | _], _state}),
+    do: throw({:lang_ex_interrupt, id, value})
+
+  defp unwrap_child({:error, reason}), do: throw({:lang_ex_graph_error, reason})
+
   @doc "Runs the compiled graph from the start node through to completion."
   @spec run(Compiled.t(), map(), run_opts() | pos_integer()) ::
           {:ok, map()} | {:interrupt, term(), map()} | {:error, term()}

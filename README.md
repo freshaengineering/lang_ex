@@ -316,6 +316,16 @@ graph =
 
 Handoffs are ordinary tools: a tool function returning a `%LangEx.Command{}` updates state (e.g. the active agent) and steers routing. Build one directly with `LangEx.Prebuilt.Handoff.tool/2`.
 
+Teams compose with the rest of LangEx:
+
+- **In-member human-in-the-loop & streaming** — each member runs as a nested child execution, so token deltas and node events stream out (`LangEx.stream/3`), and an `Interrupt.interrupt/1` raised inside a member (for example from a `:pre_model_hook`) pauses the whole team and resumes with `%LangEx.Command{resume: value}` at the team level.
+- **Parallel workers** — `Supervisor.create(parallel: true, ...)` runs the workers a supervisor turn delegates to concurrently and fans their attributed results back in one step. Each worker's task rides in its handoff arguments, so concurrent workers do not see one another's briefs.
+- **Custom team state** — pass `state_schema: [key: default]` or `state_schema: [key: {default, reducer}]` to `Swarm.create/1` or `Supervisor.create/1` to add shared state keys a member's tools can read and update. Reducer-backed keys are reduced exactly once (no double counting across members).
+- **Breakpoints** — `interrupt_before:`/`interrupt_after:` a named agent for a static approval gate before or after that agent runs, resumed with `%LangEx.Command{resume: value}`.
+- **Hierarchical teams** — a `Supervisor.create/1` `:agents` entry can be a `{name, compiled_graph}` pair, so an entire sub-team (or any compiled agent) is used as a worker.
+- **Structured output** — `response_format: json_schema` on `Supervisor.create/1` or `Prebuilt.agent/1` decodes the final answer into `:structured_response`.
+- **Verbatim forwarding** — `forward_message: true` gives the supervisor a `forward_message` tool that returns a worker's reply as-is, without paraphrasing.
+
 ### Runtime Context
 
 Inject dependencies into nodes without closures:

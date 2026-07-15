@@ -249,8 +249,8 @@ defmodule LangEx.Prebuilt.MemberTest do
     end
   end
 
-  describe "node/3 failure propagation" do
-    test "an interrupt inside a member raises a clear error" do
+  describe "node/3 propagation" do
+    test "an interrupt inside a member propagates so the team can pause" do
       member =
         Graph.new(messages: {[], &Message.add_messages/2}, active_agent: :x)
         |> Graph.add_node(:pause, fn _state -> %{approved: Interrupt.interrupt("ok?")} end)
@@ -260,10 +260,10 @@ defmodule LangEx.Prebuilt.MemberTest do
 
       node = Member.node(member, :x, :full_history)
 
-      assert_raise RuntimeError, ~r/interrupted/, fn -> node.(%{messages: []}, nil) end
+      assert catch_throw(node.(%{messages: []}, nil)) == {:lang_ex_interrupt, "pause:0", "ok?"}
     end
 
-    test "a failing member raises a clear error" do
+    test "an error inside a member propagates as a graph error" do
       member =
         Graph.new(messages: {[], &Message.add_messages/2}, active_agent: :x)
         |> Graph.add_node(:boom, fn _state -> raise "kaboom" end)
@@ -273,7 +273,8 @@ defmodule LangEx.Prebuilt.MemberTest do
 
       node = Member.node(member, :x, :full_history)
 
-      assert_raise RuntimeError, ~r/failed/, fn -> node.(%{messages: []}, nil) end
+      assert {:lang_ex_graph_error, %LangEx.NodeError{reason: %RuntimeError{message: "kaboom"}}} =
+               catch_throw(node.(%{messages: []}, nil))
     end
   end
 

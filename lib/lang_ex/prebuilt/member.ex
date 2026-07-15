@@ -16,18 +16,23 @@ defmodule LangEx.Prebuilt.Member do
   The team's runtime context is forwarded into each member turn, and each
   turn's token usage is contributed back under `:llm_usage`.
 
-  A member runs its turn as a nested execution, so a `LangEx.Interrupt`
-  raised inside a member is not resumable across the team boundary —
-  `node/3` surfaces it as an error instead. Keep human-in-the-loop pauses
-  at the team level.
+  A member runs its turn as a nested child execution that inherits the
+  team's streaming sink and resume context: token deltas and node events
+  stream out of the member, and a `LangEx.Interrupt` raised inside a
+  member pauses the whole team, resumable with `%LangEx.Command{resume:
+  ...}` at the team level. Because a member without its own checkpointer
+  re-runs from its start on resume, side effects before an in-member
+  interrupt must be idempotent.
   """
 
   alias LangEx.ContextCompaction
   alias LangEx.Graph
+  alias LangEx.Graph.Pregel
   alias LangEx.LLM.ChatModel
   alias LangEx.Message
 
   @active_agent_key :active_agent
+  @base_keys [:messages, :llm_usage, :active_agent]
   @member_opt_keys [
     :name,
     :tools,
@@ -36,6 +41,7 @@ defmodule LangEx.Prebuilt.Member do
     :compaction,
     :tool_opts,
     :store,
+    :state_schema,
     :pre_model_hook,
     :post_model_hook
   ]
@@ -63,6 +69,10 @@ defmodule LangEx.Prebuilt.Member do
     `LangEx.ContextCompaction.compact_if_needed/2`; `false` disables
   - `:tool_opts` - forwarded to `LangEx.Tool.Node.node/2`
   - `:store` - long-term memory backend
+  - `:state_schema` - extra state keys the member shares with its team
+    (`key: default` or `key: {default, reducer}`, same shape as
+    `LangEx.Graph.new/1`), so a member's tools can read and update the
+    team's custom state
   - `:pre_model_hook` - `(messages -> messages)` applied to the message
     list just before the LLM call (e.g. trimming or extra instructions)
   - `:post_model_hook` - `(update -> update)` applied to the node result
@@ -75,12 +85,14 @@ defmodule LangEx.Prebuilt.Member do
     {member_opts, llm_opts} = Keyword.split(opts, @member_opt_keys)
     name = Keyword.fetch!(member_opts, :name)
     tools = Keyword.get(member_opts, :tools, []) ++ Keyword.get(member_opts, :handoff_tools, [])
+    state_schema = Keyword.get(member_opts, :state_schema, [])
 
-    Graph.new(
-      messages: {[], &Message.add_messages/2},
-      llm_usage: {%{}, &ChatModel.merge_usage/2},
-      active_agent: name
-    )
+    ([
+       messages: {[], &Message.add_messages/2},
+       llm_usage: {%{}, &ChatModel.merge_usage/2},
+       active_agent: name
+     ] ++ state_schema)
+    |> Graph.new()
     |> Graph.add_node(:agent, agent_node(llm_opts, tools, member_opts))
     |> Graph.add_edge(:__start__, :agent)
     |> add_tool_loop(tools, name, member_opts)
@@ -95,16 +107,34 @@ defmodule LangEx.Prebuilt.Member do
   messages produced this turn (per `output_mode`), the resulting
   `:active_agent`, and the turn's `:llm_usage`. The enclosing team's
   runtime context is forwarded into the member turn.
+
+  Custom state keys (declared via `:state_schema`) are shared without
+  double reduction: a last-write-wins key is seeded with the team's
+  current value (so the member reads and overwrites it), while a
+  reducer-backed key is seeded at its default so the member accumulates
+  only its own delta, which the team then reduces exactly once.
   """
   @spec node(Graph.Compiled.t(), atom(), output_mode()) :: (map(), term() -> map())
   def node(%Graph.Compiled{} = member, name, output_mode) do
+    custom_keys = custom_keys(member)
+    lww_keys = Enum.reject(custom_keys, &Map.has_key?(member.reducers, &1))
+
     fn state, context ->
       member
-      |> Graph.Compiled.invoke(%{:messages => state.messages, @active_agent_key => name},
-        context: context
-      )
-      |> contribute(state, name, output_mode)
+      |> Pregel.run_child(seed(state, name, lww_keys), context: context)
+      |> contribute(state, name, output_mode, custom_keys)
     end
+  end
+
+  defp custom_keys(%Graph.Compiled{initial_state: initial}) do
+    initial |> Map.keys() |> Enum.reject(&(&1 in @base_keys))
+  end
+
+  defp seed(state, name, lww_keys) do
+    state
+    |> Map.take(lww_keys)
+    |> Map.put(:messages, state.messages)
+    |> Map.put(@active_agent_key, name)
   end
 
   @doc """
@@ -119,24 +149,16 @@ defmodule LangEx.Prebuilt.Member do
   defp route_after_tools(active, name) when active in [nil, name], do: :agent
   defp route_after_tools(_active, _name), do: :__end__
 
-  defp contribute({:ok, result}, state, _name, output_mode) do
-    result.messages
-    |> Enum.drop(length(state.messages))
-    |> then(
-      &%{
-        :messages => select_output(&1, output_mode),
-        :llm_usage => result.llm_usage,
-        @active_agent_key => result.active_agent
-      }
-    )
-  end
+  defp contribute({:ok, result}, state, _name, output_mode, custom_keys) do
+    delta = result.messages |> Enum.drop(length(state.messages)) |> select_output(output_mode)
 
-  defp contribute({:interrupt, _payload, _result}, _state, name, _output_mode) do
-    raise "member agent #{inspect(name)} interrupted; interrupts inside team members are not supported"
-  end
-
-  defp contribute({:error, reason}, _state, name, _output_mode) do
-    raise "member agent #{inspect(name)} failed: #{inspect(reason)}"
+    result
+    |> Map.take(custom_keys)
+    |> Map.merge(%{
+      :messages => delta,
+      :llm_usage => result.llm_usage,
+      @active_agent_key => result.active_agent
+    })
   end
 
   defp select_output(delta, :last_message), do: delta |> List.last() |> List.wrap()

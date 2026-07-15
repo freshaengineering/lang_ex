@@ -34,6 +34,13 @@ defmodule LangEx.Prebuilt.Handoff do
     explicit task brief (default `false`, a pure routing handoff)
   - `:active_agent_key` - state key holding the active agent
     (default `:active_agent`)
+  - `:active_agent_value` - value written to the active-agent key
+    (default: `target`). A parallel supervisor points several handoffs at
+    one shared sentinel so a fan-out turn ends without conflicting writes.
+  - `:brief_message` - when `false`, the tool records the task only in its
+    call arguments and skips appending a `"Task for ..."` human message
+    (default `true`). Parallel fan-out uses this to keep each worker's
+    task out of the shared transcript.
   """
   @spec tool(atom(), keyword()) :: Tool.t()
   def tool(target, opts \\ []) when is_atom(target) do
@@ -41,7 +48,13 @@ defmodule LangEx.Prebuilt.Handoff do
       name: tool_name(target, opts),
       description: Keyword.get(opts, :description, "Ask agent '#{target}' for help."),
       parameters: parameters(Keyword.get(opts, :task_description, false), target),
-      function: transfer_fn(target, Keyword.get(opts, :active_agent_key, :active_agent))
+      function:
+        transfer_fn(
+          Keyword.get(opts, :active_agent_value, target),
+          Keyword.get(opts, :active_agent_key, :active_agent),
+          target,
+          Keyword.get(opts, :brief_message, true)
+        )
     }
   end
 
@@ -68,25 +81,25 @@ defmodule LangEx.Prebuilt.Handoff do
   defp tool_name(nil, prefix, target), do: "#{prefix}#{target}"
   defp tool_name(name, _prefix, _target), do: name
 
-  defp transfer_fn(target, key) do
+  defp transfer_fn(value, key, target, brief?) do
     fn args, %{tool_call_id: id} ->
       %Command{
         update: %{
-          key => target,
-          messages: transfer_messages(target, id, Map.get(args, "task_description"))
+          key => value,
+          messages: transfer_messages(target, id, Map.get(args, "task_description"), brief?)
         }
       }
     end
   end
 
-  defp transfer_messages(target, id, task) when is_binary(task) and task != "" do
+  defp transfer_messages(target, id, task, true) when is_binary(task) and task != "" do
     [
       Message.tool("Successfully transferred to #{target}.", id),
       Message.human("Task for #{target}: #{task}")
     ]
   end
 
-  defp transfer_messages(target, id, _task) do
+  defp transfer_messages(target, id, _task, _brief) do
     [Message.tool("Successfully transferred to #{target}.", id)]
   end
 end

@@ -1,5 +1,64 @@
 # Changelog
 
+## v0.9.0
+
+### Multi-agent
+
+- Team members now run as nested child executions that inherit the team's
+  streaming sink and resume context. Token deltas and node events stream
+  out of a member (`LangEx.stream/3` with `:messages`/`:updates`), and a
+  `LangEx.Interrupt.interrupt/1` raised inside a member (e.g. from a
+  `:pre_model_hook`) pauses the whole team and is resumable at the team
+  level with `%LangEx.Command{resume: ...}` — in-member human-in-the-loop.
+  Members still contribute only their turn's delta, so message and token
+  accounting is unchanged.
+- `LangEx.Prebuilt.Supervisor.create/1` gains `:parallel`. A supervisor
+  turn that calls several worker handoffs dispatches those workers
+  concurrently (via `%LangEx.Send{}`) and fans their attributed results
+  back in one super-step. Each worker's task rides in its handoff call
+  arguments, so concurrent workers never see one another's briefs.
+- `Swarm.create/1` and `Supervisor.create/1` accept `:state_schema` —
+  extra team state keys (`key: default` or `key: {default, reducer}`)
+  that a member's tools can read and update. Custom keys are shared
+  without double reduction: last-write-wins keys are seeded with the
+  team's current value, while reducer-backed keys are seeded at their
+  default so each member contributes only its own delta, reduced exactly
+  once by the team.
+- Supervisor workers now report their token usage back to the team, so
+  `:llm_usage` accounts for worker turns.
+- `LangEx.Prebuilt.Handoff.tool/2` gains `:active_agent_value` (the value
+  written to the active-agent key, for pointing several handoffs at one
+  fan-out sentinel) and `:brief_message` (skip the shared "Task for ..."
+  transcript message and carry the task only in the call arguments).
+- `Swarm.create/1` and `Supervisor.create/1` accept `:interrupt_before` /
+  `:interrupt_after` — static breakpoints on agent (or supervisor/worker)
+  nodes for approval gates before or after a specific agent runs.
+- `Supervisor.create/1` `:agents` entries may be a `{name, compiled_graph}`
+  pair — a pre-built agent or an entire nested team used as a worker,
+  enabling hierarchical teams (a team as a worker of another team).
+- `Supervisor.create/1` accepts `:response_format` (a JSON-schema) — after
+  the supervisor's final answer a structured step decodes it into
+  `:structured_response`. `LangEx.Prebuilt.agent/1` gains the same option.
+- `Supervisor.create/1` accepts `:forward_message` — adds a
+  `forward_message` tool that forwards a named worker's latest reply
+  verbatim as the final answer (no paraphrasing).
+
+### Prebuilt
+
+- `LangEx.Prebuilt.agent/1` gains `:pre_model_hook` (`messages -> messages`)
+  and `:post_model_hook` (`update -> update`), wrapping the LLM call for
+  trimming, extra instructions, or guardrails — matching the hooks already
+  available on team members.
+- `LangEx.Prebuilt.agent/1` gains `:response_format` (a JSON-schema) — a
+  final structured step decodes the answer into `:structured_response`.
+
+### Engine
+
+- `LangEx.Graph.Pregel.run_child/3` runs a compiled graph as a nested
+  execution of the currently executing node, inheriting its streaming
+  sink, resume values, and store, and re-throwing an inner interrupt so
+  the enclosing run pauses and resumes.
+
 ## v0.8.0
 
 ### Engine

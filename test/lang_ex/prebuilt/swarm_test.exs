@@ -193,6 +193,72 @@ defmodule LangEx.Prebuilt.SwarmTest do
       assert {:done, {:ok, %{active_agent: :bob}}} = List.last(events)
     end
 
+    test "a member's inner node events and token deltas stream through the team" do
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, opts ->
+        emit = Keyword.get(opts, :on_token)
+        is_function(emit, 1) && emit.("handled ")
+        is_function(emit, 1) && emit.("by alice")
+        {:ok, Message.ai("handled by alice"), usage()}
+      end)
+
+      graph =
+        Swarm.create(
+          agents: [
+            [
+              provider: LangEx.LLM.OpenAI,
+              model: "gpt-4o",
+              name: :alice,
+              system_prompt: "You are alice."
+            ]
+          ],
+          default_active_agent: :alice
+        )
+
+      events =
+        graph
+        |> LangEx.stream(%{messages: [Message.human("hi")]}, modes: [:updates, :messages])
+        |> Enum.to_list()
+
+      assert Enum.any?(events, &match?({:node_start, :agent}, &1))
+      assert Enum.any?(events, &match?({:message_delta, %{node: :agent, text: "handled "}}, &1))
+    end
+
+    test "an interrupt inside a member pauses the team and resumes at the team level" do
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, _opts ->
+        {:ok, Message.ai("all set"), usage()}
+      end)
+
+      approve = fn messages ->
+        LangEx.Interrupt.interrupt("approve?")
+        messages
+      end
+
+      graph =
+        Swarm.create(
+          checkpointer: LangEx.Checkpointer.Memory,
+          default_active_agent: :agent1,
+          agents: [
+            [
+              provider: LangEx.LLM.OpenAI,
+              model: "gpt-4o",
+              name: :agent1,
+              system_prompt: "You are agent1.",
+              pre_model_hook: approve
+            ]
+          ]
+        )
+
+      config = [thread_id: "swarm-hitl-1"]
+
+      assert {:interrupt, "approve?", _paused} =
+               LangEx.invoke(graph, %{messages: [Message.human("hi")]}, config: config)
+
+      assert {:ok, state} =
+               LangEx.invoke(graph, %LangEx.Command{resume: :approved}, config: config)
+
+      assert %Message.AI{content: "all set"} = List.last(state.messages)
+    end
+
     test "the active agent persists across invocations" do
       stub(LangEx.LLM.OpenAI, :chat_with_usage, &scripted/2)
 
@@ -205,6 +271,173 @@ defmodule LangEx.Prebuilt.SwarmTest do
       assert %{active_agent: :bob} = second
       assert %Message.AI{content: "done by bob"} = List.last(second.messages)
     end
+
+    test "interrupt_before pauses before an agent runs and resumes" do
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, &scripted/2)
+
+      graph = swarm(checkpointer: LangEx.Checkpointer.Memory, interrupt_before: [:bob])
+      config = [thread_id: "swarm-bp-1"]
+
+      assert {:interrupt, {:interrupt_before, :bob}, _paused} =
+               LangEx.invoke(graph, %{messages: [Message.human("help")]}, config: config)
+
+      assert {:ok, state} = LangEx.invoke(graph, %LangEx.Command{resume: true}, config: config)
+      assert %{active_agent: :bob} = state
+      assert %Message.AI{content: "done by bob"} = List.last(state.messages)
+    end
+  end
+
+  describe "create/1 custom state" do
+    test "rejects a state_schema that redefines a reserved key" do
+      assert_raise ArgumentError, ~r/reserved team key/, fn ->
+        Swarm.create(
+          agents: [[name: :a, model: "gpt-4o"]],
+          default_active_agent: :a,
+          state_schema: [messages: []]
+        )
+      end
+    end
+
+    test "a reducer-backed custom key accumulates exactly once across a handoff" do
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, &log_script/2)
+
+      graph =
+        Swarm.create(
+          state_schema: [log: {[], fn current, new -> current ++ new end}],
+          default_active_agent: :alice,
+          agents: [
+            [
+              provider: LangEx.LLM.OpenAI,
+              model: "gpt-4o",
+              name: :alice,
+              system_prompt: "You are alice.",
+              tools: [log_tool("a")]
+            ],
+            [
+              provider: LangEx.LLM.OpenAI,
+              model: "gpt-4o",
+              name: :bob,
+              system_prompt: "You are bob.",
+              tools: [log_tool("b")]
+            ]
+          ]
+        )
+
+      {:ok, state} = LangEx.invoke(graph, %{messages: [Message.human("go")]})
+
+      assert state.log == ["a", "b"]
+    end
+
+    test "a last-write-wins custom key is readable and writable across members" do
+      test_pid = self()
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, &owner_script/2)
+
+      graph =
+        Swarm.create(
+          state_schema: [owner: nil],
+          default_active_agent: :alice,
+          agents: [
+            [
+              provider: LangEx.LLM.OpenAI,
+              model: "gpt-4o",
+              name: :alice,
+              system_prompt: "You are alice.",
+              tools: [set_owner_tool()]
+            ],
+            [
+              provider: LangEx.LLM.OpenAI,
+              model: "gpt-4o",
+              name: :bob,
+              system_prompt: "You are bob.",
+              tools: [read_owner_tool(test_pid)]
+            ]
+          ]
+        )
+
+      {:ok, state} = LangEx.invoke(graph, %{messages: [Message.human("go")]})
+
+      assert %{owner: :vip} = state
+      assert_received {:owner_seen, :vip}
+    end
+  end
+
+  defp log_script(messages, _opts), do: log_respond(role(messages), messages)
+
+  defp log_respond(:alice, _messages) do
+    calls = [
+      %Message.ToolCall{name: "log_a", id: "la", args: %{}},
+      %Message.ToolCall{name: "transfer_to_bob", id: "tb", args: %{}}
+    ]
+
+    {:ok, Message.ai(nil, tool_calls: calls), usage()}
+  end
+
+  defp log_respond(:bob, messages) do
+    messages
+    |> Enum.any?(&match?(%Message.Tool{tool_call_id: "lb"}, &1))
+    |> bob_log_step()
+  end
+
+  defp bob_log_step(true), do: {:ok, Message.ai("logged"), usage()}
+
+  defp bob_log_step(false) do
+    {:ok, Message.ai(nil, tool_calls: [%Message.ToolCall{name: "log_b", id: "lb", args: %{}}]),
+     usage()}
+  end
+
+  defp log_tool(entry) do
+    %LangEx.Tool{
+      name: "log_#{entry}",
+      description: "Records #{entry}.",
+      parameters: %{type: "object", properties: %{}, required: []},
+      function: fn _args -> %LangEx.Command{update: %{log: [entry]}} end
+    }
+  end
+
+  defp owner_script(messages, _opts), do: owner_respond(role(messages), messages)
+
+  defp owner_respond(:alice, _messages) do
+    calls = [
+      %Message.ToolCall{name: "set_owner", id: "so", args: %{}},
+      %Message.ToolCall{name: "transfer_to_bob", id: "tb", args: %{}}
+    ]
+
+    {:ok, Message.ai(nil, tool_calls: calls), usage()}
+  end
+
+  defp owner_respond(:bob, messages) do
+    messages
+    |> Enum.any?(&match?(%Message.Tool{tool_call_id: "ro"}, &1))
+    |> bob_read_step()
+  end
+
+  defp bob_read_step(true), do: {:ok, Message.ai("read"), usage()}
+
+  defp bob_read_step(false) do
+    {:ok,
+     Message.ai(nil, tool_calls: [%Message.ToolCall{name: "read_owner", id: "ro", args: %{}}]),
+     usage()}
+  end
+
+  defp set_owner_tool do
+    %LangEx.Tool{
+      name: "set_owner",
+      description: "Sets the owner.",
+      parameters: %{type: "object", properties: %{}, required: []},
+      function: fn _args -> %LangEx.Command{update: %{owner: :vip}} end
+    }
+  end
+
+  defp read_owner_tool(test_pid) do
+    %LangEx.Tool{
+      name: "read_owner",
+      description: "Reads the owner.",
+      parameters: %{type: "object", properties: %{}, required: []},
+      function: fn _args, %{state: state} ->
+        send(test_pid, {:owner_seen, Map.get(state, :owner)})
+        %{acknowledged: true}
+      end
+    }
   end
 
   defp swarm(opts \\ []) do

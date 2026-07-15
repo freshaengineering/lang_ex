@@ -27,6 +27,14 @@ Run them in order — each builds on the ideas of the previous one.
 | [12_multi_agent_live.exs](12_multi_agent_live.exs) | A customer-support swarm: front-line triage hands off to Billing/Tech specialists (with tools), active agent persisted across turns — **requires a real `ANTHROPIC_API_KEY`** |
 | [13_supervisor_live.exs](13_supervisor_live.exs) | A supervisor incident-response team delegating to diagnostics/runbook/comms specialists and synthesizing a summary — **requires a real `ANTHROPIC_API_KEY`** |
 | [14_workflow_live.exs](14_workflow_live.exs) | A team embedded in a larger graph with Command routing, human-in-the-loop approval, long-term store, and durable persistence — **requires a real `ANTHROPIC_API_KEY`** |
+| [15_supervisor_parallel.exs](15_supervisor_parallel.exs) | A supervisor delegating to several workers concurrently (`parallel: true`) and fanning their attributed results back in one step — scripted LLM, no key needed |
+| [16_in_member_hitl_live.exs](16_in_member_hitl_live.exs) | In-member human-in-the-loop: a `:pre_model_hook` interrupt pauses mid-member and resumes at the team level, with the reply streamed token-by-token — **requires a real `ANTHROPIC_API_KEY`** |
+| [17_parallel_supervisor_live.exs](17_parallel_supervisor_live.exs) | A travel lead delegating to flights + hotels agents concurrently (`parallel: true`) and combining their findings — **requires a real `ANTHROPIC_API_KEY`** |
+| [18_prebuilt_worker_forward_live.exs](18_prebuilt_worker_forward_live.exs) | A pre-built `Prebuilt.agent/1` used as a supervisor worker, whose answer the supervisor forwards verbatim via the `forward_message` tool — **requires a real `ANTHROPIC_API_KEY`** |
+| [19_structured_output_live.exs](19_structured_output_live.exs) | A supervisor with `response_format` decoding its final answer into a typed `:structured_response` — **requires a real `ANTHROPIC_API_KEY`** |
+| [20_team_breakpoint_live.exs](20_team_breakpoint_live.exs) | A swarm compiled with `interrupt_before: [:refunds]` — a manager approval gate that pauses before a specialist agent runs — **requires a real `ANTHROPIC_API_KEY`** |
+| [21_hierarchical_team_live.exs](21_hierarchical_team_live.exs) | Hierarchical teams: a supervisor whose worker is itself a supervisor coordinating two specialists — **requires a real `ANTHROPIC_API_KEY`** |
+| [22_custom_state_live.exs](22_custom_state_live.exs) | A swarm sharing a custom reducer-backed `:checklist` state key, accumulated exactly once across a handoff — **requires a real `ANTHROPIC_API_KEY`** |
 
 The scripts that pause and resume use
 [`support/in_memory_checkpointer.exs`](support/in_memory_checkpointer.exs),
