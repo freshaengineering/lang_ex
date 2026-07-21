@@ -8,7 +8,8 @@ defmodule LangEx.Graph.Pregel do
 
   Supports checkpointing, interrupts (dynamic and static breakpoints),
   streaming events, runtime context, Send fan-out, and managed values
-  (remaining_steps).
+  (`remaining_steps`, `is_last_step`, and the `remaining_ms` /
+  `remaining_tokens` run budgets).
 
   ## Interrupt model
 
@@ -55,6 +56,8 @@ defmodule LangEx.Graph.Pregel do
           optional(:deferred_backlog) => [entry()],
           optional(:completed_next) => [entry()],
           optional(:durability) => :sync | :async | :exit,
+          optional(:deadline) => integer() | nil,
+          optional(:token_budget) => pos_integer() | nil,
           recursion_limit: pos_integer(),
           checkpointer: module() | nil,
           config: keyword(),
@@ -910,25 +913,74 @@ defmodule LangEx.Graph.Pregel do
   defp require_mapped_target!(:error, result),
     do: raise(ArgumentError, "routing returned #{inspect(result)} but no mapping found")
 
-  # The managed value is only injected (and stripped) when the user's
-  # schema does not claim :remaining_steps for itself.
-  defp inject_managed(state, %{recursion_limit: limit, step: step}) do
+  @managed_keys [:remaining_steps, :is_last_step, :remaining_ms, :remaining_tokens]
+
+  # Managed values are injected into the state passed to nodes and stripped
+  # before the state is checkpointed or carried to the next super-step. A key
+  # is only managed when the user's schema does not claim it for itself.
+  defp inject_managed(state, %{recursion_limit: limit, step: step} = opts) do
+    remaining_steps = limit - step
+
     state
-    |> Map.has_key?(:remaining_steps)
-    |> put_managed(state, limit - step)
+    |> put_managed(:remaining_steps, remaining_steps)
+    |> put_managed(:remaining_ms, remaining_ms(opts))
+    |> put_managed(:remaining_tokens, remaining_tokens(state, opts))
+    |> put_managed(:is_last_step, last_step?(remaining_steps, state, opts))
   end
 
-  defp put_managed(true, state, _remaining), do: state
-  defp put_managed(false, state, remaining), do: Map.put(state, :remaining_steps, remaining)
+  defp put_managed(state, _key, :skip), do: state
+
+  defp put_managed(state, key, value) do
+    state
+    |> Map.has_key?(key)
+    |> put_unclaimed_managed(state, key, value)
+  end
+
+  defp put_unclaimed_managed(true, state, _key, _value), do: state
+  defp put_unclaimed_managed(false, state, key, value), do: Map.put(state, key, value)
+
+  defp remaining_ms(%{deadline: deadline}) when is_integer(deadline),
+    do: max(0, deadline - System.monotonic_time(:millisecond))
+
+  defp remaining_ms(_opts), do: :skip
+
+  defp remaining_tokens(state, %{token_budget: budget}) when is_integer(budget),
+    do: max(0, budget - used_tokens(state))
+
+  defp remaining_tokens(_state, _opts), do: :skip
+
+  defp used_tokens(%{llm_usage: %{} = usage}),
+    do:
+      number(usage[:total_tokens]) + number(usage[:input_tokens]) + number(usage[:output_tokens])
+
+  defp used_tokens(_state), do: 0
+
+  defp number(n) when is_number(n), do: n
+  defp number(_), do: 0
+
+  defp last_step?(remaining_steps, state, opts),
+    do: remaining_steps <= 1 or past_deadline?(opts) or tokens_exhausted?(state, opts)
+
+  defp past_deadline?(%{deadline: deadline}) when is_integer(deadline),
+    do: System.monotonic_time(:millisecond) >= deadline
+
+  defp past_deadline?(_opts), do: false
+
+  defp tokens_exhausted?(state, %{token_budget: budget}) when is_integer(budget),
+    do: used_tokens(state) >= budget
+
+  defp tokens_exhausted?(_state, _opts), do: false
 
   defp strip_managed(state, %Compiled{initial_state: initial}) do
-    initial
-    |> Map.has_key?(:remaining_steps)
-    |> drop_managed(state)
+    Enum.reduce(@managed_keys, state, fn key, acc ->
+      initial
+      |> Map.has_key?(key)
+      |> drop_managed(acc, key)
+    end)
   end
 
-  defp drop_managed(true, state), do: state
-  defp drop_managed(false, state), do: Map.delete(state, :remaining_steps)
+  defp drop_managed(true, state, _key), do: state
+  defp drop_managed(false, state, key), do: Map.delete(state, key)
 
   defp save_checkpoint(%{checkpointer: nil}, _state, _nodes), do: nil
 

@@ -5,6 +5,7 @@ defmodule LangEx.LLM.ChatModelTest do
   alias LangEx.LLM.ChatModel
   alias LangEx.Graph
   alias LangEx.Message
+  alias LangEx.Tool
 
   describe "ChatModel node with mocked LLM" do
     test "OpenAI-backed node appends AI response to message history" do
@@ -277,6 +278,85 @@ defmodule LangEx.LLM.ChatModelTest do
       assert_raise RuntimeError, ~r/structured output request failed/, fn ->
         node.(%{messages: [Message.human("hi")]})
       end
+    end
+  end
+
+  describe "structured/2" do
+    test "returns {:ok, data} from the respond tool call when required keys are present" do
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, opts ->
+        assert [%Tool{name: "respond"}] = opts[:tools]
+
+        call = %Message.ToolCall{
+          name: "respond",
+          id: "r1",
+          args: %{"action" => "investigate", "actionable" => true}
+        }
+
+        {:ok, Message.ai(nil, tool_calls: [call]), %{input_tokens: 1, output_tokens: 1}}
+      end)
+
+      schema = %{
+        type: "object",
+        properties: %{action: %{type: "string"}, actionable: %{type: "boolean"}},
+        required: ["action", "actionable"]
+      }
+
+      assert {:ok, %{"action" => "investigate", "actionable" => true}} =
+               ChatModel.structured([Message.human("classify")],
+                 provider: LangEx.LLM.OpenAI,
+                 model: "gpt-4o",
+                 schema: schema
+               )
+    end
+
+    test "falls back to decoding JSON content" do
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, _opts ->
+        {:ok, Message.ai(~s({"action": "skip"})), %{input_tokens: 1, output_tokens: 1}}
+      end)
+
+      assert {:ok, %{"action" => "skip"}} =
+               ChatModel.structured([Message.human("hi")],
+                 provider: LangEx.LLM.OpenAI,
+                 model: "gpt-4o",
+                 schema: %{type: "object", required: ["action"]}
+               )
+    end
+
+    test "reports missing required keys" do
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, _opts ->
+        {:ok, Message.ai(~s({"action": "skip"})), %{input_tokens: 1, output_tokens: 1}}
+      end)
+
+      assert {:error, {:missing_required, ["actionable"]}} =
+               ChatModel.structured([Message.human("hi")],
+                 provider: LangEx.LLM.OpenAI,
+                 model: "gpt-4o",
+                 schema: %{type: "object", required: ["action", "actionable"]}
+               )
+    end
+
+    test "reports no structured output for prose" do
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, _opts ->
+        {:ok, Message.ai("just prose"), %{input_tokens: 1, output_tokens: 1}}
+      end)
+
+      assert {:error, :no_structured_output} =
+               ChatModel.structured([Message.human("hi")],
+                 provider: LangEx.LLM.OpenAI,
+                 model: "gpt-4o",
+                 schema: %{type: "object"}
+               )
+    end
+
+    test "surfaces provider errors" do
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, _opts -> {:error, :boom} end)
+
+      assert {:error, :boom} =
+               ChatModel.structured([Message.human("hi")],
+                 provider: LangEx.LLM.OpenAI,
+                 model: "gpt-4o",
+                 schema: %{type: "object"}
+               )
     end
   end
 end

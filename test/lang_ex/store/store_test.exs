@@ -33,6 +33,46 @@ defmodule LangEx.StoreTest do
     end
   end
 
+  describe "ETS semantic search" do
+    test "ranks entries by cosine similarity to the query" do
+      embed = fn text ->
+        down = String.downcase(text)
+
+        Enum.map(["database", "cpu", "memory"], fn term ->
+          (down |> String.split(term) |> length()) - 1 + 0.0
+        end)
+      end
+
+      config = [index: [embed: embed]]
+      namespace = ["incidents"]
+
+      :ok = Store.ETS.put(config, namespace, "a", "database connection pool exhausted")
+      :ok = Store.ETS.put(config, namespace, "b", "cpu throttling on the node")
+      :ok = Store.ETS.put(config, namespace, "c", "memory leak in the worker")
+
+      results =
+        Store.ETS.search(config, namespace, query: "why is the database so slow", limit: 2)
+
+      assert [{"a", "database connection pool exhausted"} | _] = results
+      assert length(results) == 2
+    end
+
+    test "a query without a configured embedder falls back to prefix order" do
+      namespace = ["incidents"]
+      :ok = Store.ETS.put([], namespace, "b", "beta")
+      :ok = Store.ETS.put([], namespace, "a", "alpha")
+
+      assert [{"a", "alpha"}, {"b", "beta"}] = Store.ETS.search([], namespace, query: "anything")
+    end
+
+    test "get still returns the raw value when an embedder is configured" do
+      config = [index: [embed: fn _text -> [1.0, 0.0] end]]
+      :ok = Store.ETS.put(config, ["ns"], "k", %{fact: "value"})
+
+      assert {:ok, %{fact: "value"}} = Store.ETS.get(config, ["ns"], "k")
+    end
+  end
+
   describe "store attached to a graph" do
     test "node functions read and write through the convenience API" do
       graph =

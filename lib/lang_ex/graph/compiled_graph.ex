@@ -58,6 +58,14 @@ defmodule LangEx.Graph.Compiled do
     (default: `System.schedulers_online()`)
   - `:node_timeout` - per-node timeout in ms for parallel super-steps
     (default: `:infinity`)
+  - `:deadline_ms` - wall-clock budget for the whole run. Exposes a
+    `:remaining_ms` managed value to nodes and flips `:is_last_step` to
+    `true` once the deadline passes, so a node can conclude gracefully
+    instead of the engine raising (default: no deadline)
+  - `:token_budget` - cumulative token budget for the run. Exposes a
+    `:remaining_tokens` managed value and flips `:is_last_step` once the
+    budget is spent. Usage is read from the `:llm_usage` state key (the
+    reducer convention `ChatModel.merge_usage/2` populates) (default: none)
   - `:durability` - checkpoint write mode (default `:sync`):
     - `:sync` - write after every super-step, on the hot path
     - `:async` - write after every super-step in a supervised task
@@ -346,7 +354,12 @@ defmodule LangEx.Graph.Compiled do
       max_concurrency: Keyword.get(opts, :max_concurrency),
       node_timeout: Keyword.get(opts, :node_timeout),
       store: graph.store,
-      durability: Keyword.get(opts, :durability, :sync)
+      durability: Keyword.get(opts, :durability, :sync),
+      deadline: deadline_from(Keyword.get(opts, :deadline_ms)),
+      token_budget: Keyword.get(opts, :token_budget)
     }
   end
+
+  defp deadline_from(nil), do: nil
+  defp deadline_from(ms) when is_integer(ms), do: System.monotonic_time(:millisecond) + ms
 end

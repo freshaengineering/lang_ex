@@ -122,6 +122,67 @@ defmodule LangEx.LLM.ChatModel do
     end
   end
 
+  @doc """
+  One-shot structured extraction outside a graph node.
+
+  Forces the provider to answer via a synthetic `respond` tool whose
+  parameters are `:schema`, decodes the tool call (falling back to decoding
+  JSON content), and validates that the schema's top-level `required` keys
+  are present.
+
+  ## Options
+
+  - `:schema` (required) - JSON-schema map describing the desired shape
+  - `:resilient` - `true` or `LangEx.LLM.Resilient` options to retry on
+    transient failures
+  - `:provider` / `:model` and other options are forwarded to the provider
+
+  Returns `{:ok, map}` or `{:error, reason}`:
+
+  - `{:error, :no_structured_output}` - the model returned nothing decodable
+  - `{:error, {:missing_required, keys}}` - required keys were absent
+  - `{:error, term}` - the provider call itself failed
+  """
+  @spec structured([LangEx.Message.t()], keyword()) :: {:ok, map()} | {:error, term()}
+  def structured(messages, opts) do
+    {schema, opts} = Keyword.pop!(opts, :schema)
+    {provider, llm_opts} = resolve_provider(opts)
+    {resilient, llm_opts} = Keyword.pop(llm_opts, :resilient)
+
+    resilient
+    |> dispatch_call(provider, messages, Keyword.put(llm_opts, :tools, [respond_tool(schema)]))
+    |> structured_result(schema)
+  end
+
+  defp structured_result({:ok, ai_message, _usage}, schema) do
+    ai_message
+    |> extract_structured()
+    |> validate_structured(schema)
+  end
+
+  defp structured_result({:error, _reason} = error, _schema), do: error
+
+  @doc """
+  Validate a decoded structured result against a JSON-schema's top-level
+  `required` keys. Keys are compared as strings.
+  """
+  @spec validate_structured(map() | nil, map()) :: {:ok, map()} | {:error, term()}
+  def validate_structured(nil, _schema), do: {:error, :no_structured_output}
+
+  def validate_structured(data, schema) when is_map(data) do
+    schema
+    |> required_keys()
+    |> Enum.reject(&Map.has_key?(data, &1))
+    |> validated(data)
+  end
+
+  defp validated([], data), do: {:ok, data}
+  defp validated(missing, _data), do: {:error, {:missing_required, missing}}
+
+  defp required_keys(%{required: keys}) when is_list(keys), do: Enum.map(keys, &to_string/1)
+  defp required_keys(%{"required" => keys}) when is_list(keys), do: Enum.map(keys, &to_string/1)
+  defp required_keys(_schema), do: []
+
   defp respond_tool(schema) do
     %Tool{
       name: "respond",

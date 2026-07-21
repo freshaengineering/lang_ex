@@ -24,6 +24,7 @@ defmodule LangEx.Prebuilt do
   alias LangEx.Graph
   alias LangEx.LLM.ChatModel
   alias LangEx.Message
+  alias LangEx.Prebuilt.Reflect
 
   @agent_opt_keys [
     :name,
@@ -83,6 +84,15 @@ defmodule LangEx.Prebuilt do
       interrupt_after: Keyword.get(agent_opts, :interrupt_after, [])
     )
   end
+
+  @doc """
+  Builds a generate → critique → revise reflection graph.
+
+  Delegates to `LangEx.Prebuilt.Reflect.create/1`; see that module for
+  options and state shape.
+  """
+  @spec reflect(keyword()) :: Graph.Compiled.t()
+  def reflect(opts), do: Reflect.create(opts)
 
   defp agent_node(llm_opts, tools, agent_opts) do
     chat = ChatModel.node(llm_opts ++ [tools: tools])
