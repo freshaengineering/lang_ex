@@ -44,9 +44,16 @@ defmodule LangEx.Store do
   @callback delete(config(), namespace(), key()) :: :ok | {:error, term()}
 
   @doc """
-  Lists `{key, value}` pairs in a namespace, sorted by key.
+  Lists `{key, value}` pairs in a namespace.
 
-  Options: `:prefix` (key prefix filter), `:limit` (default 100).
+  Options:
+
+  - `:prefix` - key prefix filter (default `""`)
+  - `:limit` - maximum entries returned (default `100`)
+  - `:query` - natural-language query for semantic ranking. When the
+    backend has an embedder configured (see `LangEx.Store.ETS`), results
+    are ordered by cosine similarity (highest first) instead of by key;
+    backends without an embedder ignore it and fall back to prefix order.
   """
   @callback search(config(), namespace(), keyword()) :: [{key(), term()}] | {:error, term()}
 

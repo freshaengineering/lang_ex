@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.9.0
+
+### Engine — run budgets & managed values
+
+- New managed value `:is_last_step` injected into node state (LangGraph's
+  `IsLastStep`): `true` on the final allowed super-step so a node can
+  produce a final answer instead of the engine raising at the recursion
+  limit
+- `:deadline_ms` invoke option — a wall-clock budget for the whole run.
+  Exposes a `:remaining_ms` managed value and flips `:is_last_step` once
+  the deadline passes (graceful conclusion, not a raise)
+- `:token_budget` invoke option — a cumulative token budget. Exposes a
+  `:remaining_tokens` managed value and flips `:is_last_step` when spent;
+  usage is read from the `:llm_usage` state key (the `ChatModel.merge_usage/2`
+  reducer convention)
+- All managed values are stripped before checkpointing and left untouched
+  when the user's schema claims the key
+
+### LLM — structured output
+
+- `LangEx.LLM.ChatModel.structured/2` — one-shot, provider-agnostic
+  structured extraction outside a graph node. Forces a synthetic `respond`
+  tool, decodes the result (falling back to JSON content), and validates
+  the schema's top-level `required` keys. Returns `{:ok, map}` or
+  `{:error, :no_structured_output | {:missing_required, keys} | term}`
+- `LangEx.LLM.ChatModel.validate_structured/2` — reusable required-key
+  validation for decoded structured results
+
+### Prebuilt — reflection
+
+- `LangEx.Prebuilt.reflect/1` (and `LangEx.Prebuilt.Reflect.create/1`) — a
+  generate → critique → revise loop. A critic evaluates each draft via
+  `ChatModel.structured/2` (validated `approved` boolean) and the graph
+  loops back to revise until approval or `:max_iterations`
+
+### Store — semantic search
+
+- `LangEx.Store.ETS` supports similarity search via a pluggable embedder
+  (`store: {LangEx.Store.ETS, index: [embed: &embed/1]}`). `put/4` embeds
+  each value; `search/3` with a `:query` returns entries ranked by cosine
+  similarity. Without an embedder, `:query` falls back to prefix ordering
+
 ## v0.8.0
 
 ### Engine
