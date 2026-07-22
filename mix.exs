@@ -1,7 +1,7 @@
 defmodule LangEx.MixProject do
   use Mix.Project
 
-  @version "0.9.0"
+  @version "0.10.0"
   @source_url "https://github.com/surgeventures/lang_ex"
 
   def project do
@@ -94,6 +94,9 @@ defmodule LangEx.MixProject do
           LangEx.Tool,
           LangEx.Tool.Annotation,
           LangEx.Tool.Node
+        ],
+        Embeddings: [
+          LangEx.Embedding.Hashing
         ],
         "Multi-Agent": [
           LangEx.Prebuilt.Handoff,

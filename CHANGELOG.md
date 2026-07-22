@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.10.0
+
+### Embeddings
+
+- `LangEx.Embedding.Hashing.embed/2` — a dependency-free text embedder
+  (hashing trick: tokens hashed into fixed-length term-frequency buckets).
+  Makes `LangEx.Store` semantic search usable out of the box without a
+  neural embedding provider:
+
+      Graph.compile(builder,
+        store: {LangEx.Store.ETS, index: [embed: &LangEx.Embedding.Hashing.embed/1]}
+      )
+
+  It captures lexical overlap, not meaning; supply a neural embedder when
+  semantic similarity matters.
+
 ## v0.9.0
 
 ### Engine — run budgets & managed values
