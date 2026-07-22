@@ -1,0 +1,127 @@
+name: Claude Code
+
+permissions:
+  id-token: write
+  contents: write
+  packages: read
+  pull-requests: write
+  issues: write
+  actions: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: "Prompt to send to Claude"
+        required: false
+        type: string
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  issues:
+    types: [opened, assigned]
+  pull_request_review:
+    types: [submitted]
+
+# lang_ex is a root-level Hex library (mix.exs at repo root, no src/, no DB).
+# It uses erlef/setup-beam with pinned versions to match ci.yaml rather than the
+# platform-tribe-actions elixir/build action, which assumes an app under src/.
+env:
+  REPOSITORY: lang_ex
+  RUNNER_OS: ubuntu22
+  ELIXIR_VERSION: 1.16.2
+  OTP_VERSION: 26.2.5
+
+jobs:
+  claude:
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+      (github.event_name == 'issues' && contains(github.event.issue.body, '@claude'))
+    runs-on: runs-on/runner=8cpu-linux-x64/run-id=${{ github.run_id }}/extras=ecr-cache
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2
+        with:
+          use-policy-store: true
+          api-key: ${{ secrets.GH_FRESHAENGINEERING_STEP_SECURITY_API_KEY }}
+
+      - name: Get PR context
+        id: pr
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "sha=${{ github.sha }}" >> $GITHUB_OUTPUT
+            exit 0
+          elif [[ "${{ github.event_name }}" == "issue_comment" ]]; then
+            if [[ -n "${{ github.event.issue.pull_request }}" ]]; then
+              PR_NUMBER="${{ github.event.issue.number }}"
+            else
+              echo "sha=${{ github.sha }}" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          elif [[ "${{ github.event_name }}" == "pull_request_review_comment" || "${{ github.event_name }}" == "pull_request_review" ]]; then
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+          elif [[ "${{ github.event_name }}" == "issues" ]]; then
+            echo "sha=${{ github.sha }}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          PR_DATA=$(gh api repos/${{ github.repository }}/pulls/$PR_NUMBER)
+          echo "sha=$(echo "$PR_DATA" | jq -r '.head.sha')" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ steps.pr.outputs.sha }}
+          clean: false
+          persist-credentials: true
+
+      - name: Setup Elixir
+        uses: erlef/setup-beam@fc68ffb90438ef2936bbb3251622353b3dcb2f93 # v1
+        env:
+          ImageOS: ${{ env.RUNNER_OS }}
+        with:
+          elixir-version: ${{ env.ELIXIR_VERSION }}
+          otp-version: ${{ env.OTP_VERSION }}
+          version-type: strict
+
+      - name: Install and compile dependencies
+        env:
+          MIX_ENV: test
+          HEX_API_KEY: ${{ secrets.GH_FRESHAENGINEERING_LANG_EX_HEX_PM_API_KEY }}
+        run: |
+          mix deps.get
+          mix deps.compile
+
+      # claude-code-action is resolved at run time instead of being SHA-pinned:
+      # merges to its main roll out on the next run without pin bumps. The action
+      # expects the checkout at exactly the path its `uses:` line points at, and
+      # masks it from the target repo's git status itself.
+      - name: Mint claude-code-action clone token
+        uses: octo-sts/action@f603d3be9d8dd9871a265776e625a27b00effe05 # v1.1.1
+        id: claude_code_action
+        with:
+          scope: freshaengineering/claude-code-action
+          identity: claude
+
+      - name: Checkout claude-code-action
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: freshaengineering/claude-code-action
+          ref: main
+          path: .claude-code-action
+          token: ${{ steps.claude_code_action.outputs.token }}
+
+      - name: Run Claude Code
+        id: claude
+        uses: ./.claude-code-action
+        with:
+          anthropic_api_key: ${{ secrets.GH_FRESHAENGINEERING_ANTHROPIC_REVIEW_TOKEN }}
+          datadog_api_key: ${{ secrets.GH_FRESHAENGINEERING_DATADOG_API_KEY }}
+          slack_token: ${{ secrets.SLACK_TOKEN_CLAUDE }}
+          prompt: ${{ inputs.prompt }}
+          track_progress: ${{ github.event_name != 'workflow_dispatch' }}
