@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.11.1
+
+### Checkpoint — resilient atom decoding
+
+- `LangEx.Checkpoint.Serializer.decode/1` no longer crashes when a checkpointed
+  **value atom** is not loaded in the current VM. It prefers an existing atom
+  and falls back to creating one, so a thread resumes correctly in a fresh VM
+  or after a deploy (previously `binary_to_existing_atom` raised
+  `ArgumentError`). Module names and struct field keys stay strict — they must
+  already exist to rebuild the value, which still bounds atom-table growth from
+  structural names.
+
 ## v0.11.0
 
 ### Middleware — composable agent hooks

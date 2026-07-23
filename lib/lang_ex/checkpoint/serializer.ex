@@ -8,9 +8,12 @@ defmodule LangEx.Checkpoint.Serializer do
   matching on restored state breaks. This serializer tags each rich
   term so `decode/1` rebuilds the exact original value.
 
-  Decoding never creates atoms: module and field names are resolved
-  with `String.to_existing_atom/1`, so a malicious or corrupted payload
-  cannot exhaust the atom table.
+  Module names and struct field keys are resolved with
+  `String.to_existing_atom/1` — they must already exist to rebuild the value,
+  which also bounds atom-table growth from those structural names. Value atoms
+  are the app's own checkpointed data: decode prefers an existing atom but
+  falls back to creating one, so a checkpoint round-trips in a fresh VM or
+  after a deploy where a stored atom is not loaded yet.
 
   ## Encoding scheme
 
@@ -58,7 +61,7 @@ defmodule LangEx.Checkpoint.Serializer do
 
   @doc "Decodes a term previously produced by `encode/1`."
   @spec decode(term()) :: term()
-  def decode(%{"~a" => name}), do: String.to_existing_atom(name)
+  def decode(%{"~a" => name}), do: to_value_atom(name)
   def decode(%{"~b" => base64}), do: Base.decode64!(base64)
   def decode(%{"~t" => items}), do: items |> Enum.map(&decode/1) |> List.to_tuple()
 
@@ -81,6 +84,16 @@ defmodule LangEx.Checkpoint.Serializer do
 
   defp encode_binary(true, term), do: term
   defp encode_binary(false, term), do: %{"~b" => Base.encode64(term)}
+
+  # A value atom is the app's own checkpointed data. Prefer an already-loaded
+  # atom, but fall back to creating one so resuming in a fresh VM (or after a
+  # deploy, where a stored atom may not be loaded yet) does not crash. The set
+  # of such atoms is bounded by what the app serializes into its own checkpoints.
+  defp to_value_atom(name) do
+    String.to_existing_atom(name)
+  rescue
+    ArgumentError -> String.to_atom(name)
+  end
 
   defp resolve_module!(module_name) do
     module = String.to_existing_atom(module_name)
