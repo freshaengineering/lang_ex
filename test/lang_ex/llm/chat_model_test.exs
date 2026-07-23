@@ -422,6 +422,28 @@ defmodule LangEx.LLM.ChatModelTest do
     end
   end
 
+  describe "state-derived opts" do
+    test "resolves {:from_state, fn} opts from the node state per call" do
+      test_pid = self()
+
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, opts ->
+        send(test_pid, {:resolved, opts[:on_thinking]})
+        {:ok, Message.ai("ok"), %{input_tokens: 1, output_tokens: 1}}
+      end)
+
+      node =
+        ChatModel.node(
+          provider: LangEx.LLM.OpenAI,
+          model: "gpt-4o",
+          on_thinking: {:from_state, fn state -> state.channel end}
+        )
+
+      node.(%{messages: [Message.human("hi")], channel: "C123", llm_usage: %{}})
+
+      assert_received {:resolved, "C123"}
+    end
+  end
+
   describe "complete/2" do
     test "returns the assistant message with usage" do
       stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, _opts ->

@@ -26,7 +26,10 @@ defmodule LangEx.LLM.ChatModel do
   - `:resilient` - route calls through `LangEx.LLM.Resilient` for retries
     with backoff. `true` for defaults, or a keyword list of `Resilient`
     options (`:max_retries`, `:retry_base_ms`, `:fallback`, ...)
-  - All other opts forwarded to `provider.chat/2` (`:api_key`, `:temperature`, etc.)
+  - All other opts forwarded to `provider.chat/2` (`:api_key`, `:temperature`, etc.).
+    Any opt given as `{:from_state, fn state -> value end}` is resolved from the
+    node's state on each call — useful for per-run callbacks like `:on_thinking`
+    whose context isn't known when the graph is built.
 
   Either `:provider` or `:model` must be given. When `:model` is a string and
   `:provider` is absent, the provider is resolved via `LangEx.LLM.Registry.init_chat_model/2`.
@@ -64,10 +67,11 @@ defmodule LangEx.LLM.ChatModel do
     fn state ->
       messages = Map.fetch!(state, messages_key)
       metadata = %{provider: provider, model: model, message_count: length(messages)}
+      call_opts = llm_opts |> resolve_state_opts(state) |> attach_delta_callback()
 
       {:ok, ai_message, usage} =
         Runs.span([:lang_ex, :llm, :chat], metadata, fn ->
-          result = dispatch_call(resilient, provider, messages, attach_delta_callback(llm_opts))
+          result = dispatch_call(resilient, provider, messages, call_opts)
           {result, chat_metadata(metadata, result)}
         end)
 
@@ -334,6 +338,16 @@ defmodule LangEx.LLM.ChatModel do
   defp ensure_usage({:ok, ai, usage}), do: {:ok, ai, usage}
   defp ensure_usage({:ok, ai}), do: {:ok, ai, %{input_tokens: 0, output_tokens: 0}}
   defp ensure_usage({:error, _} = err), do: err
+
+  # Any opt given as `{:from_state, fn state -> value end}` is resolved from the
+  # node's state per call — e.g. `on_thinking:` callbacks that need per-run
+  # context (channel/thread) not known when the graph was built.
+  defp resolve_state_opts(llm_opts, state) do
+    Enum.map(llm_opts, fn
+      {key, {:from_state, resolver}} when is_function(resolver, 1) -> {key, resolver.(state)}
+      opt -> opt
+    end)
+  end
 
   # When the graph is being streamed, forward token deltas from streaming
   # adapters as {:message_delta, ...} events (consumed via the :messages

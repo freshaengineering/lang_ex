@@ -11,6 +11,13 @@
   hook can steer routing (loop, go to tools, or end) via the reserved
   `LangEx.Middleware.jump_key/0`.
 
+### ChatModel — state-derived opts
+
+- `LangEx.LLM.ChatModel.node/1` resolves any option given as
+  `{:from_state, fn state -> value end}` from the node's state on each call —
+  e.g. an `:on_thinking` callback that needs per-run context (channel/thread)
+  not known when the graph was built.
+
 ### Prebuilt agent — state-derived tools
 
 - `LangEx.Prebuilt.agent/1` accepts `tools: fn state -> [%LangEx.Tool{}] end`
