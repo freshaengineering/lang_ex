@@ -46,6 +46,50 @@ defmodule LangEx.MessageTest do
              ] = result
     end
 
+    test "add_messages removes a single message by id" do
+      existing = [
+        Message.human("Keep me", id: "a"),
+        Message.ai("Drop me", id: "b"),
+        Message.human("Keep me too", id: "c")
+      ]
+
+      result = Message.add_messages(existing, [Message.remove("b")])
+
+      assert [
+               %Message.Human{content: "Keep me", id: "a"},
+               %Message.Human{content: "Keep me too", id: "c"}
+             ] = result
+    end
+
+    test "remove_all clears history then keeps trailing messages" do
+      existing = [Message.human("old 1"), Message.ai("old 2")]
+
+      result = Message.add_messages(existing, [Message.remove_all(), Message.system("summary")])
+
+      assert [%Message.System{content: "summary"}] = result
+    end
+
+    test "remove_all with no trailing messages empties the history" do
+      existing = [Message.human("old")]
+
+      assert [] = Message.add_messages(existing, Message.remove_all())
+    end
+
+    test "removal instructions compose with appends left to right" do
+      existing = [Message.human("q", id: "q"), Message.ai("stale", id: "stale")]
+
+      result =
+        Message.add_messages(existing, [
+          Message.remove("stale"),
+          Message.ai("fresh", id: "fresh")
+        ])
+
+      assert [
+               %Message.Human{content: "q", id: "q"},
+               %Message.AI{content: "fresh", id: "fresh"}
+             ] = result
+    end
+
     test "message reducer works within a graph pipeline" do
       {:ok, result} =
         Graph.new(messages: {[], &Message.add_messages/2})

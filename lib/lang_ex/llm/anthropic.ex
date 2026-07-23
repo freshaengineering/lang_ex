@@ -11,8 +11,9 @@ defmodule LangEx.LLM.Anthropic do
   - **Streaming** — SSE-based streaming avoids TCP idle timeouts on long requests
   - **Adaptive thinking** — pass `thinking: true` to enable Claude's extended thinking;
     stream thinking deltas in real time via the `on_thinking` callback
-  - **Prompt caching** — system prompts and the last tool definition are annotated
-    with `cache_control` for Anthropic's prompt caching beta
+  - **Prompt caching** — system prompts, the last tool definition, and a rolling
+    breakpoint on the last conversation message are annotated with `cache_control`,
+    so a long agent loop reuses its cached message prefix each turn
   - **Usage tracking** — `chat_with_usage/2` returns token counts including cache metrics
   - **Model-aware defaults** — `max_tokens` defaults based on model family
 
@@ -34,6 +35,11 @@ defmodule LangEx.LLM.Anthropic do
   - `:on_token` — `fn(text_delta) -> any()` callback invoked per streamed
     content token (used by graph streaming's `:messages` mode)
   - `:prompt_caching` — enable prompt caching headers (default `true`)
+  - `:cache_conversation` — also mark a rolling `cache_control` breakpoint on
+    the last conversation message (default `true`; only applies when
+    `:prompt_caching` is on)
+  - `:tool_choice` — force tool use: `:auto` (default), `:required`/`:any`
+    (must call some tool), or `{:tool, name}` (must call that tool)
   - `:stream` — use SSE streaming (default `true`); set `false` for simple requests
   - `:max_tokens` — override max tokens (defaults: 64K for sonnet, 128K otherwise)
   """
@@ -45,6 +51,8 @@ defmodule LangEx.LLM.Anthropic do
   alias LangEx.LLM.Anthropic.SSE
   alias LangEx.Message
   alias LangEx.Tool
+
+  require Logger
 
   @base_url "https://api.anthropic.com/v1"
   @api_version "2023-06-01"
@@ -82,9 +90,55 @@ defmodule LangEx.LLM.Anthropic do
       |> put_thinking(thinking?, opts)
       |> put_system(system_prompt, caching?)
       |> put_tools(tools, caching?)
+      |> put_tool_choice(tool_choice(thinking?, Keyword.get(opts, :tool_choice)))
+      |> cache_conversation(caching? and Keyword.get(opts, :cache_conversation, true))
 
     send_request(body, api_key, callbacks, caching?)
   end
+
+  # Extended thinking requires tool_choice: auto — forcing a tool alongside it
+  # is a 400. Drop a forcing choice (falling back to auto) rather than emit an
+  # invalid request.
+  defp tool_choice(false, choice), do: choice
+  defp tool_choice(true, choice) when choice in [nil, :auto], do: choice
+
+  defp tool_choice(true, choice) do
+    Logger.warning(
+      "Anthropic: ignoring forced tool_choice #{inspect(choice)} because extended " <>
+        "thinking is enabled — Anthropic requires tool_choice: auto with thinking"
+    )
+
+    nil
+  end
+
+  defp put_tool_choice(body, nil), do: body
+  defp put_tool_choice(body, choice), do: Map.put(body, :tool_choice, format_tool_choice(choice))
+
+  defp format_tool_choice(:auto), do: %{"type" => "auto"}
+  defp format_tool_choice(choice) when choice in [:required, :any], do: %{"type" => "any"}
+
+  defp format_tool_choice({:tool, name}),
+    do: %{"type" => "tool", "name" => to_string(name)}
+
+  defp cache_conversation(body, false), do: body
+  defp cache_conversation(%{messages: []} = body, true), do: body
+
+  defp cache_conversation(%{messages: messages} = body, true) do
+    {init, [last]} = Enum.split(messages, length(messages) - 1)
+    Map.put(body, :messages, init ++ [mark_message_cacheable(last)])
+  end
+
+  defp mark_message_cacheable(%{content: content} = message) when is_binary(content) do
+    block = %{"type" => "text", "text" => content, "cache_control" => %{"type" => "ephemeral"}}
+    %{message | content: [block]}
+  end
+
+  defp mark_message_cacheable(%{content: [_ | _] = blocks} = message) do
+    {init, [last]} = Enum.split(blocks, length(blocks) - 1)
+    %{message | content: init ++ [Map.put(last, "cache_control", %{"type" => "ephemeral"})]}
+  end
+
+  defp mark_message_cacheable(message), do: message
 
   defp put_stream(body, true), do: Map.put(body, :stream, true)
   defp put_stream(body, false), do: body

@@ -187,7 +187,8 @@ jobs:
           new_version=$(grep -oP '@version "\K[^"]+' mix.exs)
           echo "Old Version: $old_version | New Version: $new_version"
           if [ "$new_version" != "$old_version" ]; then
-            if [ "$new_version" \> "$old_version" ]; then
+            higher_version=$(printf '%s\n%s\n' "$old_version" "$new_version" | sort -V | tail -n1)
+            if [ "$higher_version" = "$new_version" ]; then
               echo "Version is upped - WILL publish upon merging the PR"
               echo "PUBLISH=true" >> $GITHUB_OUTPUT
             else

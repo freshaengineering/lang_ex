@@ -1,5 +1,98 @@
 # Changelog
 
+## v0.11.0
+
+### Middleware — composable agent hooks
+
+- `LangEx.Middleware` — a value-based hook layer for `LangEx.Prebuilt.agent/1`.
+  Pass `middleware: [...]` to wrap the model call with `before_model` /
+  `after_model` / `wrap_model_call` hooks, contribute tools, and extend the
+  agent's state schema — without changing the agent's shape. An `after_model`
+  hook can steer routing (loop, go to tools, or end) via the reserved
+  `LangEx.Middleware.jump_key/0`.
+
+### ChatModel — state-derived opts
+
+- `LangEx.LLM.ChatModel.node/1` resolves any option given as
+  `{:from_state, fn state -> value end}` from the node's state on each call —
+  e.g. an `:on_thinking` callback that needs per-run context (channel/thread)
+  not known when the graph was built.
+
+### Prebuilt agent — state-derived tools
+
+- `LangEx.Prebuilt.agent/1` accepts `tools: fn state -> [%LangEx.Tool{}] end`
+  in addition to a static list. The resolver runs each turn, so tools
+  discovered at runtime can be kept as serializable specs in state (and
+  materialized on demand) instead of storing executable closures in the
+  checkpoint. Middleware-contributed tools are appended to the resolved set.
+
+### Built-in middleware
+
+- `LangEx.Middleware.Summarization` — replaces older history with an
+  LLM-written summary once the message list passes `:max_bytes`, persisting
+  the summary in place (via `Message.remove_all/0`) so later turns build on it
+  rather than resummarising.
+- `LangEx.Middleware.ContextEditing` — clears the *contents* of large, stale
+  tool results while keeping the message skeleton. No LLM call; idempotent.
+- `LangEx.Middleware.TodoList` — a `write_todos` planning tool plus a `:todos`
+  state key, keeping long multi-step loops anchored to a plan.
+- `LangEx.Middleware.ToolSelector` — a cheap LLM call that narrows a large
+  tool set to the relevant subset before the main model call (`:max_tools`,
+  `:always_include`); a no-op below the threshold.
+- `LangEx.Middleware.Rubric` — an exit gate on the tool loop: scores the
+  final answer against a `:rubric` and bounces it back with feedback for
+  another pass, up to `:max_attempts`.
+
+### Messages — deletion in the reducer
+
+- `LangEx.Message.remove/1` and `LangEx.Message.remove_all/0` emit
+  `%Message.RemoveMessage{}` instructions that `add_messages/2` applies in
+  sequence, so a reducer update can prune or replace history, not only append.
+
+### LLM — structured output & completions
+
+- `LangEx.LLM.ChatModel.structured/2` now retries on schema-validation
+  failures with the error fed back as feedback (`:max_retries`, default `2`),
+  and supports `strategy: :provider` to force the response via the provider's
+  native `tool_choice`.
+- `LangEx.LLM.ChatModel.complete/2` — one-shot text completion outside a graph
+  returning the assistant message with token usage.
+- `LangEx.LLM.Anthropic`, `LangEx.LLM.OpenAI`, and `LangEx.LLM.Gemini` accept
+  `:tool_choice` (`:auto` / `:required` / `{:tool, name}`), each translated to
+  the provider's native forcing mechanism.
+
+### Anthropic — conversation prompt caching
+
+- `LangEx.LLM.Anthropic` marks a rolling `cache_control` breakpoint on the
+  last conversation message (in addition to system + last tool), so a long
+  agent loop reuses its cached message prefix each turn. Disable with
+  `cache_conversation: false`.
+
+### Context compaction
+
+- `LangEx.ContextCompaction.compact_if_needed/2` accepts a `:summarizer`
+  (`fn dropped_messages -> String.t()`) to describe dropped rounds with a real
+  summary instead of the mechanical tool-name notice.
+- Byte accounting now counts AI `tool_calls` args (and tolerates `nil`
+  content), so a tool-argument-heavy history triggers compaction correctly
+  instead of under-reporting its size.
+
+## v0.10.0
+
+### Embeddings
+
+- `LangEx.Embedding.Hashing.embed/2` — a dependency-free text embedder
+  (hashing trick: tokens hashed into fixed-length term-frequency buckets).
+  Makes `LangEx.Store` semantic search usable out of the box without a
+  neural embedding provider:
+
+      Graph.compile(builder,
+        store: {LangEx.Store.ETS, index: [embed: &LangEx.Embedding.Hashing.embed/1]}
+      )
+
+  It captures lexical overlap, not meaning; supply a neural embedder when
+  semantic similarity matters.
+
 ## v0.9.0
 
 ### Engine — run budgets & managed values

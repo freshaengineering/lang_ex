@@ -46,9 +46,19 @@ defmodule LangEx.LLM.OpenAI do
     |> put_present(:temperature, opts[:temperature])
     |> put_present(:max_tokens, opts[:max_tokens])
     |> put_tools(tools)
+    |> put_tool_choice(Keyword.get(opts, :tool_choice))
     |> send_request(api_key, base_url)
     |> handle_response()
   end
+
+  defp put_tool_choice(body, nil), do: body
+  defp put_tool_choice(body, choice), do: Map.put(body, :tool_choice, format_tool_choice(choice))
+
+  defp format_tool_choice(:auto), do: "auto"
+  defp format_tool_choice(choice) when choice in [:required, :any], do: "required"
+
+  defp format_tool_choice({:tool, name}),
+    do: %{type: "function", function: %{name: to_string(name)}}
 
   defp handle_response({:ok, %{status: 200, body: response}}) do
     usage = extract_openai_usage(response)

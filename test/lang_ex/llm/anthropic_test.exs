@@ -290,4 +290,129 @@ defmodule LangEx.LLM.AnthropicTest do
       )
     end
   end
+
+  describe "tool_choice" do
+    test "forces a named tool" do
+      expect(Req, :post, fn _url, opts ->
+        assert %{"type" => "tool", "name" => "respond"} = opts[:json].tool_choice
+
+        {:ok,
+         %{
+           status: 200,
+           body: %{
+             "content" => [%{"type" => "text", "text" => "ok"}],
+             "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+           }
+         }}
+      end)
+
+      LangEx.LLM.Anthropic.chat(
+        [Message.human("hi")],
+        tools: [@weather_tool],
+        model: "claude-sonnet-4-20250514",
+        api_key: "test",
+        stream: false,
+        tool_choice: {:tool, "respond"}
+      )
+    end
+
+    test "drops a forced tool_choice when extended thinking is enabled" do
+      expect(Req, :post, fn _url, opts ->
+        refute Map.has_key?(opts[:json], :tool_choice)
+        assert %{type: "adaptive"} = opts[:json].thinking
+
+        {:ok,
+         %{
+           status: 200,
+           body: %{
+             "content" => [%{"type" => "text", "text" => "ok"}],
+             "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+           }
+         }}
+      end)
+
+      LangEx.LLM.Anthropic.chat(
+        [Message.human("hi")],
+        tools: [@weather_tool],
+        model: "claude-sonnet-4-20250514",
+        api_key: "test",
+        stream: false,
+        thinking: true,
+        tool_choice: {:tool, "respond"}
+      )
+    end
+
+    test "maps :required to the any type" do
+      expect(Req, :post, fn _url, opts ->
+        assert %{"type" => "any"} = opts[:json].tool_choice
+
+        {:ok,
+         %{
+           status: 200,
+           body: %{
+             "content" => [%{"type" => "text", "text" => "ok"}],
+             "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+           }
+         }}
+      end)
+
+      LangEx.LLM.Anthropic.chat(
+        [Message.human("hi")],
+        tools: [@weather_tool],
+        model: "claude-sonnet-4-20250514",
+        api_key: "test",
+        stream: false,
+        tool_choice: :required
+      )
+    end
+  end
+
+  describe "conversation caching" do
+    test "marks a cache breakpoint on the last message when caching is enabled" do
+      expect(Req, :post, fn _url, opts ->
+        assert %{content: [%{"cache_control" => %{"type" => "ephemeral"}, "text" => "second"}]} =
+                 List.last(opts[:json].messages)
+
+        {:ok,
+         %{
+           status: 200,
+           body: %{
+             "content" => [%{"type" => "text", "text" => "ok"}],
+             "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+           }
+         }}
+      end)
+
+      LangEx.LLM.Anthropic.chat(
+        [Message.human("first"), Message.human("second")],
+        model: "claude-sonnet-4-20250514",
+        api_key: "test",
+        stream: false,
+        prompt_caching: true
+      )
+    end
+
+    test "does not touch messages when caching is disabled" do
+      expect(Req, :post, fn _url, opts ->
+        assert %{role: "user", content: "second"} = List.last(opts[:json].messages)
+
+        {:ok,
+         %{
+           status: 200,
+           body: %{
+             "content" => [%{"type" => "text", "text" => "ok"}],
+             "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+           }
+         }}
+      end)
+
+      LangEx.LLM.Anthropic.chat(
+        [Message.human("first"), Message.human("second")],
+        model: "claude-sonnet-4-20250514",
+        api_key: "test",
+        stream: false,
+        prompt_caching: false
+      )
+    end
+  end
 end

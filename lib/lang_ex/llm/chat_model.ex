@@ -26,7 +26,10 @@ defmodule LangEx.LLM.ChatModel do
   - `:resilient` - route calls through `LangEx.LLM.Resilient` for retries
     with backoff. `true` for defaults, or a keyword list of `Resilient`
     options (`:max_retries`, `:retry_base_ms`, `:fallback`, ...)
-  - All other opts forwarded to `provider.chat/2` (`:api_key`, `:temperature`, etc.)
+  - All other opts forwarded to `provider.chat/2` (`:api_key`, `:temperature`, etc.).
+    Any opt given as `{:from_state, fn state -> value end}` is resolved from the
+    node's state on each call — useful for per-run callbacks like `:on_thinking`
+    whose context isn't known when the graph is built.
 
   Either `:provider` or `:model` must be given. When `:model` is a string and
   `:provider` is absent, the provider is resolved via `LangEx.LLM.Registry.init_chat_model/2`.
@@ -64,10 +67,11 @@ defmodule LangEx.LLM.ChatModel do
     fn state ->
       messages = Map.fetch!(state, messages_key)
       metadata = %{provider: provider, model: model, message_count: length(messages)}
+      call_opts = llm_opts |> resolve_state_opts(state) |> attach_delta_callback()
 
       {:ok, ai_message, usage} =
         Runs.span([:lang_ex, :llm, :chat], metadata, fn ->
-          result = dispatch_call(resilient, provider, messages, attach_delta_callback(llm_opts))
+          result = dispatch_call(resilient, provider, messages, call_opts)
           {result, chat_metadata(metadata, result)}
         end)
 
@@ -123,6 +127,24 @@ defmodule LangEx.LLM.ChatModel do
   end
 
   @doc """
+  One-shot text completion outside a graph node.
+
+  Resolves the provider, optionally routes through `LangEx.LLM.Resilient`
+  (`:resilient`), and returns the raw assistant message with token usage —
+  a primitive for auxiliary LLM calls (summarisation, critique, tool
+  selection) that need usage accounting but no graph state.
+
+  Returns `{:ok, %Message.AI{}, usage}` or `{:error, reason}`.
+  """
+  @spec complete([LangEx.Message.t()], keyword()) ::
+          {:ok, Message.AI.t(), LangEx.LLM.usage()} | {:error, term()}
+  def complete(messages, opts) do
+    {provider, llm_opts} = resolve_provider(opts)
+    {resilient, llm_opts} = Keyword.pop(llm_opts, :resilient)
+    dispatch_call(resilient, provider, messages, llm_opts)
+  end
+
+  @doc """
   One-shot structured extraction outside a graph node.
 
   Forces the provider to answer via a synthetic `respond` tool whose
@@ -130,9 +152,19 @@ defmodule LangEx.LLM.ChatModel do
   JSON content), and validates that the schema's top-level `required` keys
   are present.
 
+  On a schema validation failure (`:no_structured_output` or a missing
+  required key) the model is re-asked with the validation error appended as
+  feedback, up to `:max_retries` times — turning intermittent malformed
+  output into self-corrections. Provider/transport errors are returned
+  immediately (use `:resilient` for those).
+
   ## Options
 
   - `:schema` (required) - JSON-schema map describing the desired shape
+  - `:max_retries` - validation-feedback retries (default `2`; `0` disables)
+  - `:strategy` - `:tool` (default; a synthetic `respond` tool, works with
+    any provider) or `:provider` (forces the tool via the provider's native
+    `tool_choice`, for adapters that support it)
   - `:resilient` - `true` or `LangEx.LLM.Resilient` options to retry on
     transient failures
   - `:provider` / `:model` and other options are forwarded to the provider
@@ -146,21 +178,80 @@ defmodule LangEx.LLM.ChatModel do
   @spec structured([LangEx.Message.t()], keyword()) :: {:ok, map()} | {:error, term()}
   def structured(messages, opts) do
     {schema, opts} = Keyword.pop!(opts, :schema)
+    {max_retries, opts} = Keyword.pop(opts, :max_retries, 2)
+    {strategy, opts} = Keyword.pop(opts, :strategy, :tool)
     {provider, llm_opts} = resolve_provider(opts)
     {resilient, llm_opts} = Keyword.pop(llm_opts, :resilient)
 
-    resilient
-    |> dispatch_call(provider, messages, Keyword.put(llm_opts, :tools, [respond_tool(schema)]))
-    |> structured_result(schema)
+    attempt(messages, %{
+      schema: schema,
+      provider: provider,
+      resilient: resilient,
+      llm_opts: llm_opts,
+      strategy: strategy,
+      retries: max_retries
+    })
   end
 
-  defp structured_result({:ok, ai_message, _usage}, schema) do
+  defp attempt(messages, ctx) do
+    call_opts = Keyword.merge(ctx.llm_opts, strategy_opts(ctx.strategy, ctx.schema))
+
+    ctx.resilient
+    |> dispatch_call(ctx.provider, messages, call_opts)
+    |> evaluate_attempt(messages, ctx)
+  end
+
+  defp evaluate_attempt({:error, _reason} = error, _messages, _ctx), do: error
+
+  defp evaluate_attempt({:ok, ai_message, _usage}, messages, ctx) do
     ai_message
     |> extract_structured()
-    |> validate_structured(schema)
+    |> validate_structured(ctx.schema)
+    |> retry_or_return(ai_message, messages, ctx)
   end
 
-  defp structured_result({:error, _reason} = error, _schema), do: error
+  defp retry_or_return({:ok, _data} = ok, _ai_message, _messages, _ctx), do: ok
+
+  defp retry_or_return({:error, reason} = error, ai_message, messages, ctx),
+    do: retry_validation(validation_error?(reason), error, reason, ai_message, messages, ctx)
+
+  defp validation_error?(:no_structured_output), do: true
+  defp validation_error?({:missing_required, _keys}), do: true
+  defp validation_error?(_reason), do: false
+
+  defp retry_validation(false, error, _reason, _ai_message, _messages, _ctx), do: error
+  defp retry_validation(true, error, _reason, _ai_message, _messages, %{retries: 0}), do: error
+
+  defp retry_validation(true, _error, reason, ai_message, messages, ctx) do
+    attempt(messages ++ correction_turn(ai_message, reason), %{ctx | retries: ctx.retries - 1})
+  end
+
+  # Re-send the model's failed attempt so it sees its own mistake. A reply is
+  # required for every tool call it made (providers reject an unanswered tool
+  # call), so the error rides back as a correlated tool message; a prose/JSON
+  # attempt with no tool call is corrected with a plain user message instead.
+  defp correction_turn(%Message.AI{tool_calls: [_ | _] = calls} = ai_message, reason) do
+    text = correction_text(reason)
+    [ai_message | Enum.map(calls, &Message.tool(text, &1.id))]
+  end
+
+  defp correction_turn(ai_message, reason),
+    do: [ai_message, Message.human(correction_text(reason))]
+
+  defp correction_text(:no_structured_output) do
+    "Your previous reply was not valid structured output. Call the `respond` tool " <>
+      "with a single JSON object matching the required schema."
+  end
+
+  defp correction_text({:missing_required, keys}) do
+    "Your previous structured reply was missing required field(s): " <>
+      "#{Enum.join(keys, ", ")}. Call `respond` again including every required field."
+  end
+
+  defp strategy_opts(:tool, schema), do: [tools: [respond_tool(schema)]]
+
+  defp strategy_opts(:provider, schema),
+    do: [tools: [respond_tool(schema)], tool_choice: {:tool, "respond"}]
 
   @doc """
   Validate a decoded structured result against a JSON-schema's top-level
@@ -247,6 +338,16 @@ defmodule LangEx.LLM.ChatModel do
   defp ensure_usage({:ok, ai, usage}), do: {:ok, ai, usage}
   defp ensure_usage({:ok, ai}), do: {:ok, ai, %{input_tokens: 0, output_tokens: 0}}
   defp ensure_usage({:error, _} = err), do: err
+
+  # Any opt given as `{:from_state, fn state -> value end}` is resolved from the
+  # node's state per call — e.g. `on_thinking:` callbacks that need per-run
+  # context (channel/thread) not known when the graph was built.
+  defp resolve_state_opts(llm_opts, state) do
+    Enum.map(llm_opts, fn
+      {key, {:from_state, resolver}} when is_function(resolver, 1) -> {key, resolver.(state)}
+      opt -> opt
+    end)
+  end
 
   # When the graph is being streamed, forward token deltas from streaming
   # adapters as {:message_delta, ...} events (consumed via the :messages
