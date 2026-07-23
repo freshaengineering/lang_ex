@@ -169,9 +169,9 @@ defmodule LangEx.Prebuilt do
   end
 
   defp model_fn(llm_opts) do
-    fn messages, call_tools ->
+    fn messages, call_tools, state ->
       call = ChatModel.node(Keyword.put(llm_opts, :tools, call_tools))
-      call.(%{messages: messages, llm_usage: %{}})
+      call.(Map.merge(state, %{messages: messages, llm_usage: Map.get(state, :llm_usage, %{})}))
     end
   end
 

@@ -97,14 +97,15 @@ defmodule LangEx.Middleware do
   @doc """
   Runs one model turn through the middleware stack.
 
-  `model_fn` is `(messages, tools -> update)` — the raw LLM call, returning a
-  `%{messages_key => [ai], :llm_usage => usage}` update. `tools` is the full
-  tool list offered to the model (a `wrap_model_call` hook may narrow it).
-  Returns the merged, persistable update for the agent node.
+  `model_fn` is `(messages, tools, state -> update)` — the raw LLM call,
+  returning a `%{messages_key => [ai], :llm_usage => usage}` update. It receives
+  the current working state so state-derived options can be resolved. `tools` is
+  the full tool list offered to the model (a `wrap_model_call` hook may narrow
+  it). Returns the merged, persistable update for the agent node.
   """
-  @spec run_turn(map(), (list(), [Tool.t()] -> map()), [Tool.t()], [t()], atom()) :: map()
+  @spec run_turn(map(), (list(), [Tool.t()], map() -> map()), [Tool.t()], [t()], atom()) :: map()
   def run_turn(state, model_fn, tools, middlewares, messages_key) do
-    base = fn request -> model_fn.(request.messages, request.tools) end
+    base = fn request -> model_fn.(request.messages, request.tools, request.state) end
     chain = compose(middlewares, base)
 
     {state, acc} = fold(:before_model, middlewares, state, new_acc(), messages_key)
