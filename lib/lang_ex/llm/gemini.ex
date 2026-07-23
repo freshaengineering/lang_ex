@@ -14,6 +14,11 @@ defmodule LangEx.LLM.Gemini do
         model: "gemini-2.5-flash",
         tools: [%LangEx.Tool{name: "get_weather", ...}]
       )
+
+  ## Options
+
+  - `:tool_choice` — force function calling: `:auto` (default), `:required`/
+    `:any` (must call some function), or `{:tool, name}` (must call that one)
   """
 
   @behaviour LangEx.LLM
@@ -46,9 +51,21 @@ defmodule LangEx.LLM.Gemini do
     |> put_system_instruction(system_instruction)
     |> put_generation_config(opts)
     |> put_tools(tools)
+    |> put_tool_choice(Keyword.get(opts, :tool_choice))
     |> send_request(api_key, model)
     |> handle_response()
   end
+
+  defp put_tool_choice(body, nil), do: body
+  defp put_tool_choice(body, choice), do: Map.put(body, :tool_config, format_tool_choice(choice))
+
+  defp format_tool_choice(:auto), do: %{function_calling_config: %{mode: "AUTO"}}
+
+  defp format_tool_choice(choice) when choice in [:required, :any],
+    do: %{function_calling_config: %{mode: "ANY"}}
+
+  defp format_tool_choice({:tool, name}),
+    do: %{function_calling_config: %{mode: "ANY", allowed_function_names: [to_string(name)]}}
 
   defp handle_response({:ok, %{status: 200, body: response}}) do
     usage = extract_gemini_usage(response)

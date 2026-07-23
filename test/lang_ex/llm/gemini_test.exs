@@ -87,4 +87,47 @@ defmodule LangEx.LLM.GeminiTest do
       )
     end
   end
+
+  describe "tool_choice" do
+    test "forces a named function via function_calling_config" do
+      expect(Req, :post, fn _url, opts ->
+        assert %{function_calling_config: %{mode: "ANY", allowed_function_names: ["respond"]}} =
+                 opts[:json].tool_config
+
+        {:ok,
+         %{
+           status: 200,
+           body: %{"candidates" => [%{"content" => %{"parts" => [%{"text" => "ok"}]}}]}
+         }}
+      end)
+
+      LangEx.LLM.Gemini.chat(
+        [Message.human("hi")],
+        tools: [@weather_tool],
+        model: "gemini-2.5-flash",
+        api_key: "test",
+        tool_choice: {:tool, "respond"}
+      )
+    end
+
+    test "maps :required to ANY mode" do
+      expect(Req, :post, fn _url, opts ->
+        assert %{function_calling_config: %{mode: "ANY"}} = opts[:json].tool_config
+
+        {:ok,
+         %{
+           status: 200,
+           body: %{"candidates" => [%{"content" => %{"parts" => [%{"text" => "ok"}]}}]}
+         }}
+      end)
+
+      LangEx.LLM.Gemini.chat(
+        [Message.human("hi")],
+        tools: [@weather_tool],
+        model: "gemini-2.5-flash",
+        api_key: "test",
+        tool_choice: :required
+      )
+    end
+  end
 end

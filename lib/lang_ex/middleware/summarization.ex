@@ -69,12 +69,15 @@ defmodule LangEx.Middleware.Summarization do
 
   defp summarize(false, _messages, _keep, _prompt, _llm_opts), do: %{}
 
+  # Only a *leading* system block is hoisted above the summary; a system
+  # message that sits mid-history stays in place (summarised if old, kept if
+  # recent) rather than being reordered to the front.
   defp summarize(true, messages, keep, prompt, llm_opts) do
-    {system_msgs, rest} = Enum.split_with(messages, &match?(%Message.System{}, &1))
+    {leading_system, rest} = Enum.split_while(messages, &match?(%Message.System{}, &1))
 
     rest
     |> keep_split(keep)
-    |> rewrite(system_msgs, prompt, llm_opts)
+    |> rewrite(leading_system, prompt, llm_opts)
   end
 
   defp rewrite({[], _recent}, _system_msgs, _prompt, _llm_opts), do: %{}
@@ -123,11 +126,13 @@ defmodule LangEx.Middleware.Summarization do
   defp render_message(%Message.AI{content: c, tool_calls: []}) when is_binary(c),
     do: "Assistant: #{c}"
 
-  defp render_message(%Message.AI{content: c, tool_calls: calls}) do
+  defp render_message(%Message.AI{content: c, tool_calls: [_ | _] = calls}) do
     calls
     |> Enum.map_join(", ", & &1.name)
     |> then(&"Assistant (#{content_prefix(c)}called #{&1})")
   end
+
+  defp render_message(%Message.AI{}), do: "Assistant: (no content)"
 
   defp content_prefix(c) when is_binary(c) and c != "", do: "#{c}; "
   defp content_prefix(_c), do: ""

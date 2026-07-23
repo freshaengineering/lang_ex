@@ -9,7 +9,9 @@ defmodule LangEx.Middleware.ToolSelector do
   only earns its keep once a tool surface grows large (~15+ tools).
 
   Implemented as a `wrap_model_call` hook, so it composes with other
-  middleware and always defers to the real model call.
+  middleware and always defers to the real model call. If the selector call
+  fails or returns nothing usable, it falls back to offering every tool. Its
+  own (small) token usage is not added to `:llm_usage`.
 
   ## Options
 

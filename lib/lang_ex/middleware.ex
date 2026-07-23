@@ -39,6 +39,17 @@ defmodule LangEx.Middleware do
 
   Usage-bearing hooks (a summariser, a critic) should return their token
   usage under `:llm_usage`; the runner sums it with the turn's model usage.
+
+  ## Contributed-key semantics
+
+  The runner accumulates `:messages` (concatenating instructions, so
+  `remove_all/0`/`remove/1` work) and `:llm_usage` (summing) across all
+  hooks. Any other contributed key uses last-write-wins for the turn — a
+  custom reducer declared in `:state_schema` is still applied once by the
+  graph engine when the turn's update is committed, but is **not** re-applied
+  between hooks within a turn, so two hooks writing the same custom-reducer
+  key in one turn keep only the last write. Keep middleware state keys
+  last-write-wins (as the built-ins do) to avoid surprise.
   """
 
   alias LangEx.LLM.ChatModel

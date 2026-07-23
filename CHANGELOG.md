@@ -42,8 +42,9 @@
   native `tool_choice`.
 - `LangEx.LLM.ChatModel.complete/2` — one-shot text completion outside a graph
   returning the assistant message with token usage.
-- `LangEx.LLM.Anthropic` and `LangEx.LLM.OpenAI` accept `:tool_choice`
-  (`:auto` / `:required` / `{:tool, name}`).
+- `LangEx.LLM.Anthropic`, `LangEx.LLM.OpenAI`, and `LangEx.LLM.Gemini` accept
+  `:tool_choice` (`:auto` / `:required` / `{:tool, name}`), each translated to
+  the provider's native forcing mechanism.
 
 ### Anthropic — conversation prompt caching
 

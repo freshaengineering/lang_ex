@@ -96,7 +96,7 @@ defmodule LangEx.Middleware.Rubric do
   defp render(%Message.Tool{content: c}), do: "Tool result: #{c}"
   defp render(%Message.AI{content: c, tool_calls: []}) when is_binary(c), do: "Assistant: #{c}"
 
-  defp render(%Message.AI{content: c, tool_calls: calls}),
+  defp render(%Message.AI{content: c, tool_calls: [_ | _] = calls}),
     do: "Assistant (#{prefix(c)}called #{Enum.map_join(calls, ", ", & &1.name)})"
 
   defp render(_other), do: ""

@@ -80,6 +80,30 @@ defmodule LangEx.Middleware.SummarizationTest do
       assert %{input_tokens: 5, output_tokens: 3} = update.llm_usage
     end
 
+    test "keeps a leading system prompt at the front and does not reorder history" do
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, _opts ->
+        {:ok, Message.ai("SUMMARY"), %{input_tokens: 1, output_tokens: 1}}
+      end)
+
+      messages = [
+        Message.system("You are a bot."),
+        Message.human(String.duplicate("old ", 50)),
+        Message.ai(String.duplicate("old ", 50)),
+        Message.human("recent question"),
+        Message.ai("recent answer")
+      ]
+
+      mw =
+        Summarization.new(provider: LangEx.LLM.OpenAI, model: "gpt-4o", max_bytes: 100, keep: 2)
+
+      %{messages: [remove | rest]} = mw.before_model.(%{messages: messages})
+
+      assert %Message.RemoveMessage{} = remove
+      assert [%Message.System{content: "You are a bot."} | after_system] = rest
+      assert %Message.Human{content: "[Summary" <> _} = hd(after_system)
+      assert List.last(after_system) == %Message.AI{content: "recent answer", tool_calls: []}
+    end
+
     test "keeps a tool result attached to its originating tool call" do
       stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, _opts ->
         {:ok, Message.ai("SUMMARY"), %{input_tokens: 1, output_tokens: 1}}
