@@ -7,10 +7,14 @@ defmodule LangEx.Middleware do
   tool pre-selection, and completion gating compose without each one being
   hardcoded into the agent. The agent runs every turn through the stack:
 
-      before_model (in order)
+      before_model (first → last)
         → wrap_model_call (first middleware outermost)
           → the LLM call
-        → after_model (in order)
+        → after_model (last → first)
+
+  `after_model` runs in reverse so the stack unwinds symmetrically: the
+  middleware that saw the state last on the way in sees the result first on
+  the way out.
 
   ## Hooks
 
@@ -99,7 +103,7 @@ defmodule LangEx.Middleware do
     state = apply_local(state, model_update, messages_key)
     acc = accumulate(acc, model_update, messages_key)
 
-    {_state, acc} = fold(:after_model, middlewares, state, acc, messages_key)
+    {_state, acc} = fold(:after_model, Enum.reverse(middlewares), state, acc, messages_key)
     finalize(acc, messages_key)
   end
 

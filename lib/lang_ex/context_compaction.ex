@@ -249,9 +249,30 @@ defmodule LangEx.ContextCompaction do
   defp error_payload?({:ok, %{"errors" => _}}), do: true
   defp error_payload?(_), do: false
 
-  defp message_byte_size(%Message.Tool{content: c}) when is_binary(c), do: byte_size(c)
-  defp message_byte_size(%Message.AI{content: c}) when is_binary(c), do: byte_size(c)
-  defp message_byte_size(%Message.Human{content: c}) when is_binary(c), do: byte_size(c)
-  defp message_byte_size(%Message.System{content: c}) when is_binary(c), do: byte_size(c)
+  defp message_byte_size(%Message.AI{content: c, tool_calls: calls}),
+    do: content_bytes(c) + tool_calls_bytes(calls)
+
+  defp message_byte_size(%Message.Tool{content: c}), do: content_bytes(c)
+  defp message_byte_size(%Message.Human{content: c}), do: content_bytes(c)
+  defp message_byte_size(%Message.System{content: c}), do: content_bytes(c)
   defp message_byte_size(_), do: 0
+
+  defp content_bytes(c) when is_binary(c), do: byte_size(c)
+  defp content_bytes(_), do: 0
+
+  defp tool_calls_bytes(calls) when is_list(calls),
+    do: calls |> Enum.map(&tool_call_bytes/1) |> Enum.sum()
+
+  defp tool_calls_bytes(_), do: 0
+
+  defp tool_call_bytes(%Message.ToolCall{name: name, args: args}),
+    do: content_bytes(name) + args_bytes(args)
+
+  defp tool_call_bytes(_), do: 0
+
+  defp args_bytes(args) when is_map(args), do: args |> Jason.encode() |> encoded_bytes()
+  defp args_bytes(_), do: 0
+
+  defp encoded_bytes({:ok, json}), do: byte_size(json)
+  defp encoded_bytes({:error, _reason}), do: 0
 end

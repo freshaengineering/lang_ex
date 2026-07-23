@@ -68,6 +68,55 @@ defmodule LangEx.MiddlewareTest do
     end
   end
 
+  describe "hook ordering" do
+    test "before_model runs first-to-last, after_model last-to-first" do
+      test_pid = self()
+
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, _opts ->
+        {:ok, Message.ai("x"), %{input_tokens: 1, output_tokens: 1}}
+      end)
+
+      mark = fn tag ->
+        Middleware.new(
+          name: tag,
+          before_model: fn _state -> send(test_pid, {:before, tag}) && %{} end,
+          after_model: fn _state -> send(test_pid, {:after, tag}) && %{} end
+        )
+      end
+
+      graph =
+        Prebuilt.agent(
+          provider: LangEx.LLM.OpenAI,
+          model: "gpt-4o",
+          middleware: [mark.(:a), mark.(:b)]
+        )
+
+      {:ok, _result} = LangEx.invoke(graph, %{messages: [Message.human("go")]})
+
+      order = for _ <- 1..4, do: receive(do: (event -> event))
+      assert order == [{:before, :a}, {:before, :b}, {:after, :b}, {:after, :a}]
+    end
+  end
+
+  describe "jump routing safety" do
+    test "a :tools jump on a tool-less agent ends the turn instead of crashing" do
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, _opts ->
+        {:ok, Message.ai("answer"), %{input_tokens: 1, output_tokens: 1}}
+      end)
+
+      to_tools =
+        Middleware.new(
+          name: :to_tools,
+          after_model: fn _state -> %{Middleware.jump_key() => :tools} end
+        )
+
+      graph = Prebuilt.agent(provider: LangEx.LLM.OpenAI, model: "gpt-4o", middleware: [to_tools])
+
+      assert {:ok, result} = LangEx.invoke(graph, %{messages: [Message.human("go")]})
+      assert %Message.AI{content: "answer"} = List.last(result.messages)
+    end
+  end
+
   describe "wrap_model_call" do
     test "can narrow the tools offered to the model" do
       test_pid = self()

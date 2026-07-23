@@ -316,6 +316,32 @@ defmodule LangEx.LLM.AnthropicTest do
       )
     end
 
+    test "drops a forced tool_choice when extended thinking is enabled" do
+      expect(Req, :post, fn _url, opts ->
+        refute Map.has_key?(opts[:json], :tool_choice)
+        assert %{type: "adaptive"} = opts[:json].thinking
+
+        {:ok,
+         %{
+           status: 200,
+           body: %{
+             "content" => [%{"type" => "text", "text" => "ok"}],
+             "usage" => %{"input_tokens" => 1, "output_tokens" => 1}
+           }
+         }}
+      end)
+
+      LangEx.LLM.Anthropic.chat(
+        [Message.human("hi")],
+        tools: [@weather_tool],
+        model: "claude-sonnet-4-20250514",
+        api_key: "test",
+        stream: false,
+        thinking: true,
+        tool_choice: {:tool, "respond"}
+      )
+    end
+
     test "maps :required to the any type" do
       expect(Req, :post, fn _url, opts ->
         assert %{"type" => "any"} = opts[:json].tool_choice

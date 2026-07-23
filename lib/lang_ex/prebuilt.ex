@@ -45,6 +45,8 @@ defmodule LangEx.Prebuilt do
   alias LangEx.Prebuilt.Reflect
   alias LangEx.Tool
 
+  require Logger
+
   @agent_opt_keys [
     :name,
     :system_prompt,
@@ -79,7 +81,10 @@ defmodule LangEx.Prebuilt do
   - `:store` - long-term memory backend (see `LangEx.Store`)
   - `:compaction` - context compaction options passed to
     `LangEx.ContextCompaction.compact_if_needed/2`; `false` disables
-    (default `[]` — compaction with defaults)
+    (default `[]` — compaction with defaults). This trims only the *model's
+    view* each turn; the full history stays in state. For persisted
+    compaction use `LangEx.Middleware.Summarization` (and pass
+    `compaction: false`).
   - `:interrupt_before` / `:interrupt_after` - static breakpoints,
     forwarded to `Graph.compile/2` (nodes: `:agent`, `:tools`)
   - `:tool_opts` - options for `LangEx.Tool.Node.node/2`
@@ -117,12 +122,15 @@ defmodule LangEx.Prebuilt do
   @spec reflect(keyword()) :: Graph.Compiled.t()
   def reflect(opts), do: Reflect.create(opts)
 
+  # Middleware fragments are merged first so the core :messages / :llm_usage
+  # reducers always win a key collision and can't be silently clobbered.
   defp agent_schema(middlewares) do
-    [
+    middlewares
+    |> Middleware.state_schema()
+    |> Keyword.merge(
       messages: {[], &Message.add_messages/2},
       llm_usage: {%{}, &ChatModel.merge_usage/2}
-    ]
-    |> Keyword.merge(Middleware.state_schema(middlewares))
+    )
     |> add_jump_key(middlewares)
   end
 
@@ -178,30 +186,49 @@ defmodule LangEx.Prebuilt do
   end
 
   defp route_agent(graph, [], _middlewares) do
-    Graph.add_conditional_edges(graph, :agent, &agent_router/1, %{
+    Graph.add_conditional_edges(graph, :agent, &agent_router(&1, false), %{
       model: :agent,
       __end__: :__end__
     })
   end
 
   defp route_agent(graph, _tools, _middlewares) do
-    Graph.add_conditional_edges(graph, :agent, &agent_router/1, %{
+    Graph.add_conditional_edges(graph, :agent, &agent_router(&1, true), %{
       model: :agent,
       tools: :tools,
       __end__: :__end__
     })
   end
 
-  defp agent_router(state) do
+  defp agent_router(state, has_tools?) do
     state
     |> Map.get(Middleware.jump_key())
-    |> resolve_jump(state)
+    |> resolve_jump(state, has_tools?)
   end
 
-  defp resolve_jump(:model, _state), do: :model
-  defp resolve_jump(:tools, _state), do: :tools
-  defp resolve_jump(:__end__, _state), do: :__end__
-  defp resolve_jump(nil, state), do: Tool.Node.tools_condition(state)
+  defp resolve_jump(:model, _state, _has_tools?), do: :model
+  defp resolve_jump(:__end__, _state, _has_tools?), do: :__end__
+  defp resolve_jump(:tools, _state, true), do: :tools
+
+  # A :tools jump is meaningless without a tools node; end the turn rather than
+  # route to a target that does not exist.
+  defp resolve_jump(:tools, _state, false) do
+    Logger.warning(
+      "Prebuilt.agent: an after_model hook requested a :tools jump but the agent " <>
+        "has no tools — ending the turn instead"
+    )
+
+    :__end__
+  end
+
+  defp resolve_jump(nil, state, has_tools?) do
+    state
+    |> Tool.Node.tools_condition()
+    |> normalize_condition(has_tools?)
+  end
+
+  defp normalize_condition(:tools, false), do: :__end__
+  defp normalize_condition(condition, _has_tools?), do: condition
 
   defp ensure_system(messages, nil), do: messages
   defp ensure_system([%Message.System{} | _] = messages, _prompt), do: messages

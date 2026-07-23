@@ -73,10 +73,36 @@ defmodule LangEx.Middleware.Rubric do
   defp evaluate(true, _answer, _state, _rubric, _llm_opts), do: %{}
 
   defp evaluate(false, answer, state, rubric, llm_opts) do
-    [Message.system(judge_prompt(rubric)), Message.human(answer.content || "")]
+    [Message.system(judge_prompt(rubric)), Message.human(review_context(state.messages, answer))]
     |> ChatModel.structured(Keyword.put(llm_opts, :schema, @verdict_schema))
     |> verdict(state)
   end
+
+  # The judge sees the recent conversation (rendered as plain text, so no
+  # dangling tool-call/result pairs reach the provider) plus the answer under
+  # review, so rubrics can reference what the agent actually did, not just its
+  # closing words.
+  defp review_context(messages, answer) do
+    transcript =
+      messages
+      |> Enum.reject(&match?(%Message.System{}, &1))
+      |> Enum.take(-10)
+      |> Enum.map_join("\n\n", &render/1)
+
+    "Conversation so far:\n#{transcript}\n\nAnswer to evaluate:\n#{answer.content || ""}"
+  end
+
+  defp render(%Message.Human{content: c}), do: "User: #{c}"
+  defp render(%Message.Tool{content: c}), do: "Tool result: #{c}"
+  defp render(%Message.AI{content: c, tool_calls: []}) when is_binary(c), do: "Assistant: #{c}"
+
+  defp render(%Message.AI{content: c, tool_calls: calls}),
+    do: "Assistant (#{prefix(c)}called #{Enum.map_join(calls, ", ", & &1.name)})"
+
+  defp render(_other), do: ""
+
+  defp prefix(c) when is_binary(c) and c != "", do: "#{c}; "
+  defp prefix(_c), do: ""
 
   defp verdict({:ok, %{"passes" => true}}, _state), do: %{}
 

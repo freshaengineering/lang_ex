@@ -194,52 +194,60 @@ defmodule LangEx.LLM.ChatModel do
 
     ctx.resilient
     |> dispatch_call(ctx.provider, messages, call_opts)
-    |> structured_result(ctx.schema)
-    |> retry_or_return(messages, ctx)
+    |> evaluate_attempt(messages, ctx)
   end
 
-  defp retry_or_return({:ok, _data} = ok, _messages, _ctx), do: ok
+  defp evaluate_attempt({:error, _reason} = error, _messages, _ctx), do: error
 
-  defp retry_or_return({:error, reason} = error, messages, ctx),
-    do: retry_validation(validation_error?(reason), error, reason, messages, ctx)
+  defp evaluate_attempt({:ok, ai_message, _usage}, messages, ctx) do
+    ai_message
+    |> extract_structured()
+    |> validate_structured(ctx.schema)
+    |> retry_or_return(ai_message, messages, ctx)
+  end
+
+  defp retry_or_return({:ok, _data} = ok, _ai_message, _messages, _ctx), do: ok
+
+  defp retry_or_return({:error, reason} = error, ai_message, messages, ctx),
+    do: retry_validation(validation_error?(reason), error, reason, ai_message, messages, ctx)
 
   defp validation_error?(:no_structured_output), do: true
   defp validation_error?({:missing_required, _keys}), do: true
   defp validation_error?(_reason), do: false
 
-  defp retry_validation(false, error, _reason, _messages, _ctx), do: error
-  defp retry_validation(true, error, _reason, _messages, %{retries: 0}), do: error
+  defp retry_validation(false, error, _reason, _ai_message, _messages, _ctx), do: error
+  defp retry_validation(true, error, _reason, _ai_message, _messages, %{retries: 0}), do: error
 
-  defp retry_validation(true, _error, reason, messages, ctx) do
-    attempt(messages ++ [correction(reason)], %{ctx | retries: ctx.retries - 1})
+  defp retry_validation(true, _error, reason, ai_message, messages, ctx) do
+    attempt(messages ++ correction_turn(ai_message, reason), %{ctx | retries: ctx.retries - 1})
   end
 
-  defp correction(:no_structured_output) do
-    Message.human(
-      "Your previous reply was not valid structured output. Call the `respond` tool " <>
-        "with a single JSON object matching the required schema."
-    )
+  # Re-send the model's failed attempt so it sees its own mistake. A reply is
+  # required for every tool call it made (providers reject an unanswered tool
+  # call), so the error rides back as a correlated tool message; a prose/JSON
+  # attempt with no tool call is corrected with a plain user message instead.
+  defp correction_turn(%Message.AI{tool_calls: [_ | _] = calls} = ai_message, reason) do
+    text = correction_text(reason)
+    [ai_message | Enum.map(calls, &Message.tool(text, &1.id))]
   end
 
-  defp correction({:missing_required, keys}) do
-    Message.human(
-      "Your previous structured reply was missing required field(s): " <>
-        "#{Enum.join(keys, ", ")}. Call `respond` again including every required field."
-    )
+  defp correction_turn(ai_message, reason),
+    do: [ai_message, Message.human(correction_text(reason))]
+
+  defp correction_text(:no_structured_output) do
+    "Your previous reply was not valid structured output. Call the `respond` tool " <>
+      "with a single JSON object matching the required schema."
+  end
+
+  defp correction_text({:missing_required, keys}) do
+    "Your previous structured reply was missing required field(s): " <>
+      "#{Enum.join(keys, ", ")}. Call `respond` again including every required field."
   end
 
   defp strategy_opts(:tool, schema), do: [tools: [respond_tool(schema)]]
 
   defp strategy_opts(:provider, schema),
     do: [tools: [respond_tool(schema)], tool_choice: {:tool, "respond"}]
-
-  defp structured_result({:ok, ai_message, _usage}, schema) do
-    ai_message
-    |> extract_structured()
-    |> validate_structured(schema)
-  end
-
-  defp structured_result({:error, _reason} = error, _schema), do: error
 
   @doc """
   Validate a decoded structured result against a JSON-schema's top-level

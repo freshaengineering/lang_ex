@@ -95,6 +95,18 @@ defmodule LangEx.ContextCompactionTest do
       assert ContextCompaction.messages_byte_size(messages) == 10
     end
 
+    test "counts tool-call args on an AI message with nil content" do
+      call = %Message.ToolCall{
+        name: "query",
+        id: "1",
+        args: %{"sql" => String.duplicate("x", 500)}
+      }
+
+      messages = [Message.ai(nil, tool_calls: [call])]
+
+      assert ContextCompaction.messages_byte_size(messages) > 500
+    end
+
     test "handles nil content" do
       messages = [Message.ai(nil)]
       assert ContextCompaction.messages_byte_size(messages) == 0

@@ -4,6 +4,48 @@ defmodule LangEx.Middleware.SummarizationTest do
 
   alias LangEx.Message
   alias LangEx.Middleware.Summarization
+  alias LangEx.Prebuilt
+
+  describe "through the agent graph" do
+    test "persists the summary so history shrinks (remove_all end-to-end)" do
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn messages, _opts ->
+        messages |> List.first() |> reply()
+      end)
+
+      history =
+        for n <- 1..4 do
+          Message.human("BULKY_#{n} " <> String.duplicate("x", 200))
+        end
+
+      graph =
+        Prebuilt.agent(
+          provider: LangEx.LLM.OpenAI,
+          model: "gpt-4o",
+          compaction: false,
+          middleware: [
+            Summarization.new(
+              provider: LangEx.LLM.OpenAI,
+              model: "gpt-4o",
+              max_bytes: 100,
+              keep: 2
+            )
+          ]
+        )
+
+      {:ok, result} = LangEx.invoke(graph, %{messages: history})
+
+      refute Enum.any?(result.messages, &match?(%Message.RemoveMessage{}, &1))
+      refute Enum.any?(result.messages, &match?(%Message.Human{content: "BULKY_1" <> _}, &1))
+      assert Enum.any?(result.messages, &match?(%Message.Human{content: "[Summary" <> _}, &1))
+      assert %Message.AI{content: "final answer"} = List.last(result.messages)
+    end
+  end
+
+  defp reply(%Message.System{content: "You are compressing" <> _}),
+    do: {:ok, Message.ai("DENSE SUMMARY"), %{input_tokens: 1, output_tokens: 1}}
+
+  defp reply(_first),
+    do: {:ok, Message.ai("final answer"), %{input_tokens: 2, output_tokens: 2}}
 
   describe "before_model hook" do
     test "leaves history untouched when under budget" do

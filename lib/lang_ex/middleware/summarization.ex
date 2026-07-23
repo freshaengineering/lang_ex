@@ -13,6 +13,11 @@ defmodule LangEx.Middleware.Summarization do
   Use this instead of the built-in `:compaction` (pass `compaction: false`
   to `LangEx.Prebuilt.agent/1`), not alongside it.
 
+  Only history *older* than the last `:keep` messages is summarised — if the
+  bulk sits within the kept window (few but very large recent messages) the
+  hook is a safe no-op and the context stays large. Pair with
+  `LangEx.Middleware.ContextEditing` when recent tool results are the bloat.
+
   ## Options
 
   - `:model` / `:provider` - the summariser model (required; a cheaper/faster

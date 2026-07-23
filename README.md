@@ -316,6 +316,34 @@ graph =
 
 Handoffs are ordinary tools: a tool function returning a `%LangEx.Command{}` updates state (e.g. the active agent) and steers routing. Build one directly with `LangEx.Prebuilt.Handoff.tool/2`.
 
+### Agent Middleware
+
+Layer extra behaviour around a `Prebuilt.agent/1` model call with composable `%LangEx.Middleware{}` values. Each can run `before_model` / `after_model` / `wrap_model_call` hooks, contribute tools, and extend the agent's state — an `after_model` hook can even steer routing (loop, go to tools, or end). Built-ins ship for the common needs:
+
+```elixir
+graph =
+  LangEx.Prebuilt.agent(
+    model: "claude-opus-4-20250514",
+    tools: investigation_tools,
+    compaction: false,
+    middleware: [
+      # keep context small without losing findings
+      LangEx.Middleware.Summarization.new(model: "claude-haiku-4-5-20251001"),
+      # let the agent keep a running plan
+      LangEx.Middleware.TodoList.new(),
+      # narrow a big tool set to what's relevant each turn
+      LangEx.Middleware.ToolSelector.new(model: "claude-haiku-4-5-20251001", max_tools: 7),
+      # don't let it finish until the answer meets the bar
+      LangEx.Middleware.Rubric.new(
+        model: "claude-opus-4-20250514",
+        rubric: "Cites concrete evidence and names a root cause."
+      )
+    ]
+  )
+```
+
+Also available: `LangEx.Middleware.ContextEditing` (clears stale tool-result bodies while keeping the message skeleton). Write your own with `LangEx.Middleware.new/1`.
+
 ### Runtime Context
 
 Inject dependencies into nodes without closures:

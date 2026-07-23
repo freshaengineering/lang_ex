@@ -91,7 +91,12 @@ defmodule LangEx.Middleware.ToolSelector do
     kept ++ Enum.take(extra, max_tools - length(kept))
   end
 
-  defp recent(messages), do: Enum.take(messages, -4)
+  defp recent(messages) do
+    messages
+    |> Enum.reject(&match?(%Message.System{}, &1))
+    |> Enum.filter(&match?(%Message.Human{}, &1))
+    |> Enum.take(-4)
+  end
 
   defp selector_prompt(tools, max_tools) do
     catalog = Enum.map_join(tools, "\n", &"- #{&1.name}: #{&1.description}")

@@ -57,6 +57,9 @@
 - `LangEx.ContextCompaction.compact_if_needed/2` accepts a `:summarizer`
   (`fn dropped_messages -> String.t()`) to describe dropped rounds with a real
   summary instead of the mechanical tool-name notice.
+- Byte accounting now counts AI `tool_calls` args (and tolerates `nil`
+  content), so a tool-argument-heavy history triggers compaction correctly
+  instead of under-reporting its size.
 
 ## v0.10.0
 

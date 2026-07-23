@@ -52,6 +52,8 @@ defmodule LangEx.LLM.Anthropic do
   alias LangEx.Message
   alias LangEx.Tool
 
+  require Logger
+
   @base_url "https://api.anthropic.com/v1"
   @api_version "2023-06-01"
   @prompt_caching_beta "prompt-caching-2024-07-31"
@@ -88,10 +90,25 @@ defmodule LangEx.LLM.Anthropic do
       |> put_thinking(thinking?, opts)
       |> put_system(system_prompt, caching?)
       |> put_tools(tools, caching?)
-      |> put_tool_choice(Keyword.get(opts, :tool_choice))
+      |> put_tool_choice(tool_choice(thinking?, Keyword.get(opts, :tool_choice)))
       |> cache_conversation(caching? and Keyword.get(opts, :cache_conversation, true))
 
     send_request(body, api_key, callbacks, caching?)
+  end
+
+  # Extended thinking requires tool_choice: auto — forcing a tool alongside it
+  # is a 400. Drop a forcing choice (falling back to auto) rather than emit an
+  # invalid request.
+  defp tool_choice(false, choice), do: choice
+  defp tool_choice(true, choice) when choice in [nil, :auto], do: choice
+
+  defp tool_choice(true, choice) do
+    Logger.warning(
+      "Anthropic: ignoring forced tool_choice #{inspect(choice)} because extended " <>
+        "thinking is enabled — Anthropic requires tool_choice: auto with thinking"
+    )
+
+    nil
   end
 
   defp put_tool_choice(body, nil), do: body
