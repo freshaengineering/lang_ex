@@ -81,6 +81,38 @@ defmodule LangEx.PrebuiltTest do
     end
   end
 
+  describe "agent/1 with state-derived tools" do
+    test "resolves tools from a fn(state) at runtime and runs the loop" do
+      test_pid = self()
+
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn messages, opts ->
+        send(test_pid, {:offered, Enum.map(opts[:tools] || [], & &1.name)})
+
+        messages
+        |> Enum.any?(&match?(%Message.Tool{}, &1))
+        |> scripted_reply()
+      end)
+
+      # The tool set lives in state (as it would after a runtime discovery
+      # step), not baked in at build time.
+      graph =
+        Prebuilt.agent(
+          provider: LangEx.LLM.OpenAI,
+          model: "gpt-4o",
+          tools: fn state -> state.discovered_tools end
+        )
+
+      {:ok, result} =
+        LangEx.invoke(graph, %{
+          messages: [Message.human("Weather in Tokyo?")],
+          discovered_tools: [weather_tool()]
+        })
+
+      assert_received {:offered, ["get_weather"]}
+      assert %Message.AI{content: "22C and sunny"} = List.last(result.messages)
+    end
+  end
+
   defp weather_tool do
     %Tool{
       name: "get_weather",

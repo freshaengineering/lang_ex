@@ -70,8 +70,10 @@ defmodule LangEx.Prebuilt do
   ## Options
 
   - `:model` / `:provider` - forwarded to `ChatModel.node/1` (one is required)
-  - `:tools` - list of `%LangEx.Tool{}` (default `[]`; without tools the
-    graph is a single LLM turn)
+  - `:tools` - list of `%LangEx.Tool{}`, or a `fn state -> [%LangEx.Tool{}] end`
+    resolved from state each turn (for tools discovered at runtime and kept
+    out of checkpointed state). Default `[]`; without tools the graph is a
+    single LLM turn
   - `:middleware` - list of `%LangEx.Middleware{}` wrapping the model call
     (default `[]`); their tools and state schema are merged in automatically
   - `:system_prompt` - prepended as a system message when the
@@ -96,14 +98,16 @@ defmodule LangEx.Prebuilt do
   def agent(opts) do
     {agent_opts, llm_opts} = Keyword.split(opts, @agent_opt_keys)
     middlewares = Keyword.get(agent_opts, :middleware, [])
-    tools = Keyword.get(agent_opts, :tools, []) ++ Middleware.tools(middlewares)
+    tools_spec = Keyword.get(agent_opts, :tools, [])
+    static_tools = Middleware.tools(middlewares)
+    resolver = tool_resolver(tools_spec, static_tools)
 
     middlewares
     |> agent_schema()
     |> Graph.new()
-    |> Graph.add_node(:agent, agent_node(llm_opts, tools, agent_opts, middlewares))
+    |> Graph.add_node(:agent, agent_node(llm_opts, resolver, agent_opts, middlewares))
     |> Graph.add_edge(:__start__, :agent)
-    |> add_tool_loop(tools, agent_opts, middlewares)
+    |> add_tool_loop(resolver, has_tools?(tools_spec, static_tools), agent_opts, middlewares)
     |> Graph.compile(
       name: Keyword.get(agent_opts, :name, :agent),
       checkpointer: Keyword.get(agent_opts, :checkpointer),
@@ -112,6 +116,18 @@ defmodule LangEx.Prebuilt do
       interrupt_after: Keyword.get(agent_opts, :interrupt_after, [])
     )
   end
+
+  # Tools may be a static list or a `fn state -> [tool] end` resolved per turn
+  # (for agents whose tools are discovered at runtime). Middleware-contributed
+  # tools are always appended.
+  defp tool_resolver(tools_spec, static_tools) when is_function(tools_spec, 1),
+    do: fn state -> tools_spec.(state) ++ static_tools end
+
+  defp tool_resolver(tools_spec, static_tools) when is_list(tools_spec),
+    do: fn _state -> tools_spec ++ static_tools end
+
+  defp has_tools?(tools_spec, _static_tools) when is_function(tools_spec, 1), do: true
+  defp has_tools?(tools_spec, static_tools), do: tools_spec != [] or static_tools != []
 
   @doc """
   Builds a generate → critique → revise reflection graph.
@@ -137,7 +153,7 @@ defmodule LangEx.Prebuilt do
   defp add_jump_key(schema, []), do: schema
   defp add_jump_key(schema, _middlewares), do: Keyword.put(schema, Middleware.jump_key(), nil)
 
-  defp agent_node(llm_opts, tools, agent_opts, middlewares) do
+  defp agent_node(llm_opts, resolver, agent_opts, middlewares) do
     system_prompt = Keyword.get(agent_opts, :system_prompt)
     compaction = Keyword.get(agent_opts, :compaction, [])
     model_fn = model_fn(llm_opts)
@@ -147,7 +163,7 @@ defmodule LangEx.Prebuilt do
       |> ensure_system(system_prompt)
       |> compact(compaction)
       |> then(&%{state | messages: &1})
-      |> Middleware.run_turn(model_fn, tools, middlewares, :messages)
+      |> then(&(&1 |> Middleware.run_turn(model_fn, resolver.(&1), middlewares, :messages)))
       |> reset_jump(middlewares)
     end
   end
@@ -162,37 +178,45 @@ defmodule LangEx.Prebuilt do
   defp reset_jump(update, []), do: update
   defp reset_jump(update, _middlewares), do: Map.put_new(update, Middleware.jump_key(), nil)
 
-  defp add_tool_loop(graph, tools, agent_opts, middlewares) do
+  defp add_tool_loop(graph, resolver, has_tools?, agent_opts, middlewares) do
     graph
-    |> add_tools_node(tools, agent_opts)
-    |> route_agent(tools, middlewares)
+    |> add_tools_node(resolver, has_tools?, agent_opts)
+    |> route_agent(has_tools?, middlewares)
   end
 
-  defp add_tools_node(graph, [], _agent_opts), do: graph
+  defp add_tools_node(graph, _resolver, false, _agent_opts), do: graph
 
-  defp add_tools_node(graph, tools, agent_opts) do
+  defp add_tools_node(graph, resolver, true, agent_opts) do
+    tool_opts = Keyword.get(agent_opts, :tool_opts, [])
+
     graph
-    |> Graph.add_node(:tools, Tool.Node.node(tools, Keyword.get(agent_opts, :tool_opts, [])))
+    |> Graph.add_node(:tools, tools_node(resolver, tool_opts))
     |> Graph.add_edge(:tools, :agent)
   end
 
-  defp route_agent(graph, [], []), do: Graph.add_edge(graph, :agent, :__end__)
+  # Resolve tools from state per execution so runtime-discovered tools work;
+  # rebuilding the Tool.Node closure each call is cheap.
+  defp tools_node(resolver, tool_opts) do
+    fn state -> state |> resolver.() |> Tool.Node.node(tool_opts) |> then(& &1.(state)) end
+  end
 
-  defp route_agent(graph, _tools, []) do
+  defp route_agent(graph, false, []), do: Graph.add_edge(graph, :agent, :__end__)
+
+  defp route_agent(graph, true, []) do
     Graph.add_conditional_edges(graph, :agent, &Tool.Node.tools_condition/1, %{
       tools: :tools,
       __end__: :__end__
     })
   end
 
-  defp route_agent(graph, [], _middlewares) do
+  defp route_agent(graph, false, _middlewares) do
     Graph.add_conditional_edges(graph, :agent, &agent_router(&1, false), %{
       model: :agent,
       __end__: :__end__
     })
   end
 
-  defp route_agent(graph, _tools, _middlewares) do
+  defp route_agent(graph, true, _middlewares) do
     Graph.add_conditional_edges(graph, :agent, &agent_router(&1, true), %{
       model: :agent,
       tools: :tools,

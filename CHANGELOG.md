@@ -11,6 +11,14 @@
   hook can steer routing (loop, go to tools, or end) via the reserved
   `LangEx.Middleware.jump_key/0`.
 
+### Prebuilt agent — state-derived tools
+
+- `LangEx.Prebuilt.agent/1` accepts `tools: fn state -> [%LangEx.Tool{}] end`
+  in addition to a static list. The resolver runs each turn, so tools
+  discovered at runtime can be kept as serializable specs in state (and
+  materialized on demand) instead of storing executable closures in the
+  checkpoint. Middleware-contributed tools are appended to the resolved set.
+
 ### Built-in middleware
 
 - `LangEx.Middleware.Summarization` — replaces older history with an
