@@ -2,7 +2,7 @@
 
 Graph-based agent orchestration for Elixir. Builds stateful, multi-step LLM workflows using nodes, edges, conditional routing, state reducers, human-in-the-loop interrupts, and checkpointing. Inspired by LangGraph, built on BEAM primitives.
 
-- **Version**: 0.6.0, **Elixir**: ~> 1.16
+- **Version**: 0.11.0, **Elixir**: ~> 1.16
 - **Deps**: `req`, `jason`, `telemetry`; optional `redix`, `postgrex`, `ecto_sql`, `opentelemetry_api`, `opentelemetry_telemetry`
 - **Test**: ExUnit with `mimic` for mocking
 
@@ -47,7 +47,13 @@ LangEx (facade: invoke/3, stream/3, get_state/2, get_state_history/2, update_sta
 ├── Tool                              # Tool/function definition struct
 │   ├── Tool.Node                     # Graph node for parallel tool execution
 │   └── Tool.Annotation               # Error recovery guidance for LLM
-├── Message                           # Chat message types (Human, AI, System, Tool)
+├── Message                           # Chat message types (Human, AI, System, Tool, RemoveMessage)
+├── Middleware                        # Composable model-call hooks for Prebuilt.agent
+│   ├── Middleware.Summarization      # LLM-summarised, persisted context compaction
+│   ├── Middleware.ContextEditing     # Clears stale tool-result contents (no LLM)
+│   ├── Middleware.TodoList           # write_todos planning tool + :todos state
+│   ├── Middleware.ToolSelector       # LLM tool pre-selection for large tool sets
+│   └── Middleware.Rubric             # Completion gate scoring the final answer
 ├── Checkpoint / Checkpointer         # Pause/resume with Memory, Redis, or Postgres
 ├── Store                             # Long-term memory (ETS / Postgres backends)
 ├── Migration                         # Versioned Postgres migrations (V1, V2)
@@ -88,6 +94,13 @@ lib/lang_ex/
 ├── node_error.ex                    → LangEx.NodeError (exception)
 ├── node_timeout_error.ex            → LangEx.NodeTimeoutError (exception)
 ├── prebuilt.ex                      → LangEx.Prebuilt
+├── middleware.ex                    → LangEx.Middleware
+├── middleware/
+│   ├── summarization.ex             → LangEx.Middleware.Summarization
+│   ├── context_editing.ex           → LangEx.Middleware.ContextEditing
+│   ├── todo_list.ex                 → LangEx.Middleware.TodoList
+│   ├── tool_selector.ex             → LangEx.Middleware.ToolSelector
+│   └── rubric.ex                    → LangEx.Middleware.Rubric
 ├── send.ex                          → LangEx.Send
 ├── telemetry.ex                     → LangEx.Telemetry
 ├── telemetry/

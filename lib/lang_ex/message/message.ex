@@ -51,7 +51,24 @@ defmodule LangEx.Message do
     @type t :: %__MODULE__{content: String.t(), tool_call_id: String.t(), id: String.t() | nil}
   end
 
+  defmodule RemoveMessage do
+    @moduledoc """
+    A deletion instruction consumed by `LangEx.Message.add_messages/2`.
+
+    Emitted (never stored) so a reducer update can prune history instead of
+    only appending. `id` targets a single message by its `:id`; the special
+    `LangEx.Message.remove_all/0` sentinel clears every prior message,
+    letting a node replace the whole history (e.g. summarization).
+    """
+    @derive Jason.Encoder
+    defstruct [:id]
+    @type t :: %__MODULE__{id: String.t()}
+  end
+
   @type t :: Human.t() | AI.t() | System.t() | Tool.t()
+  @type instruction :: t() | RemoveMessage.t()
+
+  @remove_all "__remove_all__"
 
   @doc "Create a human message."
   @spec human(String.t(), keyword()) :: Human.t()
@@ -71,41 +88,67 @@ defmodule LangEx.Message do
     struct!(Tool, [{:content, content}, {:tool_call_id, tool_call_id} | opts])
   end
 
+  @doc "Create a `RemoveMessage` targeting a single message by its `:id`."
+  @spec remove(String.t()) :: RemoveMessage.t()
+  def remove(id) when is_binary(id), do: %RemoveMessage{id: id}
+
+  @doc "Create a `RemoveMessage` that clears the entire prior history."
+  @spec remove_all() :: RemoveMessage.t()
+  def remove_all, do: %RemoveMessage{id: @remove_all}
+
   @doc """
-  Reducer that appends new messages to an existing list.
-  Messages with matching IDs replace the existing message (for corrections/updates).
+  Reducer that folds a list of instructions onto the existing history.
+
+  Instructions are applied left to right:
+
+  - a plain message is appended, or replaces an existing one when their
+    `:id` values match (corrections/updates)
+  - a `RemoveMessage` with a matching `:id` deletes that message
+  - the `remove_all/0` sentinel clears everything accumulated so far, so a
+    node can replace the whole history in a single update
+
+  Order matters: `[remove_all(), summary]` clears the history and keeps
+  `summary`, while `[summary, remove_all()]` would discard `summary` too.
   """
-  @spec add_messages([t()], [t()] | t()) :: [t()]
+  @spec add_messages([t()], [instruction()] | instruction()) :: [t()]
   def add_messages(existing, new) when is_list(new) do
-    existing_ids = for msg <- existing, id = message_id(msg), id, into: MapSet.new(), do: id
-
-    replacements =
-      for msg <- new,
-          id = message_id(msg),
-          id && MapSet.member?(existing_ids, id),
-          into: %{},
-          do: {id, msg}
-
-    replaced_ids = replacements |> Map.keys() |> MapSet.new()
-
-    Enum.map(existing, &replace_by_id(&1, replacements)) ++
-      Enum.reject(new, &MapSet.member?(replaced_ids, message_id(&1)))
+    Enum.reduce(new, existing, &apply_instruction/2)
   end
 
   def add_messages(existing, single), do: add_messages(existing, [single])
 
-  defp replace_by_id(msg, replacements) do
+  defp apply_instruction(%RemoveMessage{id: @remove_all}, _acc), do: []
+
+  defp apply_instruction(%RemoveMessage{id: id}, acc),
+    do: Enum.reject(acc, &(message_id(&1) == id))
+
+  defp apply_instruction(msg, acc) do
     msg
     |> message_id()
-    |> fetch_replacement(replacements)
-    |> apply_replacement(msg)
+    |> upsert(msg, acc)
   end
 
-  defp fetch_replacement(id, replacements) when is_binary(id), do: Map.fetch(replacements, id)
-  defp fetch_replacement(_, _replacements), do: :error
+  defp upsert(nil, msg, acc), do: acc ++ [msg]
 
-  defp apply_replacement({:ok, replacement}, _msg), do: replacement
-  defp apply_replacement(:error, msg), do: msg
+  defp upsert(id, msg, acc) do
+    acc
+    |> Enum.any?(&(message_id(&1) == id))
+    |> replace_or_append(id, msg, acc)
+  end
+
+  defp replace_or_append(true, id, msg, acc),
+    do: Enum.map(acc, &replace_matching(&1, id, msg))
+
+  defp replace_or_append(false, _id, msg, acc), do: acc ++ [msg]
+
+  defp replace_matching(existing, id, msg) do
+    existing
+    |> message_id()
+    |> matched(existing, id, msg)
+  end
+
+  defp matched(id, _existing, id, msg), do: msg
+  defp matched(_other, existing, _id, _msg), do: existing
 
   defp message_id(%{id: id}) when is_binary(id), do: id
   defp message_id(_), do: nil

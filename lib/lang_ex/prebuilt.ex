@@ -18,18 +18,38 @@ defmodule LangEx.Prebuilt do
         LangEx.invoke(graph, %{messages: [Message.human("Is api-gateway healthy?")]},
           config: [thread_id: "ops-1", repo: MyApp.Repo]
         )
+
+  ## Middleware
+
+  Pass `:middleware` (a list of `%LangEx.Middleware{}`) to layer extra
+  behaviour around the model call — summarisation, context editing,
+  planning, tool pre-selection, completion gating — without changing the
+  agent's shape. Built-in middleware lives under `LangEx.Middleware.*`:
+
+      LangEx.Prebuilt.agent(
+        model: "claude-opus-4-20250514",
+        tools: tools,
+        middleware: [
+          LangEx.Middleware.Summarization.new(model: "claude-haiku-4-5-20251001"),
+          LangEx.Middleware.TodoList.new(),
+          LangEx.Middleware.Rubric.new(rubric: "Cites logs and names a root cause.")
+        ]
+      )
   """
 
   alias LangEx.ContextCompaction
   alias LangEx.Graph
   alias LangEx.LLM.ChatModel
   alias LangEx.Message
+  alias LangEx.Middleware
   alias LangEx.Prebuilt.Reflect
+  alias LangEx.Tool
 
   @agent_opt_keys [
     :name,
     :system_prompt,
     :tools,
+    :middleware,
     :checkpointer,
     :store,
     :compaction,
@@ -42,13 +62,16 @@ defmodule LangEx.Prebuilt do
   Builds and compiles a tool-calling agent graph.
 
   The graph state has `:messages` (with `Message.add_messages/2`) and
-  `:llm_usage` (accumulating token usage via `ChatModel.merge_usage/2`).
+  `:llm_usage` (accumulating token usage via `ChatModel.merge_usage/2`),
+  plus any keys contributed by `:middleware`.
 
   ## Options
 
   - `:model` / `:provider` - forwarded to `ChatModel.node/1` (one is required)
   - `:tools` - list of `%LangEx.Tool{}` (default `[]`; without tools the
     graph is a single LLM turn)
+  - `:middleware` - list of `%LangEx.Middleware{}` wrapping the model call
+    (default `[]`); their tools and state schema are merged in automatically
   - `:system_prompt` - prepended as a system message when the
     conversation does not already start with one
   - `:name` - graph name for telemetry (default `:agent`)
@@ -67,15 +90,15 @@ defmodule LangEx.Prebuilt do
   @spec agent(keyword()) :: Graph.Compiled.t()
   def agent(opts) do
     {agent_opts, llm_opts} = Keyword.split(opts, @agent_opt_keys)
-    tools = Keyword.get(agent_opts, :tools, [])
+    middlewares = Keyword.get(agent_opts, :middleware, [])
+    tools = Keyword.get(agent_opts, :tools, []) ++ Middleware.tools(middlewares)
 
-    Graph.new(
-      messages: {[], &Message.add_messages/2},
-      llm_usage: {%{}, &ChatModel.merge_usage/2}
-    )
-    |> Graph.add_node(:agent, agent_node(llm_opts, tools, agent_opts))
+    middlewares
+    |> agent_schema()
+    |> Graph.new()
+    |> Graph.add_node(:agent, agent_node(llm_opts, tools, agent_opts, middlewares))
     |> Graph.add_edge(:__start__, :agent)
-    |> add_tool_loop(tools, agent_opts)
+    |> add_tool_loop(tools, agent_opts, middlewares)
     |> Graph.compile(
       name: Keyword.get(agent_opts, :name, :agent),
       checkpointer: Keyword.get(agent_opts, :checkpointer),
@@ -94,33 +117,91 @@ defmodule LangEx.Prebuilt do
   @spec reflect(keyword()) :: Graph.Compiled.t()
   def reflect(opts), do: Reflect.create(opts)
 
-  defp agent_node(llm_opts, tools, agent_opts) do
-    chat = ChatModel.node(llm_opts ++ [tools: tools])
+  defp agent_schema(middlewares) do
+    [
+      messages: {[], &Message.add_messages/2},
+      llm_usage: {%{}, &ChatModel.merge_usage/2}
+    ]
+    |> Keyword.merge(Middleware.state_schema(middlewares))
+    |> add_jump_key(middlewares)
+  end
+
+  defp add_jump_key(schema, []), do: schema
+  defp add_jump_key(schema, _middlewares), do: Keyword.put(schema, Middleware.jump_key(), nil)
+
+  defp agent_node(llm_opts, tools, agent_opts, middlewares) do
     system_prompt = Keyword.get(agent_opts, :system_prompt)
     compaction = Keyword.get(agent_opts, :compaction, [])
+    model_fn = model_fn(llm_opts)
 
     fn state ->
       state.messages
       |> ensure_system(system_prompt)
       |> compact(compaction)
-      |> then(&chat.(%{state | messages: &1}))
+      |> then(&%{state | messages: &1})
+      |> Middleware.run_turn(model_fn, tools, middlewares, :messages)
+      |> reset_jump(middlewares)
     end
   end
 
-  defp add_tool_loop(graph, [], _agent_opts), do: Graph.add_edge(graph, :agent, :__end__)
+  defp model_fn(llm_opts) do
+    fn messages, call_tools ->
+      call = ChatModel.node(Keyword.put(llm_opts, :tools, call_tools))
+      call.(%{messages: messages, llm_usage: %{}})
+    end
+  end
 
-  defp add_tool_loop(graph, tools, agent_opts) do
+  defp reset_jump(update, []), do: update
+  defp reset_jump(update, _middlewares), do: Map.put_new(update, Middleware.jump_key(), nil)
+
+  defp add_tool_loop(graph, tools, agent_opts, middlewares) do
     graph
-    |> Graph.add_node(
-      :tools,
-      LangEx.Tool.Node.node(tools, Keyword.get(agent_opts, :tool_opts, []))
-    )
-    |> Graph.add_conditional_edges(:agent, &LangEx.Tool.Node.tools_condition/1, %{
+    |> add_tools_node(tools, agent_opts)
+    |> route_agent(tools, middlewares)
+  end
+
+  defp add_tools_node(graph, [], _agent_opts), do: graph
+
+  defp add_tools_node(graph, tools, agent_opts) do
+    graph
+    |> Graph.add_node(:tools, Tool.Node.node(tools, Keyword.get(agent_opts, :tool_opts, [])))
+    |> Graph.add_edge(:tools, :agent)
+  end
+
+  defp route_agent(graph, [], []), do: Graph.add_edge(graph, :agent, :__end__)
+
+  defp route_agent(graph, _tools, []) do
+    Graph.add_conditional_edges(graph, :agent, &Tool.Node.tools_condition/1, %{
       tools: :tools,
       __end__: :__end__
     })
-    |> Graph.add_edge(:tools, :agent)
   end
+
+  defp route_agent(graph, [], _middlewares) do
+    Graph.add_conditional_edges(graph, :agent, &agent_router/1, %{
+      model: :agent,
+      __end__: :__end__
+    })
+  end
+
+  defp route_agent(graph, _tools, _middlewares) do
+    Graph.add_conditional_edges(graph, :agent, &agent_router/1, %{
+      model: :agent,
+      tools: :tools,
+      __end__: :__end__
+    })
+  end
+
+  defp agent_router(state) do
+    state
+    |> Map.get(Middleware.jump_key())
+    |> resolve_jump(state)
+  end
+
+  defp resolve_jump(:model, _state), do: :model
+  defp resolve_jump(:tools, _state), do: :tools
+  defp resolve_jump(:__end__, _state), do: :__end__
+  defp resolve_jump(nil, state), do: Tool.Node.tools_condition(state)
 
   defp ensure_system(messages, nil), do: messages
   defp ensure_system([%Message.System{} | _] = messages, _prompt), do: messages

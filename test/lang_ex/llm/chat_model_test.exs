@@ -358,5 +358,91 @@ defmodule LangEx.LLM.ChatModelTest do
                  schema: %{type: "object"}
                )
     end
+
+    test "retries with validation feedback then succeeds" do
+      counter = :counters.new(1, [:atomics])
+
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, _opts ->
+        :counters.add(counter, 1, 1)
+
+        case :counters.get(counter, 1) do
+          1 -> {:ok, Message.ai("{}"), %{input_tokens: 1, output_tokens: 1}}
+          _ -> {:ok, Message.ai(~s({"action": "go"})), %{input_tokens: 1, output_tokens: 1}}
+        end
+      end)
+
+      assert {:ok, %{"action" => "go"}} =
+               ChatModel.structured([Message.human("x")],
+                 provider: LangEx.LLM.OpenAI,
+                 model: "gpt-4o",
+                 schema: %{type: "object", required: ["action"]},
+                 max_retries: 2
+               )
+
+      assert :counters.get(counter, 1) == 2
+    end
+
+    test "does not retry when max_retries is zero" do
+      counter = :counters.new(1, [:atomics])
+
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, _opts ->
+        :counters.add(counter, 1, 1)
+        {:ok, Message.ai("{}"), %{input_tokens: 1, output_tokens: 1}}
+      end)
+
+      assert {:error, {:missing_required, ["action"]}} =
+               ChatModel.structured([Message.human("x")],
+                 provider: LangEx.LLM.OpenAI,
+                 model: "gpt-4o",
+                 schema: %{type: "object", required: ["action"]},
+                 max_retries: 0
+               )
+
+      assert :counters.get(counter, 1) == 1
+    end
+
+    test "provider strategy forces the respond tool via tool_choice" do
+      test_pid = self()
+
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, opts ->
+        send(test_pid, {:tool_choice, opts[:tool_choice]})
+        call = %Message.ToolCall{name: "respond", id: "r1", args: %{"action" => "go"}}
+        {:ok, Message.ai(nil, tool_calls: [call]), %{input_tokens: 1, output_tokens: 1}}
+      end)
+
+      assert {:ok, %{"action" => "go"}} =
+               ChatModel.structured([Message.human("x")],
+                 provider: LangEx.LLM.OpenAI,
+                 model: "gpt-4o",
+                 schema: %{type: "object", required: ["action"]},
+                 strategy: :provider
+               )
+
+      assert_received {:tool_choice, {:tool, "respond"}}
+    end
+  end
+
+  describe "complete/2" do
+    test "returns the assistant message with usage" do
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, _opts ->
+        {:ok, Message.ai("hello"), %{input_tokens: 3, output_tokens: 2}}
+      end)
+
+      assert {:ok, %Message.AI{content: "hello"}, %{input_tokens: 3, output_tokens: 2}} =
+               ChatModel.complete([Message.human("hi")],
+                 provider: LangEx.LLM.OpenAI,
+                 model: "gpt-4o"
+               )
+    end
+
+    test "surfaces provider errors" do
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, _opts -> {:error, :down} end)
+
+      assert {:error, :down} =
+               ChatModel.complete([Message.human("hi")],
+                 provider: LangEx.LLM.OpenAI,
+                 model: "gpt-4o"
+               )
+    end
   end
 end

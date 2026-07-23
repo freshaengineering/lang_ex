@@ -21,6 +21,9 @@ defmodule LangEx.ContextCompaction do
   - `:min_rounds_to_keep` — never drop below this many rounds (default `2`)
   - `:error_detector` — `fn(content :: String.t()) -> boolean()` to detect
     error payloads in tool results (default: JSON `"error"`/`"errors"` key detection)
+  - `:summarizer` — `fn(dropped_messages :: [Message.t()]) -> String.t()` to
+    produce a real summary of the dropped rounds' content (e.g. an LLM call).
+    When absent, a mechanical notice listing tool names and outcomes is used.
   - `:compaction_notice` — `fn(summary_text, dropped_count) -> Message.t()`
     to customize the compaction notice message
   """
@@ -62,34 +65,22 @@ defmodule LangEx.ContextCompaction do
     min_rounds = Keyword.get(opts, :min_rounds_to_keep, @default_min_rounds)
     error_detector = Keyword.get(opts, :error_detector, &default_error_detector/1)
     notice_builder = Keyword.get(opts, :compaction_notice, &default_compaction_notice/2)
+    summarizer = Keyword.get(opts, :summarizer)
 
     {rounds, trailing} = chunk_into_rounds(rest)
     total = messages_byte_size([system | rest])
     dropped_count = count_rounds_to_drop(rounds, total, max_bytes, min_rounds)
 
-    apply_compaction(
-      dropped_count,
-      system,
-      rest,
-      rounds,
-      trailing,
-      error_detector,
-      notice_builder
-    )
+    apply_compaction(dropped_count, system, rest, rounds, trailing, %{
+      error_detector: error_detector,
+      notice_builder: notice_builder,
+      summarizer: summarizer
+    })
   end
 
-  defp apply_compaction(0, system, rest, _rounds, _trailing, _error_detector, _notice_builder),
-    do: [system | rest]
+  defp apply_compaction(0, system, rest, _rounds, _trailing, _opts), do: [system | rest]
 
-  defp apply_compaction(
-         dropped_count,
-         system,
-         _rest,
-         rounds,
-         trailing,
-         error_detector,
-         notice_builder
-       ) do
+  defp apply_compaction(dropped_count, system, _rest, rounds, trailing, opts) do
     {dropped, kept} = Enum.split(rounds, dropped_count)
     kept_flat = List.flatten(kept) ++ trailing
 
@@ -100,11 +91,23 @@ defmodule LangEx.ContextCompaction do
 
     notice =
       dropped
-      |> format_dropped_summaries(error_detector)
-      |> then(&notice_builder.(&1, dropped_count))
+      |> summary_text(opts.error_detector, opts.summarizer)
+      |> then(&opts.notice_builder.(&1, dropped_count))
 
     [system, notice | kept_flat]
   end
+
+  defp summary_text(dropped, error_detector, nil),
+    do: format_dropped_summaries(dropped, error_detector)
+
+  defp summary_text(dropped, _error_detector, summarizer) when is_function(summarizer, 1) do
+    dropped
+    |> List.flatten()
+    |> summarizer.()
+    |> wrap_summary()
+  end
+
+  defp wrap_summary(text), do: "Summary of dropped rounds:\n#{text}\n\n"
 
   defp default_compaction_notice(summary_text, count) do
     Message.human(

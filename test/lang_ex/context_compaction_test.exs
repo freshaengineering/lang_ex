@@ -40,6 +40,29 @@ defmodule LangEx.ContextCompactionTest do
       assert String.contains?(notice.content, "t1")
     end
 
+    test "uses the :summarizer to describe dropped rounds when provided" do
+      large_content = String.duplicate("x", 5_000)
+
+      messages = [
+        Message.system("system"),
+        Message.ai("round 1", tool_calls: [%Message.ToolCall{name: "t1", id: "1", args: %{}}]),
+        Message.tool(large_content, "1"),
+        Message.ai("round 2", tool_calls: [%Message.ToolCall{name: "t2", id: "2", args: %{}}]),
+        Message.tool(large_content, "2"),
+        Message.ai("round 3", tool_calls: [%Message.ToolCall{name: "t3", id: "3", args: %{}}]),
+        Message.tool(large_content, "3"),
+        Message.human("continue")
+      ]
+
+      summarizer = fn dropped -> "LLM summary of #{length(dropped)} messages" end
+
+      compacted =
+        ContextCompaction.compact_if_needed(messages, max_bytes: 12_000, summarizer: summarizer)
+
+      notice = Enum.at(compacted, 1)
+      assert String.contains?(notice.content, "LLM summary of")
+    end
+
     test "preserves at least min_rounds_to_keep" do
       large_content = String.duplicate("x", 5_000)
 
