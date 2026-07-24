@@ -430,6 +430,10 @@ defmodule LangEx.Graph.Pregel do
 
   defp emit_node_end({:interrupted, _, _}, _name, _opts), do: :ok
   defp emit_node_end({:graph_error, _}, _name, _opts), do: :ok
+
+  defp emit_node_end({:__subgraph_state__, inner}, name, opts),
+    do: emit_node_end(inner, name, opts)
+
   defp emit_node_end(result, name, opts), do: emit(opts, {:node_end, name, result})
 
   defp reduce_task_result(_task_result, {:failed, _reason} = halt, _reducers), do: halt
@@ -499,7 +503,7 @@ defmodule LangEx.Graph.Pregel do
        do: {error, metadata}
 
   defp finalize_node_call(result, node_name, state, reducers, opts, metadata) do
-    emit(opts, {:node_end, node_name, result})
+    emit_node_end(result, node_name, opts)
     {merge_node_result(result, state, reducers, []), metadata}
   end
 
@@ -690,6 +694,11 @@ defmodule LangEx.Graph.Pregel do
   defp settle_shutdown(late_result, timeout, name),
     do: settle_attempt(late_result, nil, timeout, name)
 
+  # A subgraph inherits the parent's full state as its input, so its final
+  # state already contains everything it started with. The result is tagged
+  # so the merge REPLACES shared keys instead of re-applying reducers —
+  # re-reducing would double-apply every inherited value (an append-reducer
+  # key would gain a full duplicate of the inherited history per invocation).
   defp execute_node_value(%Compiled{} = subgraph, name, state, opts) do
     Process.delete(:lang_ex_parent_goto)
 
@@ -701,6 +710,7 @@ defmodule LangEx.Graph.Pregel do
     :lang_ex_parent_goto
     |> Process.delete()
     |> attach_parent_goto(result)
+    |> then(&{:__subgraph_state__, &1})
   end
 
   defp execute_node_value(fun, _name, state, opts) when is_function(fun),
@@ -840,6 +850,17 @@ defmodule LangEx.Graph.Pregel do
 
   defp dispatch_node_fn({:arity, 2}, fun, state, context), do: fun.(state, context)
   defp dispatch_node_fn({:arity, 1}, fun, state, _context), do: fun.(state)
+
+  defp merge_node_result(
+         {:__subgraph_state__, %Command{update: final, goto: goto}},
+         state,
+         _reducers,
+         cmds
+       ),
+       do: {Map.merge(state, final), cmds ++ List.wrap(goto)}
+
+  defp merge_node_result({:__subgraph_state__, final}, state, _reducers, cmds),
+    do: {Map.merge(state, final), cmds}
 
   defp merge_node_result(%Command{update: update, goto: goto}, state, reducers, cmds) do
     {State.apply_update(state, update, reducers), cmds ++ List.wrap(goto)}
