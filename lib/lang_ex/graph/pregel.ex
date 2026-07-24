@@ -949,9 +949,14 @@ defmodule LangEx.Graph.Pregel do
 
   defp remaining_tokens(_state, _opts), do: :skip
 
+  # Cached prompt tokens count toward the budget: with provider prompt
+  # caching enabled, :input_tokens is only the uncached tail, so a budget
+  # ignoring cache reads/writes would never trigger.
   defp used_tokens(%{llm_usage: %{} = usage}),
     do:
-      number(usage[:total_tokens]) + number(usage[:input_tokens]) + number(usage[:output_tokens])
+      number(usage[:total_tokens]) + number(usage[:input_tokens]) +
+        number(usage[:output_tokens]) + number(usage[:cache_creation_input_tokens]) +
+        number(usage[:cache_read_input_tokens])
 
   defp used_tokens(_state), do: 0
 
