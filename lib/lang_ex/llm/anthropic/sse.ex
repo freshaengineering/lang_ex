@@ -36,7 +36,7 @@ defmodule LangEx.LLM.Anthropic.SSE do
         %Message.ToolCall{name: tc.name, id: tc.id, args: decode_tool_args(state.tool_json[idx])}
       end)
 
-    ai = Message.ai(text, tool_calls: tool_calls)
+    ai = Message.ai(text, tool_calls: tool_calls, thinking: presence(thinking))
     usage = state.usage |> extract_usage() |> Map.put(:thinking, thinking)
     {:ok, ai, usage}
   end
@@ -131,6 +131,9 @@ defmodule LangEx.LLM.Anthropic.SSE do
     do: update_in(state, [:tool_json, idx], &((&1 || "") <> json))
 
   defp apply_block_delta(_, _idx, state), do: state
+
+  defp presence(""), do: nil
+  defp presence(text), do: text
 
   defp sorted_concat(indexed_map) do
     indexed_map
