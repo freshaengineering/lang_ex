@@ -145,4 +145,62 @@ defmodule LangEx.Checkpointer.PostgresIntegrationTest do
       assert %{results: [{"a", :yes}]} = result
     end
   end
+
+  describe "blob dedup" do
+    import Ecto.Query
+
+    test "a large unchanged value is stored once per thread and round-trips" do
+      thread = thread_id("blob")
+      big = String.duplicate("t", 40_000)
+
+      for step <- 0..2 do
+        :ok =
+          Postgres.save(
+            config(thread),
+            checkpoint(thread, state: %{tool_specs: big, step: step}, step: step)
+          )
+      end
+
+      blob_rows =
+        LangEx.Checkpointer.Postgres.BlobSchema
+        |> where([b], b.thread_id == ^thread)
+        |> IntegrationRepo.all()
+
+      assert length(blob_rows) == 1
+
+      assert {:ok, %Checkpoint{state: %{tool_specs: ^big, step: 2}}} =
+               Postgres.load(config(thread))
+
+      assert [%Checkpoint{state: %{tool_specs: ^big}} | _] =
+               Postgres.list(config(thread))
+    end
+
+    test "delete_thread removes the thread's blobs" do
+      thread = thread_id("blob-del")
+      big = String.duplicate("d", 40_000)
+
+      :ok = Postgres.save(config(thread), checkpoint(thread, state: %{tool_specs: big}, step: 0))
+      :ok = Postgres.delete_thread(config(thread))
+
+      assert [] =
+               LangEx.Checkpointer.Postgres.BlobSchema
+               |> where([b], b.thread_id == ^thread)
+               |> IntegrationRepo.all()
+    end
+
+    test "blob_threshold: :infinity stores everything inline" do
+      thread = thread_id("blob-inline")
+      big = String.duplicate("i", 40_000)
+      cfg = config(thread) ++ [blob_threshold: :infinity]
+
+      :ok = Postgres.save(cfg, checkpoint(thread, state: %{tool_specs: big}, step: 0))
+
+      assert [] =
+               LangEx.Checkpointer.Postgres.BlobSchema
+               |> where([b], b.thread_id == ^thread)
+               |> IntegrationRepo.all()
+
+      assert {:ok, %Checkpoint{state: %{tool_specs: ^big}}} = Postgres.load(cfg)
+    end
+  end
 end
