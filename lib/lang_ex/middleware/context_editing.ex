@@ -10,6 +10,13 @@ defmodule LangEx.Middleware.ContextEditing do
   once a result is replaced by the short placeholder it falls under the
   threshold and is left alone.
 
+  Edits are batched behind `:trigger_at_chars`: rewriting history invalidates
+  the provider's prompt-cache prefix (a cache write costs ~12x a cache read
+  on Anthropic), so clearing a little every turn pays that invalidation
+  repeatedly. Instead the conversation is left untouched until its total
+  content size crosses the trigger, then every eligible result is cleared in
+  one pass — rare invalidations, large reclaim.
+
   No LLM call — cheap, deterministic context recovery. Composes with
   `LangEx.Middleware.Summarization`; typically you reach for one or the
   other.
@@ -19,6 +26,8 @@ defmodule LangEx.Middleware.ContextEditing do
   - `:keep_last` - most recent tool results left untouched (default `3`)
   - `:clear_at_chars` - only results larger than this are cleared
     (default `4_000`)
+  - `:trigger_at_chars` - no editing until the total content size of the
+    conversation exceeds this (default `100_000`; `0` edits every turn)
   - `:placeholder` - replacement content for cleared results
   """
 
@@ -27,6 +36,7 @@ defmodule LangEx.Middleware.ContextEditing do
 
   @default_keep_last 3
   @default_clear_at 4_000
+  @default_trigger_at 100_000
   @default_placeholder "[cleared: earlier tool output elided to save context]"
 
   @doc "Builds a context-editing middleware. See the module doc for options."
@@ -38,14 +48,35 @@ defmodule LangEx.Middleware.ContextEditing do
   defp hook(opts) do
     keep_last = Keyword.get(opts, :keep_last, @default_keep_last)
     clear_at = Keyword.get(opts, :clear_at_chars, @default_clear_at)
+    trigger_at = Keyword.get(opts, :trigger_at_chars, @default_trigger_at)
     placeholder = Keyword.get(opts, :placeholder, @default_placeholder)
 
     fn state ->
       state.messages
-      |> edit(keep_last, clear_at, placeholder)
+      |> apply_when_triggered(
+        triggered?(state.messages, trigger_at),
+        keep_last,
+        clear_at,
+        placeholder
+      )
       |> persist(state.messages)
     end
   end
+
+  defp apply_when_triggered(messages, false, _keep_last, _clear_at, _placeholder), do: messages
+
+  defp apply_when_triggered(messages, true, keep_last, clear_at, placeholder),
+    do: edit(messages, keep_last, clear_at, placeholder)
+
+  defp triggered?(messages, trigger_at) do
+    messages
+    |> Enum.map(&content_size/1)
+    |> Enum.sum()
+    |> Kernel.>=(trigger_at)
+  end
+
+  defp content_size(%{content: c}) when is_binary(c), do: byte_size(c)
+  defp content_size(_message), do: 0
 
   defp edit(messages, keep_last, clear_at, placeholder) do
     clearable = clearable_positions(messages, keep_last)

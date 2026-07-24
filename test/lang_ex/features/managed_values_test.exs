@@ -116,5 +116,35 @@ defmodule LangEx.Features.ManagedValuesTest do
       assert [{100, false}, {60, false}, {20, false}, {0, true}] = result.rounds
       refute Map.has_key?(result, :remaining_tokens)
     end
+
+    test "cached prompt tokens count toward the budget" do
+      {:ok, result} =
+        Graph.new(
+          llm_usage: {%{}, &LangEx.LLM.ChatModel.merge_usage/2},
+          rounds: {[], &Kernel.++/2},
+          counter: {0, fn _old, new -> new end}
+        )
+        |> Graph.add_node(:spend, fn state ->
+          %{
+            counter: state.counter + 1,
+            rounds: [{state.remaining_tokens, state.is_last_step}],
+            llm_usage: %{
+              input_tokens: 5,
+              output_tokens: 5,
+              cache_creation_input_tokens: 60,
+              cache_read_input_tokens: 30
+            }
+          }
+        end)
+        |> Graph.add_edge(:__start__, :spend)
+        |> Graph.add_conditional_edges(:spend, fn
+          %{counter: c} when c >= 3 -> :__end__
+          _ -> :spend
+        end)
+        |> Graph.compile()
+        |> LangEx.invoke(%{}, recursion_limit: 100, token_budget: 150)
+
+      assert [{150, false}, {50, false}, {0, true}] = result.rounds
+    end
   end
 end

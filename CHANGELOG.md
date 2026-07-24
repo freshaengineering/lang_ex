@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.11.3
+
+### Run budgets — cached tokens count
+
+- `token_budget` accounting now includes `cache_creation_input_tokens` and
+  `cache_read_input_tokens`. With provider prompt caching enabled,
+  `:input_tokens` is only the uncached tail of each request, so a budget
+  ignoring cache tokens effectively never triggered.
+
+### Middleware.ContextEditing — batched, cache-aware editing
+
+- New `:trigger_at_chars` option (default `100_000`): the conversation is
+  left untouched until its total content size crosses the trigger, then every
+  eligible tool result is cleared in one pass. Editing a little every turn
+  invalidated the provider prompt-cache prefix each round (a cache write
+  costs ~12x a cache read on Anthropic); batching makes invalidations rare
+  and the reclaim large. Set `trigger_at_chars: 0` for the previous
+  every-turn behaviour.
+
 ## v0.11.2
 
 ### Tool.Node — deep-merge parallel accumulator updates
