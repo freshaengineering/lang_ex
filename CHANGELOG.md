@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.11.2
+
+### Tool.Node — deep-merge parallel accumulator updates
+
+- When several tool calls run in parallel in one round and each returns a
+  `%LangEx.Command{}` writing the **same map-valued state key** (e.g. a shared
+  cache), `LangEx.Tool.Node` now **deep-merges** those maps into a union
+  instead of keeping only the earliest and logging a conflict. Plain maps are
+  accumulators, so every call's entries survive. Diverging **scalar** keys
+  (e.g. two handoffs both setting `:active_agent`) keep the earliest-wins +
+  warning behavior, and structs are never merged.
+
+## v0.11.1
+
+### Checkpoint — resilient atom decoding
+
+- `LangEx.Checkpoint.Serializer.decode/1` no longer crashes when a checkpointed
+  **value atom** is not loaded in the current VM. It prefers an existing atom
+  and falls back to creating one, so a thread resumes correctly in a fresh VM
+  or after a deploy (previously `binary_to_existing_atom` raised
+  `ArgumentError`). Module names and struct field keys stay strict — they must
+  already exist to rebuild the value, which still bounds atom-table growth from
+  structural names.
+
 ## v0.11.0
 
 ### Middleware — composable agent hooks

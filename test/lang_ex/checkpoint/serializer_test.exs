@@ -71,13 +71,14 @@ defmodule LangEx.Checkpoint.SerializerTest do
              } = round_trip(cp)
     end
 
-    test "decoding never creates new atoms" do
-      payload =
-        Jason.encode!(%{"~a" => "definitely_not_an_existing_atom_#{System.unique_integer()}"})
+    test "value atoms round-trip even when not loaded yet (fresh-VM / post-deploy resume)" do
+      name = "langex_unloaded_value_atom_#{System.unique_integer([:positive])}"
 
-      assert_raise ArgumentError, fn ->
-        payload |> Jason.decode!() |> Serializer.decode()
-      end
+      decoded =
+        %{"~a" => name} |> Jason.encode!() |> Jason.decode!() |> Serializer.decode()
+
+      assert is_atom(decoded)
+      assert Atom.to_string(decoded) == name
     end
 
     test "functions are rejected at encode time" do

@@ -223,10 +223,11 @@ defmodule LangEx.Tool.Node do
     replies ++ rest
   end
 
-  # Parallel tool calls in one batch can each write state. When two write
-  # different values to the same key (e.g. two handoffs both setting
-  # `:active_agent`), the earliest call wins and the conflict is logged —
-  # a single super-step cannot honour two divergent routings at once.
+  # Parallel tool calls in one batch can each write state. Map-valued keys
+  # are accumulators (e.g. a shared cache): they deep-merge so every call's
+  # entries survive. Scalar keys that diverge (e.g. two handoffs both setting
+  # `:active_agent`) cannot both win in a single super-step, so the earliest
+  # call wins and the conflict is logged.
   defp merge_command_updates(commands, messages_key) do
     Enum.reduce(commands, %{}, fn %Command{update: update}, acc ->
       update
@@ -238,6 +239,11 @@ defmodule LangEx.Tool.Node do
   defp merge_into(update, acc), do: Map.merge(acc, update, &keep_earliest/3)
 
   defp keep_earliest(_key, existing, existing), do: existing
+
+  defp keep_earliest(_key, existing, dropped)
+       when is_map(existing) and is_map(dropped) and
+              not is_struct(existing) and not is_struct(dropped),
+       do: Map.merge(existing, dropped, &keep_earliest/3)
 
   defp keep_earliest(key, existing, dropped) do
     Logger.warning(

@@ -510,6 +510,51 @@ defmodule LangEx.Tool.NodeTest do
                node_fn.(state_with_tool_calls([first, second]))
     end
 
+    test "map-valued parallel updates deep-merge into a union" do
+      cache_tool = fn suffix, entry ->
+        %Tool{
+          name: "cache_#{suffix}",
+          description: "Writes a cache entry",
+          parameters: %{},
+          function: fn _args, %{tool_call_id: id} ->
+            %LangEx.Command{update: %{tool_cache: entry, messages: [Message.tool("ok", id)]}}
+          end
+        }
+      end
+
+      node_fn =
+        ToolNode.node([cache_tool.("x", %{"k1" => "v1"}), cache_tool.("y", %{"k2" => "v2"})])
+
+      first = %Message.ToolCall{name: "cache_x", id: "c1", args: %{}}
+      second = %Message.ToolCall{name: "cache_y", id: "c2", args: %{}}
+
+      assert %LangEx.Command{update: %{tool_cache: %{"k1" => "v1", "k2" => "v2"}}} =
+               node_fn.(state_with_tool_calls([first, second]))
+    end
+
+    @tag capture_log: true
+    test "map-valued parallel updates keep the earliest on a leaf-key conflict" do
+      cache_tool = fn suffix, value ->
+        %Tool{
+          name: "cache_#{suffix}",
+          description: "Writes the same cache key",
+          parameters: %{},
+          function: fn _args, %{tool_call_id: id} ->
+            %LangEx.Command{
+              update: %{tool_cache: %{"k" => value}, messages: [Message.tool("ok", id)]}
+            }
+          end
+        }
+      end
+
+      node_fn = ToolNode.node([cache_tool.("x", "first"), cache_tool.("y", "second")])
+      first = %Message.ToolCall{name: "cache_x", id: "c1", args: %{}}
+      second = %Message.ToolCall{name: "cache_y", id: "c2", args: %{}}
+
+      assert %LangEx.Command{update: %{tool_cache: %{"k" => "first"}}} =
+               node_fn.(state_with_tool_calls([first, second]))
+    end
+
     test "tool replies lead, extra command messages follow (provider adjacency)" do
       briefing = fn target ->
         %Tool{
