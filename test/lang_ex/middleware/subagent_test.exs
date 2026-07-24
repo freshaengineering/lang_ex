@@ -125,5 +125,48 @@ defmodule LangEx.Middleware.SubagentTest do
 
       assert result =~ "Subagent log-miner failed: "
     end
+
+    test "inherit_keys seeds the child's state so state-derived tools materialize" do
+      test_pid = self()
+
+      stub(LangEx.LLM.Anthropic, :chat_with_usage, fn _messages, _opts ->
+        {:ok, Message.ai("done"), %{input_tokens: 1, output_tokens: 1}}
+      end)
+
+      middleware =
+        Subagent.new(
+          subagents: [
+            %{
+              name: "prober",
+              description: "Probes with inherited tools.",
+              system_prompt: "You probe.",
+              inherit_keys: [:tool_specs, :session],
+              tools: fn child_state ->
+                send(test_pid, {:child_state_keys, child_state |> Map.keys() |> Enum.sort()})
+                []
+              end
+            }
+          ],
+          provider: LangEx.LLM.Anthropic,
+          model: "claude-sonnet-5"
+        )
+
+      [%Tool{function: function}] = middleware.tools
+
+      %Command{} =
+        function.(
+          %{"description" => "probe", "subagent_type" => "prober"},
+          %{
+            state: %{tool_specs: [:spec], session: %{token: "t"}, secret: "hidden"},
+            store: nil,
+            tool_call_id: "call_9"
+          }
+        )
+
+      assert_received {:child_state_keys, keys}
+      assert :tool_specs in keys
+      assert :session in keys
+      refute :secret in keys
+    end
   end
 end
