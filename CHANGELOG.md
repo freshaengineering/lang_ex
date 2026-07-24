@@ -1,5 +1,50 @@
 # Changelog
 
+## v0.12.0
+
+### Subgraphs — replace semantics for shared keys
+
+- A subgraph's final state now REPLACES the parent's values for every key it
+  carries instead of re-applying reducers. A subgraph inherits the parent's
+  state as input, so reducer re-application double-applied everything
+  inherited — an append-reducer `:messages` key gained a full duplicate of
+  the inherited history per subgraph invocation.
+
+### Prebuilt agent — new middleware
+
+- `LangEx.Middleware.Subagent` — a `task` tool that spawns ephemeral,
+  context-isolated child agents (own prompt/tools/model); only the child's
+  final report and token usage return to the parent.
+- `LangEx.Middleware.Filesystem` — a state-backed virtual workspace
+  (`ls`/`read_file`/`write_file`/`edit_file`/`glob`/`grep`) so the agent can
+  offload large artifacts out of chat history; files persist via
+  checkpointing and survive summarization.
+- `LangEx.Middleware.ModelFallback` — when the primary model call fails,
+  retries the same request against an ordered list of fallback models.
+
+### Evaluation
+
+- `LangEx.Eval.Trajectory` — extract tool-call trajectories from message
+  histories or checkpoints and match them against expected trajectories
+  (`:strict` / `:unordered` / `:subset`, partial-args matching).
+- `LangEx.Eval.Judge` — LLM-as-judge scoring of trajectories/transcripts via
+  `ChatModel.structured/2`.
+
+### Checkpointer — content-addressed blob dedup (Postgres)
+
+- State values above `:blob_threshold` (default 16KB) are stored once per
+  `(thread_id, content_hash)` in `lang_ex_checkpoint_blobs` and referenced
+  from checkpoint rows — large values that never change between super-steps
+  (e.g. a tool catalog) are written once per thread instead of every step.
+  Migration V3. `blob_threshold: :infinity` restores inline storage.
+
+### LLM — auditable thinking
+
+- `%Message.AI{}` gains a `:thinking` field; the Anthropic adapter sets it
+  to the reply's extended-thinking text (never echoed back to the API).
+  Previously the text lived only in `usage.thinking`, where each call's
+  merge overwrote it.
+
 ## v0.11.3
 
 ### Run budgets — cached tokens count
