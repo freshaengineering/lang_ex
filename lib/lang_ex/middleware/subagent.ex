@@ -23,6 +23,10 @@ defmodule LangEx.Middleware.Subagent do
     - `:system_prompt` (required) - the child agent's system prompt
     - `:tools` - tools for the child, a list or `fn state -> tools end`
       (default `[]`)
+    - `:inherit_keys` - parent-state keys copied into the child's input
+      state (default `[]`) — lets state-derived child tools (sessions,
+      serialized tool specs, time windows) materialize inside the child
+      without exposing the parent conversation
     - `:provider` / `:model` - override the middleware-level defaults
     - `:recursion_limit` - max child super-steps (default `24`)
   - `:provider` / `:model` - defaults for children without their own
@@ -74,7 +78,8 @@ defmodule LangEx.Middleware.Subagent do
       tools: Map.get(subagent, :tools, []),
       provider: Map.get(subagent, :provider, Keyword.get(opts, :provider)),
       model: Map.get(subagent, :model, Keyword.get(opts, :model)),
-      recursion_limit: Map.get(subagent, :recursion_limit, @default_recursion_limit)
+      recursion_limit: Map.get(subagent, :recursion_limit, @default_recursion_limit),
+      inherit_keys: Map.get(subagent, :inherit_keys, [])
     }
   end
 
@@ -115,20 +120,32 @@ defmodule LangEx.Middleware.Subagent do
     }
   end
 
-  defp run_task(%{"description" => brief, "subagent_type" => type}, %{tool_call_id: id}, specs) do
+  defp run_task(
+         %{"description" => brief, "subagent_type" => type},
+         %{tool_call_id: id, state: parent_state},
+         specs
+       ) do
     specs
     |> Enum.find(&(&1.name == type))
-    |> launch(brief, id, type, specs)
+    |> launch(brief, id, type, specs, parent_state)
   end
 
-  defp launch(nil, _brief, _id, type, specs),
+  defp launch(nil, _brief, _id, type, specs, _parent_state),
     do: "Unknown subagent_type: #{type}. Available: #{Enum.map_join(specs, ", ", & &1.name)}"
 
-  defp launch(spec, brief, id, _type, _specs) do
+  defp launch(spec, brief, id, _type, _specs, parent_state) do
     spec
     |> child_graph()
-    |> LangEx.invoke(%{messages: [Message.human(brief)]}, recursion_limit: spec.recursion_limit)
+    |> LangEx.invoke(child_input(spec, brief, parent_state),
+      recursion_limit: spec.recursion_limit
+    )
     |> child_reply(spec, id)
+  end
+
+  defp child_input(spec, brief, parent_state) do
+    parent_state
+    |> Map.take(spec.inherit_keys)
+    |> Map.put(:messages, [Message.human(brief)])
   end
 
   # Compiled lazily per call: children hold no state worth caching and a
