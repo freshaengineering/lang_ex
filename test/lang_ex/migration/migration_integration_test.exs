@@ -15,7 +15,7 @@ defmodule LangEx.MigrationIntegrationTest do
   end
 
   test "current_version covers every registered migration" do
-    assert LangEx.Migration.current_version() == 2
+    assert LangEx.Migration.current_version() == 3
   end
 
   test "down and up cycle leaves working tables" do

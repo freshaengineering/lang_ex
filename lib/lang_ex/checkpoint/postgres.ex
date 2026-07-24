@@ -9,6 +9,13 @@ if Code.ensure_loaded?(Ecto) do
     State is encoded with `LangEx.Checkpoint.Serializer`, so structs, atoms,
     and tuples survive the round-trip exactly.
 
+    Large state values (above `:blob_threshold` bytes, default 16KB) are
+    stored once per `(thread_id, content_hash)` in `lang_ex_checkpoint_blobs`
+    and referenced from the checkpoint row — a value that never changes
+    between super-steps (e.g. a big tool catalog) is written once per thread
+    instead of into every checkpoint. Requires migration V3. Set
+    `blob_threshold: :infinity` in the config to store everything inline.
+
     ## Config
 
     The `:repo` key must point to an Ecto.Repo module:
@@ -23,18 +30,29 @@ if Code.ensure_loaded?(Ecto) do
 
     alias LangEx.Checkpoint
     alias LangEx.Checkpoint.Serializer
+    alias LangEx.Checkpointer.Postgres.BlobSchema
+    alias LangEx.Checkpointer.Postgres.Blobs
     alias LangEx.Checkpointer.Postgres.Schema
+
+    @default_blob_threshold 16_384
 
     @impl true
     def save(config, %Checkpoint{} = cp) do
       repo = Keyword.fetch!(config, :repo)
 
+      {slim_state, blobs} =
+        cp.state
+        |> Serializer.encode()
+        |> Blobs.split(Keyword.get(config, :blob_threshold, @default_blob_threshold))
+
+      insert_blobs(repo, cp.thread_id, blobs)
+
       attrs = %{
         thread_id: cp.thread_id,
         checkpoint_id: cp.checkpoint_id,
         parent_id: cp.parent_id,
-        state: Serializer.encode(cp.state),
-        next_nodes: Enum.map(cp.next_nodes, &Serializer.encode/1),
+        state: slim_state,
+        next_nodes: Enum.map(cp.next_nodes || [], &Serializer.encode/1),
         step: cp.step,
         metadata: Serializer.encode(cp.metadata || %{}),
         pending_interrupts: encode_interrupts(cp.pending_interrupts),
@@ -64,7 +82,7 @@ if Code.ensure_loaded?(Ecto) do
       |> order_by([c], desc: c.created_at, desc: c.step, desc: c.checkpoint_id)
       |> limit(1)
       |> repo.one()
-      |> to_checkpoint()
+      |> to_checkpoint(repo)
     end
 
     @impl true
@@ -78,7 +96,7 @@ if Code.ensure_loaded?(Ecto) do
       |> order_by([c], desc: c.created_at, desc: c.step, desc: c.checkpoint_id)
       |> limit(^row_limit)
       |> repo.all()
-      |> Enum.map(&schema_to_checkpoint/1)
+      |> Enum.map(&schema_to_checkpoint(&1, repo))
     end
 
     @impl true
@@ -88,6 +106,10 @@ if Code.ensure_loaded?(Ecto) do
 
       Schema
       |> where([c], c.thread_id == ^thread_id)
+      |> repo.delete_all()
+
+      BlobSchema
+      |> where([b], b.thread_id == ^thread_id)
       |> repo.delete_all()
 
       :ok
@@ -112,6 +134,11 @@ if Code.ensure_loaded?(Ecto) do
         |> where([c], c.created_at < ^older_than)
         |> repo.delete_all()
 
+      live_threads = from(c in Schema, where: c.thread_id == parent_as(:blob).thread_id)
+
+      from(b in BlobSchema, as: :blob, where: not exists(live_threads))
+      |> repo.delete_all()
+
       {:ok, count}
     end
 
@@ -123,15 +150,45 @@ if Code.ensure_loaded?(Ecto) do
     defp handle_insert({:ok, _row}), do: :ok
     defp handle_insert({:error, changeset}), do: {:error, changeset}
 
-    defp to_checkpoint(nil), do: :none
-    defp to_checkpoint(%Schema{} = row), do: {:ok, schema_to_checkpoint(row)}
+    defp insert_blobs(_repo, _thread_id, blobs) when blobs == %{}, do: :ok
 
-    defp schema_to_checkpoint(%Schema{} = row) do
+    defp insert_blobs(repo, thread_id, blobs) do
+      rows =
+        Enum.map(blobs, fn {hash, value} ->
+          %{thread_id: thread_id, hash: hash, value: %{"v" => value}}
+        end)
+
+      repo.insert_all(BlobSchema, rows,
+        on_conflict: :nothing,
+        conflict_target: [:thread_id, :hash]
+      )
+
+      :ok
+    end
+
+    defp fetch_blobs(_repo, _thread_id, []), do: %{}
+
+    defp fetch_blobs(repo, thread_id, hashes) do
+      BlobSchema
+      |> where([b], b.thread_id == ^thread_id)
+      |> where([b], b.hash in ^hashes)
+      |> select([b], {b.hash, b.value})
+      |> repo.all()
+      |> Map.new(fn {hash, %{"v" => value}} -> {hash, value} end)
+    end
+
+    defp resolve_state(encoded, repo, thread_id),
+      do: Blobs.resolve(encoded, &fetch_blobs(repo, thread_id, &1))
+
+    defp to_checkpoint(nil, _repo), do: :none
+    defp to_checkpoint(%Schema{} = row, repo), do: {:ok, schema_to_checkpoint(row, repo)}
+
+    defp schema_to_checkpoint(%Schema{} = row, repo) do
       %Checkpoint{
         thread_id: row.thread_id,
         checkpoint_id: row.checkpoint_id,
         parent_id: row.parent_id,
-        state: Serializer.decode(row.state),
+        state: row.state |> resolve_state(repo, row.thread_id) |> Serializer.decode(),
         next_nodes: Enum.map(row.next_nodes || [], &decode_entry/1),
         step: row.step,
         metadata: Serializer.decode(row.metadata || %{}),
