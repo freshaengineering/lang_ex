@@ -26,13 +26,21 @@ defmodule LangEx.Message do
   end
 
   defmodule AI do
-    @moduledoc "A message authored by the LLM, optionally carrying tool calls."
+    @moduledoc """
+    A message authored by the LLM, optionally carrying tool calls.
+
+    `:thinking` holds the extended-thinking text that produced this reply
+    (nil when thinking was disabled or the provider does not expose it) —
+    per-reply reasoning stays auditable instead of being lost in usage
+    accounting. Providers are NOT sent this field back on subsequent turns.
+    """
     @derive Jason.Encoder
-    defstruct [:content, :id, tool_calls: []]
+    defstruct [:content, :id, :thinking, tool_calls: []]
 
     @type t :: %__MODULE__{
             content: String.t() | nil,
             id: String.t() | nil,
+            thinking: String.t() | nil,
             tool_calls: [LangEx.Message.ToolCall.t()]
           }
   end

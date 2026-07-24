@@ -33,4 +33,30 @@ defmodule LangEx.LLM.Anthropic.SSETest do
 
     refute_received {:token, _}
   end
+
+  @thinking_body """
+  data: {"type":"message_start","message":{"usage":{"input_tokens":5}}}
+
+  data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}
+
+  data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"pondering..."}}
+
+  data: {"type":"content_block_start","index":1,"content_block":{"type":"text"}}
+
+  data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Answer"}}
+
+  data: {"type":"message_delta","usage":{"output_tokens":3}}
+  """
+
+  test "thinking text lands on the AI message (and stays out of the API echo path)" do
+    assert {:ok, %Message.AI{content: "Answer", thinking: "pondering..."}, usage} =
+             SSE.parse_response(@thinking_body, SSE.callbacks(nil, nil))
+
+    assert usage.thinking == "pondering..."
+  end
+
+  test "a reply without thinking carries thinking: nil" do
+    assert {:ok, %Message.AI{thinking: nil}, _usage} =
+             SSE.parse_response(@sse_body, SSE.callbacks(nil, nil))
+  end
 end
