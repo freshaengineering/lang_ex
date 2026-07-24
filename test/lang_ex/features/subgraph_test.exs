@@ -26,6 +26,28 @@ defmodule LangEx.Features.SubgraphTest do
       assert %{value: 14, label: "done"} = result
     end
 
+    test "a subgraph's inherited reducer-key values are not re-applied to the parent" do
+      inner =
+        Graph.new(items: {[], &Kernel.++/2})
+        |> Graph.add_node(:add_x, fn _state -> %{items: ["x"]} end)
+        |> Graph.add_edge(:__start__, :add_x)
+        |> Graph.add_edge(:add_x, :__end__)
+        |> Graph.compile()
+
+      outer =
+        Graph.new(items: {[], &Kernel.++/2}, label: "")
+        |> Graph.add_node(:seed, fn _state -> %{items: ["a"], label: "kept"} end)
+        |> Graph.add_node(:sub, inner)
+        |> Graph.add_edge(:__start__, :seed)
+        |> Graph.add_edge(:seed, :sub)
+        |> Graph.add_edge(:sub, :__end__)
+        |> Graph.compile()
+
+      {:ok, result} = LangEx.invoke(outer, %{})
+
+      assert %{items: ["a", "x"], label: "kept"} = result
+    end
+
     test "interrupts inside a subgraph pause the parent and resume through it" do
       inner =
         Graph.new(value: 0, approved: nil)
