@@ -15,7 +15,7 @@ defmodule LangEx.Config do
 
   @builtin_defaults %{
     openai: %{env_key: "OPENAI_API_KEY", default_model: "gpt-4o"},
-    anthropic: %{env_key: "ANTHROPIC_API_KEY", default_model: "claude-sonnet-4-20250514"},
+    anthropic: %{env_key: "ANTHROPIC_API_KEY", default_model: "claude-sonnet-5"},
     gemini: %{env_key: "GEMINI_API_KEY", default_model: "gemini-2.5-flash"}
   }
 

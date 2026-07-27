@@ -24,7 +24,7 @@ defmodule LangEx.LLM.Anthropic do
   model requests tool use. Use `LangEx.Tool.Node` to execute them.
 
       LangEx.LLM.Anthropic.chat(messages,
-        model: "claude-sonnet-4-20250514",
+        model: "claude-sonnet-5",
         tools: [%LangEx.Tool{name: "get_weather", ...}]
       )
 
