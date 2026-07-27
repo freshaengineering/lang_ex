@@ -1,5 +1,21 @@
 # Changelog
 
+## v0.12.1
+
+### Resilient — retries keep the caller's provider opts
+
+- `LangEx.LLM.Resilient` rebuilt only its own retry config when retrying, so
+  every retried call lost `:model`, `:tools`, `:max_tokens`, and streaming
+  callbacks and fell back to the provider's default model with no tools. A
+  single transient 429/5xx silently downgraded the call; once the default
+  model was retired it became a hard 404. Retries now reuse the original opts.
+
+### Anthropic — default model updated
+
+- The Anthropic default model is now `claude-sonnet-5`;
+  `claude-sonnet-4-20250514` was retired by Anthropic and returns
+  404 `not_found_error`.
+
 ## v0.12.0
 
 ### Subgraphs — replace semantics for shared keys

@@ -44,6 +44,42 @@ defmodule LangEx.LLM.ResilientTest do
                )
     end
 
+    test "retries with the caller's provider opts intact" do
+      test_pid = self()
+      call_count = :counters.new(1, [:atomics])
+
+      stub(LangEx.LLM.Anthropic, :chat_with_usage, fn _msgs, opts ->
+        n = :counters.get(call_count, 1)
+        :counters.add(call_count, 1, 1)
+        send(test_pid, {:call_opts, n, opts})
+
+        case n do
+          0 -> {:error, {429, %{"error" => "rate limited"}}}
+          _ -> {:ok, Message.ai("recovered"), %{input_tokens: 5, output_tokens: 3}}
+        end
+      end)
+
+      tool = %LangEx.Tool{name: "respond", description: "d", parameters: %{}}
+
+      assert {:ok, %Message.AI{content: "recovered"}, _usage} =
+               LangEx.LLM.Resilient.chat_with_usage(
+                 LangEx.LLM.Anthropic,
+                 [Message.human("hi")],
+                 api_key: "test",
+                 model: "claude-sonnet-5",
+                 tools: [tool],
+                 max_tokens: 1024,
+                 max_retries: 2,
+                 retry_base_ms: 1
+               )
+
+      assert_receive {:call_opts, 1, retry_opts}
+      assert retry_opts[:model] == "claude-sonnet-5"
+      assert retry_opts[:tools] == [tool]
+      assert retry_opts[:max_tokens] == 1024
+      assert retry_opts[:api_key] == "test"
+    end
+
     test "calls fallback on final failure" do
       stub(LangEx.LLM.Anthropic, :chat_with_usage, fn _msgs, _opts ->
         {:error, {500, "server error"}}

@@ -68,7 +68,7 @@ defmodule LangEx.LLM.Resilient do
 
     provider
     |> call_provider(messages, provider_opts)
-    |> handle_chat_result(provider, messages, config, attempt, start)
+    |> handle_chat_result(provider, messages, config, opts, attempt, start)
   end
 
   defp split_resilient_opts(opts) do
@@ -93,13 +93,13 @@ defmodule LangEx.LLM.Resilient do
     {config, opts}
   end
 
-  defp handle_chat_result({:ok, ai, usage}, _provider, _messages, config, attempt, start) do
+  defp handle_chat_result({:ok, ai, usage}, _provider, _messages, config, _opts, attempt, start) do
     elapsed = System.monotonic_time(:millisecond) - start
     invoke_callback(config.on_success, [attempt, elapsed, ai, usage])
     {:ok, ai, Map.put(usage, :duration_ms, elapsed)}
   end
 
-  defp handle_chat_result({:error, reason}, provider, messages, config, attempt, start)
+  defp handle_chat_result({:error, reason}, provider, messages, config, opts, attempt, start)
        when attempt < config.max_retries do
     elapsed = System.monotonic_time(:millisecond) - start
 
@@ -109,39 +109,31 @@ defmodule LangEx.LLM.Resilient do
       provider,
       messages,
       config,
+      opts,
       attempt,
       elapsed
     )
   end
 
-  defp handle_chat_result({:error, reason}, _provider, _messages, config, attempt, start) do
+  defp handle_chat_result({:error, reason}, _provider, _messages, config, _opts, attempt, start) do
     elapsed = System.monotonic_time(:millisecond) - start
     invoke_callback(config.on_error, [attempt, elapsed, reason])
     apply_fallback(config.fallback, reason, elapsed)
   end
 
-  defp attempt_retry(true, reason, provider, messages, config, attempt, elapsed) do
+  # Retry with the caller's original opts — rebuilding from config would drop
+  # every provider opt (:model, :tools, :max_tokens, callbacks), silently
+  # downgrading retried calls to the provider's default model with no tools.
+  defp attempt_retry(true, reason, provider, messages, config, opts, attempt, elapsed) do
     wait = config.retry_base_ms * (attempt + 1)
     invoke_callback(config.on_retry, [attempt, elapsed, wait, reason])
     Process.sleep(wait)
-    chat_attempt(provider, messages, rebuild_opts(config), attempt + 1)
+    chat_attempt(provider, messages, opts, attempt + 1)
   end
 
-  defp attempt_retry(false, reason, _provider, _messages, config, attempt, elapsed) do
+  defp attempt_retry(false, reason, _provider, _messages, config, _opts, attempt, elapsed) do
     invoke_callback(config.on_error, [attempt, elapsed, reason])
     apply_fallback(config.fallback, reason, elapsed)
-  end
-
-  defp rebuild_opts(config) do
-    [
-      max_retries: config.max_retries,
-      retry_base_ms: config.retry_base_ms,
-      retryable?: config.retryable_fn,
-      on_success: config.on_success,
-      on_retry: config.on_retry,
-      on_error: config.on_error,
-      fallback: config.fallback
-    ]
   end
 
   defp invoke_callback(nil, _args), do: :ok

@@ -18,7 +18,7 @@ defmodule LangEx.LLM.ChatModel do
   ## Options
 
   - `:provider` - module implementing `LangEx.LLM` (explicit)
-  - `:model` - model string like `"gpt-4o"` or `"claude-sonnet-4-20250514"` (auto-resolves provider)
+  - `:model` - model string like `"gpt-4o"` or `"claude-sonnet-5"` (auto-resolves provider)
   - `:messages_key` - state key holding the message list (default: `:messages`)
   - `:usage_key` - state key accumulating token usage (default: `:llm_usage`);
     only written when the key exists in the graph state schema
