@@ -159,6 +159,22 @@ checkpoints" below for what changes and what old data keeps.
   them. This is what lets a reviewer answer a call in advance while the rest of
   the batch runs.
 
+### Examples
+
+- Five runnable scripts cover the new surface, all offline: per-branch fan-out
+  approvals, execution policy (scoped barriers, ephemeral keys, node defaults,
+  cache keys), thread lifecycle (provenance, pagination, copying, namespaced
+  delete), the agent middleware stack (approval with argument correction,
+  retry, budget, request overrides, run hooks), and encrypted checkpoints with
+  key rotation. `06_crash_recovery.exs` now also shows per-task durability.
+- The example checkpointer template keys storage on `{thread_id,
+  checkpoint_ns}`. A custom backend that keys on `thread_id` alone will hand a
+  parent graph its subgraph's checkpoints; the template shows the correct
+  shape, and `delete_thread/1` closing out a whole run tree depends on it.
+- `IncidentResponder` gained the session lifecycle operations a durable,
+  Postgres-backed deployment needs: an edit audit trail, branching, close-out,
+  and a retention job.
+
 ## v0.12.1
 
 ### Resilient — retries keep the caller's provider opts

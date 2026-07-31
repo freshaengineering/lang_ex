@@ -56,7 +56,10 @@ defmodule IncidentResponder do
     graph = Graph.build(checkpointer: checkpointer)
     config = build_config(session_id, opts)
 
-    case LangEx.invoke(graph, %Command{resume: message}, config: config, recursion_limit: @recursion_limit) do
+    case LangEx.invoke(graph, %Command{resume: message},
+           config: config,
+           recursion_limit: @recursion_limit
+         ) do
       {:interrupt, %{response: response}, _state} ->
         {:ok, response}
 
@@ -66,6 +69,57 @@ defmodule IncidentResponder do
       {:error, reason} ->
         {:error, reason}
     end
+  end
+
+  @doc """
+  Copies a session onto a new ID, leaving the original untouched.
+
+  Useful before a risky remediation: branch the incident, let the agent
+  explore "restart the database instead" on the copy, and keep the real
+  session resumable from where it was.
+  """
+  def branch_session(session_id, branch_id, opts \\ []) do
+    graph()
+    |> LangEx.copy_thread(branch_id, config: build_config(session_id, opts))
+    |> tag(branch_id)
+  end
+
+  @doc """
+  Returns the points where a human changed a session's state, newest
+  first — the audit trail for "who edited this incident, and when".
+  """
+  def edit_history(session_id, opts \\ []) do
+    LangEx.get_state_history(graph(),
+      config: build_config(session_id, opts),
+      source: [:update, :fork],
+      limit: Keyword.get(opts, :limit, 20)
+    )
+  end
+
+  @doc """
+  Deletes a session's checkpoints, including any subgraph namespaces
+  under it. Call when an incident is closed for good, or to satisfy a
+  data-removal request.
+  """
+  def close_session(session_id, opts \\ []) do
+    LangEx.delete_thread(graph(), config: build_config(session_id, opts))
+  end
+
+  @doc """
+  Enforces the checkpoint retention window across all sessions.
+
+  Run from a scheduled job. `:keep_latest` retains that many checkpoints
+  per session regardless of age, so trimming history never leaves a live
+  incident unresumable.
+  """
+  def enforce_retention(opts \\ []) do
+    days = Keyword.get(opts, :days, 30)
+
+    LangEx.Checkpointer.Postgres.prune(
+      [repo: Keyword.get(opts, :repo, @repo)],
+      older_than: DateTime.add(DateTime.utc_now(), -days, :day),
+      keep_latest: Keyword.get(opts, :keep_latest, 5)
+    )
   end
 
   @doc """
@@ -129,4 +183,11 @@ defmodule IncidentResponder do
   defp build_config(session_id, opts) do
     [thread_id: session_id, repo: Keyword.get(opts, :repo, @repo)]
   end
+
+  # Thread operations only need the compiled graph's checkpointer, not its
+  # nodes, so they can share one build.
+  defp graph, do: Graph.build(checkpointer: @checkpointer)
+
+  defp tag(:ok, branch_id), do: {:ok, branch_id}
+  defp tag({:error, reason}, _branch_id), do: {:error, reason}
 end

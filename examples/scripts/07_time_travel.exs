@@ -5,6 +5,11 @@
 # new checkpoint from any point, and invoking with `%{}` continues
 # from the edited state.
 #
+# Each checkpoint also records why it exists in `:source` — `:input` for
+# the run's input, `:step` for a super-step, `:update`/`:fork` for a
+# hand edit — so a history read months later is interpretable without
+# guessing from step numbers.
+#
 # Run: elixir examples/scripts/07_time_travel.exs
 
 Mix.install([{:lang_ex, path: Path.expand("../..", __DIR__)}])
@@ -26,7 +31,10 @@ defmodule TimeTravelDemo do
     graph
     |> LangEx.get_state_history(config: @config)
     |> Enum.each(fn cp ->
-      IO.puts("  step #{cp.step} #{cp.checkpoint_id} (parent: #{cp.parent_id || "-"})")
+      IO.puts(
+        "  step #{cp.step} #{cp.source} #{cp.checkpoint_id} (parent: #{cp.parent_id || "-"})"
+      )
+
       IO.puts("    state: #{inspect(cp.state)}")
     end)
 
