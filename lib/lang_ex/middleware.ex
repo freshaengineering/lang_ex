@@ -5,18 +5,25 @@ defmodule LangEx.Middleware do
   A middleware is a value — a `%LangEx.Middleware{}` carrying optional hook
   functions — so behaviours like summarization, context editing, planning,
   tool pre-selection, and completion gating compose without each one being
-  hardcoded into the agent. The agent runs every turn through the stack:
+  hardcoded into the agent. A run passes through the stack like this:
 
-      before_model (first → last)
-        → wrap_model_call (first middleware outermost)
-          → the LLM call
-        → after_model (last → first)
+      before_agent (first → last, once per run)
+        │
+        ├─ every turn:
+        │    before_model (first → last)
+        │      → wrap_model_call (first middleware outermost)
+        │        → the LLM call
+        │      → after_model (last → first)
+        │    before_tools (first → last, when tools were requested)
+        │      → wrap_tool_call (first middleware outermost, per call)
+        │
+      after_agent (last → first, once per run)
 
-  `after_model` runs in reverse so the stack unwinds symmetrically: the
-  middleware that saw the state last on the way in sees the result first on
-  the way out.
+  Hooks that run on the way out (`after_model`, `after_agent`) run in
+  reverse so the stack unwinds symmetrically: the middleware that saw the
+  state last on the way in sees the result first on the way out.
 
-  ## Hooks
+  ## Turn hooks
 
   - `:before_model` — `(state -> update)` run before the LLM call. Its
     update is applied to the working state (so the model sees it) and
@@ -27,9 +34,41 @@ defmodule LangEx.Middleware do
     `:__agent_jump__` to `:model` (loop again), `:tools`, or `:__end__` in
     the update to override the agent's routing — e.g. a completion gate that
     bounces an inadequate answer back for another pass.
-  - `:wrap_model_call` — `(request, next -> update)` wraps the LLM call. The
-    `request` is `%{messages: [...], tools: [...], state: map()}`; call
-    `next.(request)` (optionally with narrowed `:tools`) to run the model.
+  - `:wrap_model_call` — `(request, next -> update)` wraps the LLM call.
+    The `request` is a `%LangEx.Middleware.ModelRequest{}`; derive a
+    changed one with `ModelRequest.override/2` (model, prompt, tools, tool
+    choice, provider options) and call `next.(request)` to run it.
+
+  ## Run hooks
+
+  - `:before_agent` — `(state -> update)` run once before the first model
+    call of a run, for setup that must not repeat every turn: loading a
+    user profile from the store, seeding a plan, stamping a run ID.
+  - `:after_agent` — `(state -> update)` run once when the agent is about
+    to finish, for teardown: persisting what was learned, emitting a
+    summary, clearing scratch state.
+
+  Both run once per `invoke`, not per turn. On a resume they do not re-run,
+  because their earlier update is already in the checkpointed state.
+
+  ## Tool hooks
+
+  - `:before_tools` — `(state -> update)` run after the model asks for
+    tools and before they execute. It runs as its own graph node, so
+    unlike `after_model` it may call `LangEx.Interrupt.interrupt/1`: a
+    resume re-runs only this hook, not the model call whose tool requests
+    are being reviewed. Set `:__agent_jump__` in the update to steer
+    routing (`:model` to hand control back to the model, `:__end__` to
+    stop). Answer a call in advance by appending its
+    `%LangEx.Message.Tool{}` — the tools node then skips it and runs the
+    rest of the batch.
+  - `:wrap_tool_call` — `(request, execute -> result)` wraps each tool
+    call. The `request` is a `%LangEx.Tool.Node.ToolCallRequest{}`; return
+    `execute.(request)` to run the tool, or return a `%LangEx.Message.Tool{}`
+    / `%LangEx.Command{}` to answer without running it. Wrappers from
+    several middleware compose, first-declared outermost. Tool calls run in
+    their own tasks, so a wrapper cannot interrupt — use `:before_tools`
+    for anything needing human input.
 
   ## Contributions
 
@@ -54,26 +93,36 @@ defmodule LangEx.Middleware do
 
   alias LangEx.LLM.ChatModel
   alias LangEx.Message
+  alias LangEx.Middleware.ModelRequest
   alias LangEx.Tool
 
   @jump_key :__agent_jump__
 
   defstruct name: nil,
+            before_agent: nil,
             before_model: nil,
             after_model: nil,
+            before_tools: nil,
+            after_agent: nil,
             wrap_model_call: nil,
+            wrap_tool_call: nil,
             tools: [],
             state_schema: []
 
   @type hook :: (map() -> map())
-  @type request :: %{messages: [Message.t()], tools: [Tool.t()], state: map()}
+  @type request :: ModelRequest.t()
   @type wrapper :: (request(), (request() -> map()) -> map())
+  @type tool_wrapper :: (term(), (term() -> term()) -> term())
 
   @type t :: %__MODULE__{
           name: atom() | nil,
+          before_agent: hook() | nil,
           before_model: hook() | nil,
           after_model: hook() | nil,
+          before_tools: hook() | nil,
+          after_agent: hook() | nil,
           wrap_model_call: wrapper() | nil,
+          wrap_tool_call: tool_wrapper() | nil,
           tools: [Tool.t()],
           state_schema: keyword()
         }
@@ -97,26 +146,73 @@ defmodule LangEx.Middleware do
   @doc """
   Runs one model turn through the middleware stack.
 
-  `model_fn` is `(messages, tools, state -> update)` — the raw LLM call,
-  returning a `%{messages_key => [ai], :llm_usage => usage}` update. It receives
-  the current working state so state-derived options can be resolved. `tools` is
-  the full tool list offered to the model (a `wrap_model_call` hook may narrow
-  it). Returns the merged, persistable update for the agent node.
+  `model_fn` is `(%ModelRequest{} -> update)` — the raw LLM call, returning a
+  `%{messages_key => [ai], :llm_usage => usage}` update. It reads the model,
+  prompt, tools and provider options off the request, so a `wrap_model_call`
+  hook can redirect the call. `tools` is the full tool list offered to the
+  model. Returns the merged, persistable update for the agent node.
   """
-  @spec run_turn(map(), (list(), [Tool.t()], map() -> map()), [Tool.t()], [t()], atom()) :: map()
+  @spec run_turn(map(), (ModelRequest.t() -> map()), [Tool.t()], [t()], atom()) :: map()
   def run_turn(state, model_fn, tools, middlewares, messages_key) do
-    base = fn request -> model_fn.(request.messages, request.tools, request.state) end
-    chain = compose(middlewares, base)
+    chain = compose(middlewares, model_fn)
 
     {state, acc} = fold(:before_model, middlewares, state, new_acc(), messages_key)
-    request = %{messages: Map.fetch!(state, messages_key), tools: tools, state: state}
-    model_update = chain.(request)
+
+    model_update =
+      chain.(
+        ModelRequest.new(
+          messages: Map.fetch!(state, messages_key),
+          tools: tools,
+          state: state
+        )
+      )
 
     state = apply_local(state, model_update, messages_key)
     acc = accumulate(acc, model_update, messages_key)
 
     {_state, acc} = fold(:after_model, Enum.reverse(middlewares), state, acc, messages_key)
     finalize(acc, messages_key)
+  end
+
+  @doc """
+  Runs a run-scoped hook (`:before_agent` / `:after_agent`) across the stack.
+
+  Returns the merged update to commit. `:after_agent` is run with the stack
+  reversed by the caller so the stack unwinds symmetrically.
+  """
+  @spec run_hooks(map(), [t()], atom(), atom()) :: map()
+  def run_hooks(state, middlewares, kind, messages_key) do
+    {_state, acc} = fold(kind, middlewares, state, new_acc(), messages_key)
+    finalize(acc, messages_key)
+  end
+
+  @doc "True when any middleware in the stack declares `kind`."
+  @spec declares?([t()], atom()) :: boolean()
+  def declares?(middlewares, kind), do: Enum.any?(middlewares, &Map.fetch!(&1, kind))
+
+  @doc """
+  The composed `wrap_tool_call` interceptor for a stack, or `nil` when none.
+
+  First-declared middleware is outermost, matching `wrap_model_call`.
+  """
+  @spec tool_wrapper([t()]) :: tool_wrapper() | nil
+  def tool_wrapper(middlewares) do
+    middlewares
+    |> Enum.filter(& &1.wrap_tool_call)
+    |> nest_tool_wrappers()
+  end
+
+  defp nest_tool_wrappers([]), do: nil
+
+  defp nest_tool_wrappers(middlewares) do
+    fn request, execute ->
+      middlewares
+      |> Enum.reverse()
+      |> Enum.reduce(execute, fn mw, next ->
+        fn req -> mw.wrap_tool_call.(req, next) end
+      end)
+      |> then(& &1.(request))
+    end
   end
 
   defp compose(middlewares, base) do

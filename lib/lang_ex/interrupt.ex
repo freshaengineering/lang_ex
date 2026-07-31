@@ -3,10 +3,15 @@ defmodule LangEx.Interrupt do
   Pause graph execution and wait for external input.
 
   Call `interrupt/1` inside any node function. Each call site gets a
-  stable ID derived from the node name and the call order within the
-  node (`"node:0"`, `"node:1"`, ...). If a resume value has been
+  stable ID derived from the executing work entry and the call order
+  within it (`"node:0"`, `"node:1"`, ...). If a resume value has been
   provided for that ID, it is returned immediately. Otherwise execution
   pauses and the payload is surfaced to the caller.
+
+  When the entry is a `%LangEx.Send{}`, its stamped ID is part of the
+  scope (`"node#Ab3f:0"`), so parallel fan-out branches landing on the
+  same node interrupt independently and can be answered with different
+  values.
 
   A node may interrupt multiple times: on each resume the node re-runs
   from the top, earlier `interrupt/1` calls return their recorded
@@ -61,9 +66,9 @@ defmodule LangEx.Interrupt do
   defp require_node_context!(_node), do: :ok
 
   defp next_interrupt_id do
-    node = Process.get(:lang_ex_current_node)
+    scope = Process.get(:lang_ex_current_task) || Process.get(:lang_ex_current_node)
     index = Process.get(:lang_ex_interrupt_counter, 0)
     Process.put(:lang_ex_interrupt_counter, index + 1)
-    "#{node}:#{index}"
+    "#{scope}:#{index}"
   end
 end

@@ -15,7 +15,7 @@ defmodule LangEx.MigrationIntegrationTest do
   end
 
   test "current_version covers every registered migration" do
-    assert LangEx.Migration.current_version() == 3
+    assert LangEx.Migration.current_version() == 4
   end
 
   test "down and up cycle leaves working tables" do
@@ -24,11 +24,15 @@ defmodule LangEx.MigrationIntegrationTest do
 
     refute table_exists?("lang_ex_checkpoints")
     refute table_exists?("lang_ex_store")
+    refute table_exists?("lang_ex_checkpoint_blobs")
+    refute table_exists?("lang_ex_checkpoint_writes")
 
     :ok = LangEx.Integration.migrate!()
 
     assert table_exists?("lang_ex_checkpoints")
     assert table_exists?("lang_ex_store")
+    assert table_exists?("lang_ex_checkpoint_blobs")
+    assert table_exists?("lang_ex_checkpoint_writes")
 
     thread = "migration-int-#{System.unique_integer([:positive])}"
     config = [repo: IntegrationRepo, thread_id: thread]
@@ -45,7 +49,8 @@ defmodule LangEx.MigrationIntegrationTest do
         )
       )
 
-    assert {:ok, %Checkpoint{state: %{v: 1}, version: 2}} = Postgres.load(config)
+    assert {:ok, %Checkpoint{state: %{v: 1}, checkpoint_ns: "", source: :step, version: 3}} =
+             Postgres.load(config)
   end
 
   defp table_exists?(table) do

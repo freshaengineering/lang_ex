@@ -6,6 +6,8 @@ if Code.ensure_loaded?(Ecto) do
     @primary_key false
     schema "lang_ex_checkpoints" do
       field(:thread_id, :string)
+      field(:checkpoint_ns, :string, default: "")
+      field(:source, :string, default: "step")
       field(:checkpoint_id, :string)
       field(:parent_id, :string)
       field(:state, :map)

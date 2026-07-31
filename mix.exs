@@ -1,7 +1,7 @@
 defmodule LangEx.MixProject do
   use Mix.Project
 
-  @version "0.12.1"
+  @version "0.13.0"
   @source_url "https://github.com/surgeventures/lang_ex"
 
   def project do

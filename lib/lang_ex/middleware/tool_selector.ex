@@ -26,6 +26,7 @@ defmodule LangEx.Middleware.ToolSelector do
   alias LangEx.LLM.ChatModel
   alias LangEx.Message
   alias LangEx.Middleware
+  alias LangEx.Middleware.ModelRequest
 
   @default_max_tools 7
   @middleware_opt_keys [:max_tools, :always_include]
@@ -66,7 +67,7 @@ defmodule LangEx.Middleware.ToolSelector do
   defp narrow(_count, request, next, max_tools, always, llm_opts) do
     request
     |> pick(max_tools, always, llm_opts)
-    |> then(&Map.put(request, :tools, &1))
+    |> then(&ModelRequest.override(request, tools: &1))
     |> next.()
   end
 

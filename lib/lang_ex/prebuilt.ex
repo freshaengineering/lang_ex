@@ -42,6 +42,7 @@ defmodule LangEx.Prebuilt do
   alias LangEx.LLM.ChatModel
   alias LangEx.Message
   alias LangEx.Middleware
+  alias LangEx.Middleware.ModelRequest
   alias LangEx.Prebuilt.Reflect
   alias LangEx.Tool
 
@@ -106,7 +107,7 @@ defmodule LangEx.Prebuilt do
     |> agent_schema()
     |> Graph.new()
     |> Graph.add_node(:agent, agent_node(llm_opts, resolver, agent_opts, middlewares))
-    |> Graph.add_edge(:__start__, :agent)
+    |> add_lifecycle(middlewares)
     |> add_tool_loop(resolver, has_tools?(tools_spec, static_tools), agent_opts, middlewares)
     |> Graph.compile(
       name: Keyword.get(agent_opts, :name, :agent),
@@ -168,31 +169,111 @@ defmodule LangEx.Prebuilt do
     end
   end
 
+  # The request owns every input to the call — model, prompt, tools, provider
+  # options — so a wrap_model_call hook can redirect it without the agent
+  # needing an option for each case.
   defp model_fn(llm_opts) do
-    fn messages, call_tools, state ->
-      call = ChatModel.node(Keyword.put(llm_opts, :tools, call_tools))
-      call.(Map.merge(state, %{messages: messages, llm_usage: Map.get(state, :llm_usage, %{})}))
+    fn request ->
+      request
+      |> ModelRequest.provider_opts(llm_opts)
+      |> ChatModel.node()
+      |> then(& &1.(model_state(request)))
     end
+  end
+
+  defp model_state(request) do
+    Map.merge(request.state, %{
+      messages: ModelRequest.resolved_messages(request),
+      llm_usage: Map.get(request.state, :llm_usage, %{})
+    })
   end
 
   defp reset_jump(update, []), do: update
   defp reset_jump(update, _middlewares), do: Map.put_new(update, Middleware.jump_key(), nil)
 
+  # Run-scoped hooks are graph nodes rather than a flag the agent node checks,
+  # so they run exactly once per run, are visible when streaming, and their
+  # update is checkpointed before the first model call.
+  defp add_lifecycle(graph, middlewares) do
+    graph
+    |> add_entry(Middleware.declares?(middlewares, :before_agent), middlewares)
+    |> add_exit(Middleware.declares?(middlewares, :after_agent), middlewares)
+  end
+
+  defp add_entry(graph, false, _middlewares), do: Graph.add_edge(graph, :__start__, :agent)
+
+  defp add_entry(graph, true, middlewares) do
+    graph
+    |> Graph.add_node(:before_agent, lifecycle_node(middlewares, :before_agent))
+    |> Graph.add_edge(:__start__, :before_agent)
+    |> Graph.add_edge(:before_agent, :agent)
+  end
+
+  defp add_exit(graph, false, _middlewares), do: graph
+
+  defp add_exit(graph, true, middlewares) do
+    graph
+    |> Graph.add_node(:after_agent, lifecycle_node(middlewares, :after_agent))
+    |> Graph.add_edge(:after_agent, :__end__)
+  end
+
+  defp lifecycle_node(middlewares, :after_agent) do
+    reversed = Enum.reverse(middlewares)
+    fn state -> Middleware.run_hooks(state, reversed, :after_agent, :messages) end
+  end
+
+  defp lifecycle_node(middlewares, kind),
+    do: fn state -> Middleware.run_hooks(state, middlewares, kind, :messages) end
+
   defp add_tool_loop(graph, resolver, has_tools?, agent_opts, middlewares) do
     graph
-    |> add_tools_node(resolver, has_tools?, agent_opts)
+    |> add_tools_node(resolver, has_tools?, agent_opts, middlewares)
     |> route_agent(has_tools?, middlewares)
   end
 
-  defp add_tools_node(graph, _resolver, false, _agent_opts), do: graph
+  defp add_tools_node(graph, _resolver, false, _agent_opts, _middlewares), do: graph
 
-  defp add_tools_node(graph, resolver, true, agent_opts) do
-    tool_opts = Keyword.get(agent_opts, :tool_opts, [])
-
+  defp add_tools_node(graph, resolver, true, agent_opts, middlewares) do
     graph
-    |> Graph.add_node(:tools, tools_node(resolver, tool_opts))
+    |> Graph.add_node(:tools, tools_node(resolver, tool_opts(agent_opts, middlewares)))
     |> Graph.add_edge(:tools, :agent)
+    |> add_review(Middleware.declares?(middlewares, :before_tools), middlewares)
   end
+
+  # Reviewing requested tool calls is its own node so that pausing for a
+  # human resumes into the review, not into the model call being reviewed.
+  defp add_review(graph, false, _middlewares), do: graph
+
+  defp add_review(graph, true, middlewares) do
+    graph
+    |> Graph.add_node(:before_tools, lifecycle_node(middlewares, :before_tools))
+    |> Graph.add_conditional_edges(
+      :before_tools,
+      &agent_router(&1, true),
+      routes(true, exit_node(middlewares), :tools)
+    )
+  end
+
+  # A middleware's tool interceptor wraps the agent's own, so the stack sees
+  # the call before any node-level handling narrows it.
+  defp tool_opts(agent_opts, middlewares) do
+    agent_opts
+    |> Keyword.get(:tool_opts, [])
+    |> nest_tool_wrapper(Middleware.tool_wrapper(middlewares))
+  end
+
+  defp nest_tool_wrapper(tool_opts, nil), do: tool_opts
+
+  defp nest_tool_wrapper(tool_opts, outer) do
+    tool_opts
+    |> Keyword.get(:wrap_tool_call)
+    |> then(&Keyword.put(tool_opts, :wrap_tool_call, around(outer, &1)))
+  end
+
+  defp around(outer, nil), do: outer
+
+  defp around(outer, inner) when is_function(inner, 2),
+    do: fn request, execute -> outer.(request, fn req -> inner.(req, execute) end) end
 
   # Resolve tools from state per execution so runtime-discovered tools work;
   # rebuilding the Tool.Node closure each call is cheap.
@@ -209,20 +290,32 @@ defmodule LangEx.Prebuilt do
     })
   end
 
-  defp route_agent(graph, false, _middlewares) do
-    Graph.add_conditional_edges(graph, :agent, &agent_router(&1, false), %{
-      model: :agent,
-      __end__: :__end__
-    })
+  defp route_agent(graph, has_tools?, middlewares) do
+    Graph.add_conditional_edges(
+      graph,
+      :agent,
+      &agent_router(&1, has_tools?),
+      routes(has_tools?, exit_node(middlewares), tools_target(middlewares))
+    )
   end
 
-  defp route_agent(graph, true, _middlewares) do
-    Graph.add_conditional_edges(graph, :agent, &agent_router(&1, true), %{
-      model: :agent,
-      tools: :tools,
-      __end__: :__end__
-    })
+  defp routes(false, exit_node, _tools), do: %{model: :agent, __end__: exit_node}
+  defp routes(true, exit_node, tools), do: %{model: :agent, tools: tools, __end__: exit_node}
+
+  defp exit_node(middlewares) do
+    middlewares
+    |> Middleware.declares?(:after_agent)
+    |> node_or(:after_agent, :__end__)
   end
+
+  defp tools_target(middlewares) do
+    middlewares
+    |> Middleware.declares?(:before_tools)
+    |> node_or(:before_tools, :tools)
+  end
+
+  defp node_or(true, node, _fallback), do: node
+  defp node_or(false, _node, fallback), do: fallback
 
   defp agent_router(state, has_tools?) do
     state

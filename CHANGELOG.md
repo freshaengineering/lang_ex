@@ -1,5 +1,164 @@
 # Changelog
 
+## v0.13.0
+
+Requires a new migration calling `LangEx.Migration.up()` (V4) for the Postgres
+checkpointer. See "Deleting a thread no longer orphans its subgraph
+checkpoints" below for what changes and what old data keeps.
+
+### Parallel fan-out branches interrupt independently
+
+- Two `%LangEx.Send{}` entries targeting the same node derived the same
+  interrupt ID, so a fan-out where every branch pauses for approval collapsed
+  into one pending interrupt — answering it resumed every branch with the same
+  value, and branches with identical payloads were silently dropped on resume.
+  Each Send now carries a stamped ID that scopes its interrupts
+  (`"worker#Ab3f:0"`), so branches are individually addressable and can be
+  answered separately or left pending. Plain node interrupt IDs are unchanged,
+  so IDs recorded by earlier versions still resolve.
+
+### Deleting a thread no longer orphans its subgraph checkpoints
+
+- Subgraphs used to checkpoint under a derived thread ID (`"t-1/planner"`),
+  which `delete_thread/1` could not see: closing a conversation left its
+  subgraph state — including full transcripts — in the database forever.
+  Subgraph checkpoints now share the parent's `thread_id` and are located by a
+  new first-class `checkpoint_ns` field, so one thread ID addresses an entire
+  run tree. `delete_thread/1` removes all of it.
+- Requires migration V4. Subgraph checkpoints written before the upgrade keep
+  their old derived thread IDs; delete those threads directly if they must go.
+- `get_state/2` and `get_state_history/2` accept `:checkpoint_ns` in `:config`
+  to inspect a subgraph's own history.
+- Subgraph checkpoints record the enclosing namespace's checkpoint ID in
+  `metadata.parents`, so lineage stays reconstructable across graph boundaries.
+
+### Per-task durability
+
+- A crash midway through a parallel super-step discarded every node that had
+  already succeeded, because durability was whole-step. Each unit of work is
+  now journaled the moment it completes, and recovering the run replays those
+  results instead of re-running the nodes — a crash costs only the work that
+  was genuinely in flight. Applies to `durability: :sync` and `:async`.
+- A fresh run records an `:input` checkpoint before any node executes, so
+  step 0 has something to recover against and the run's input is visible in
+  the thread history.
+- Backends opt in via the optional `put_writes/4`, `load_writes/2`, and
+  `discard_writes/2` callbacks; Memory, Postgres, and Redis implement them.
+
+### Checkpoint provenance and history pagination
+
+- Checkpoints carry a `source`: `:input`, `:step`, `:update`, or `:fork`.
+  `update_state/3` distinguishes continuing a thread from branching it.
+- `get_state_history/2` accepts `:before` (a checkpoint ID cursor, keyset
+  paginated in Postgres) and `:source`, so a long history can be paged and
+  branch points listed without loading everything.
+
+### Thread lifecycle
+
+- `LangEx.copy_thread/3` copies a thread's full history — every namespace — to
+  a new thread ID. The copy is independent, making it safe to branch a live
+  conversation or snapshot before a risky operation. Postgres copies rows
+  inside the database rather than through the application.
+- `LangEx.Checkpointer.Postgres.prune/2` accepts a `:thread_id` in the config
+  to scope retention to one thread, and `:keep_latest` to retain the most
+  recent checkpoints regardless of age so trimming never leaves a live
+  conversation unresumable.
+
+### Pluggable and encrypting checkpoint codecs
+
+- `LangEx.Checkpoint.Codec` makes the checkpoint wire format a deployment
+  choice, selected per run (`serializer:` in the config) or application-wide.
+  The existing lossless tagged-JSON serializer remains the default.
+- `LangEx.Checkpoint.Codec.Encrypted` encrypts state at rest with
+  AES-256-GCM, so database dumps, replicas, and backups hold ciphertext
+  rather than transcripts. Values are sealed individually with an allowlist
+  for keys that must stay queryable, and keyed rotation lets a new key be
+  introduced while existing threads still decrypt.
+
+### Fan-in barriers can name the branches they wait for
+
+- `defer: true` made a node wait for the whole super-step, which is wrong for a
+  graph where two independent merges run side by side: each was held up by
+  branches it had nothing to do with. `defer:` now also accepts a list of node
+  names, so a merge waits for its own sources and nothing else. Naming a node
+  that does not exist is rejected when the graph is built.
+
+### Ephemeral state keys
+
+- `Graph.new/2` accepts `ephemeral:` keys that live for exactly one super-step:
+  readable by the next step, never written to a checkpoint, and gone after
+  that. Retry signals, routing hints, and per-step scratch values no longer
+  have to be threaded through persisted state or manually cleared. Declaring an
+  ephemeral key that is not in the state schema is rejected at build time.
+
+### Graph-level default node policies
+
+- `Graph.compile/2` accepts `node_defaults:` so a policy — `retry`, `cache`,
+  `timeout`, `on_error` — can be stated once for every node instead of repeated
+  per node and silently forgotten on the next one added. A node's own options
+  override the default, and options that cannot combine (an `:on_error`
+  fallback on a cached node) are dropped rather than applied inconsistently.
+  An invalid default fails at compile time.
+
+### Per-node cache keys
+
+- A node's `cache:` option accepts `key:` — `(state -> term())` — so a cached
+  node keeps its entry when unrelated state changes. Previously any state
+  change invalidated the cache, which made caching useless for a node that
+  depends on one field of a large state.
+
+### The model call is data a middleware can redirect
+
+- `wrap_model_call` now receives a `%LangEx.Middleware.ModelRequest{}` carrying
+  every input to the call — messages, tools, model, system prompt, tool choice,
+  provider options — and `ModelRequest.override/2` derives a changed one. A
+  middleware can escalate a hard turn to a stronger model, force a tool, or
+  swap the prompt per user without the agent needing an option for each case.
+  Overriding an unknown or read-only field raises instead of being ignored.
+
+### Run-scoped and tool-scoped middleware hooks
+
+- `:before_agent` and `:after_agent` run once per run rather than once per
+  turn, for setup and teardown — loading a profile, persisting what was
+  learned — that must not repeat on every model call.
+- `:before_tools` runs after the model requests tools and before they execute,
+  as its own graph node. Because it is a node, it may `interrupt/1`: resuming
+  re-runs only the review, not the model call being reviewed.
+- `:wrap_tool_call` lets a middleware intercept each tool call; wrappers from
+  several middleware compose, and the agent's own `:wrap_tool_call` still runs
+  innermost.
+
+### Human review of tool calls
+
+- `LangEx.Middleware.ToolApproval` pauses on the tool calls that need a human
+  and nowhere else. A reviewer can approve, approve with corrected arguments,
+  refuse with a reason, or answer the call themselves. Unguarded calls in the
+  same batch run untouched, and refusing one call no longer blocks the calls
+  beside it.
+
+### Budgets and tool retries
+
+- `LangEx.Middleware.CallBudget` caps model calls and token spend per run, so
+  an agent that would loop forever stops and says why. Tool calls left hanging
+  by the stop are answered, keeping the conversation valid to continue.
+- `LangEx.Middleware.ToolRetry` retries a transiently failing tool inside the
+  call, with fixed or growing backoff, so a momentary outage does not cost a
+  turn or teach the model that the tool is broken.
+
+### Tool results record whether they failed
+
+- `%LangEx.Message.Tool{}` carries a `:status` (`:ok` / `:error`), set when a
+  tool raises. Failures are now recognisable without parsing prose, and the
+  Anthropic adapter sends `is_error` so the model is told the call failed
+  rather than left to infer it.
+
+### Tool calls already answered are not re-run
+
+- The tools step and `tools_condition/2` now consider only tool calls still
+  awaiting a result, and look back past trailing non-tool messages to find
+  them. This is what lets a reviewer answer a call in advance while the rest of
+  the batch runs.
+
 ## v0.12.1
 
 ### Resilient — retries keep the caller's provider opts

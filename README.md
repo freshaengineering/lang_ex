@@ -318,7 +318,7 @@ Handoffs are ordinary tools: a tool function returning a `%LangEx.Command{}` upd
 
 ### Agent Middleware
 
-Layer extra behaviour around a `Prebuilt.agent/1` model call with composable `%LangEx.Middleware{}` values. Each can run `before_model` / `after_model` / `wrap_model_call` hooks, contribute tools, and extend the agent's state — an `after_model` hook can even steer routing (loop, go to tools, or end). Built-ins ship for the common needs:
+Layer extra behaviour around a `Prebuilt.agent/1` run with composable `%LangEx.Middleware{}` values. A middleware can hook the run (`before_agent` / `after_agent`), each turn (`before_model` / `after_model` / `wrap_model_call`), and each tool call (`before_tools` / `wrap_tool_call`), contribute tools, and extend the agent's state — an `after_model` hook can even steer routing (loop, go to tools, or end). Built-ins ship for the common needs:
 
 ```elixir
 graph =
@@ -333,6 +333,12 @@ graph =
       LangEx.Middleware.TodoList.new(),
       # narrow a big tool set to what's relevant each turn
       LangEx.Middleware.ToolSelector.new(model: "claude-haiku-4-5-20251001", max_tools: 7),
+      # a human signs off before anything is restarted
+      LangEx.Middleware.ToolApproval.new(tools: ["restart_service"]),
+      # ride out a flaky API instead of spending a turn on it
+      LangEx.Middleware.ToolRetry.new(max_attempts: 3, backoff: fn n -> n * 250 end),
+      # never let one investigation run away
+      LangEx.Middleware.CallBudget.new(max_model_calls: 20, max_tokens: 400_000),
       # don't let it finish until the answer meets the bar
       LangEx.Middleware.Rubric.new(
         model: "claude-opus-4-20250514",
@@ -342,7 +348,21 @@ graph =
   )
 ```
 
-Also available: `LangEx.Middleware.ContextEditing` (clears stale tool-result bodies while keeping the message skeleton). Write your own with `LangEx.Middleware.new/1`.
+`wrap_model_call` receives the call as data, so a middleware can redirect it:
+
+```elixir
+escalate =
+  LangEx.Middleware.new(
+    name: :escalate,
+    wrap_model_call: fn request, next ->
+      request
+      |> LangEx.Middleware.ModelRequest.override(model: "claude-opus-4-20250514")
+      |> next.()
+    end
+  )
+```
+
+Also available: `LangEx.Middleware.ContextEditing` (clears stale tool-result bodies while keeping the message skeleton), `LangEx.Middleware.ModelFallback` (retries a failed call on other models), `LangEx.Middleware.Subagent`, and `LangEx.Middleware.Filesystem`. Write your own with `LangEx.Middleware.new/1`.
 
 ### Runtime Context
 

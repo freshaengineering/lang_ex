@@ -42,8 +42,37 @@ defmodule LangEx.Checkpoint.StateApiTest do
 
       history = LangEx.get_state_history(graph, config: [thread_id: "hist-1"])
 
-      assert [%Checkpoint{parent_id: parent}, %Checkpoint{checkpoint_id: parent, parent_id: nil}] =
-               history
+      assert [
+               %Checkpoint{source: :step, parent_id: middle_id},
+               %Checkpoint{source: :step, checkpoint_id: middle_id, parent_id: input_id},
+               %Checkpoint{source: :input, checkpoint_id: input_id, parent_id: nil}
+             ] = history
+    end
+
+    test "the run's input is recorded before any node executes", %{graph: graph} do
+      {:ok, _} = LangEx.invoke(graph, %{value: 1}, config: [thread_id: "hist-input"])
+
+      assert [%Checkpoint{state: %{value: 1}, step: 0}] =
+               LangEx.get_state_history(graph, config: [thread_id: "hist-input"], source: :input)
+    end
+
+    test "the :before cursor pages through older checkpoints", %{graph: graph} do
+      {:ok, _} = LangEx.invoke(graph, %{value: 1}, config: [thread_id: "hist-page"])
+
+      config = [thread_id: "hist-page"]
+      [newest | rest] = LangEx.get_state_history(graph, config: config)
+
+      assert Enum.map(rest, & &1.checkpoint_id) ==
+               LangEx.get_state_history(graph, config: config, before: newest.checkpoint_id)
+               |> Enum.map(& &1.checkpoint_id)
+    end
+
+    test "an unknown :before cursor is rejected rather than returning everything", %{graph: graph} do
+      {:ok, _} = LangEx.invoke(graph, %{value: 1}, config: [thread_id: "hist-bad-cursor"])
+
+      assert_raise ArgumentError, ~r/not a checkpoint/, fn ->
+        LangEx.get_state_history(graph, config: [thread_id: "hist-bad-cursor"], before: "nope")
+      end
     end
   end
 
