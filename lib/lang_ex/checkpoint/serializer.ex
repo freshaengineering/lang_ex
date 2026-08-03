@@ -27,7 +27,20 @@ defmodule LangEx.Checkpoint.Serializer do
   | struct          | `%{"~s" => "Elixir.Mod", "~f" => %{...}}`       |
   | map             | `%{"~m" => [[encoded_key, encoded_value], ...]}`|
   | list            | JSON array of encoded elements                  |
+
+  This is the default `LangEx.Checkpoint.Codec`. See that module to swap
+  in a different wire format, such as `LangEx.Checkpoint.Codec.Encrypted`.
   """
+
+  @behaviour LangEx.Checkpoint.Codec
+
+  @doc false
+  @impl true
+  def encode(term, _config), do: encode(term)
+
+  @doc false
+  @impl true
+  def decode(term, _config), do: decode(term)
 
   @doc "Encodes a term into a JSON-compatible representation."
   @spec encode(term()) :: term()

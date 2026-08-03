@@ -48,7 +48,11 @@ defmodule LangEx do
           {:ok, LangEx.Checkpoint.t()} | {:error, term()}
   defdelegate update_state(graph, update, opts), to: Compiled
 
-  @doc "Deletes every checkpoint for the thread in the config."
+  @doc "Deletes every checkpoint for the thread in the config, subgraphs included."
   @spec delete_thread(Compiled.t(), keyword()) :: :ok | {:error, term()}
   defdelegate delete_thread(graph, opts), to: Compiled
+
+  @doc "Copies a thread's full history onto a new thread, branching it safely."
+  @spec copy_thread(Compiled.t(), String.t(), keyword()) :: :ok | {:error, term()}
+  defdelegate copy_thread(graph, target_thread_id, opts), to: Compiled
 end

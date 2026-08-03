@@ -21,6 +21,7 @@ defmodule LangEx.Graph.Compiled do
     :checkpointer,
     :store,
     node_opts: %{},
+    ephemeral: %{},
     interrupt_before: [],
     interrupt_after: []
   ]
@@ -33,6 +34,7 @@ defmodule LangEx.Graph.Compiled do
           conditional_edges: %{atom() => {(map() -> atom() | String.t()), map() | nil}},
           initial_state: map(),
           reducers: State.reducers(),
+          ephemeral: %{atom() => term()},
           checkpointer: module() | nil,
           store: {module(), keyword()} | nil,
           interrupt_before: [atom()],
@@ -164,21 +166,55 @@ defmodule LangEx.Graph.Compiled do
   Each checkpoint carries `parent_id`, so the full lineage (including
   forks created by `update_state/3`) can be reconstructed.
 
-  Options: `:config` (with `:thread_id`), `:limit`.
+  Options:
+  - `:config` — with `:thread_id`, and `:checkpoint_ns` to read a
+    subgraph's history instead of the root graph's
+  - `:limit` — page size (default 100)
+  - `:before` — a `checkpoint_id` cursor; returns only checkpoints older
+    than it, for paging through a long history
+  - `:source` — restrict to given provenance values, e.g.
+    `source: [:input, :fork]` to list just the branch points
   """
   @spec get_state_history(t(), keyword()) :: [Checkpoint.t()]
   def get_state_history(%__MODULE__{checkpointer: cp}, opts) when not is_nil(cp) do
-    cp.list(Keyword.get(opts, :config, []), Keyword.take(opts, [:limit]))
+    cp.list(Keyword.get(opts, :config, []), Keyword.take(opts, [:limit, :before, :source]))
   end
 
   @doc """
   Deletes every checkpoint for the thread in `:config` — e.g. when a
   conversation is closed or a user requests data removal.
+
+  Removes the thread's entire graph tree: subgraph checkpoints live under
+  the same thread ID in their own namespaces and are deleted too.
   """
   @spec delete_thread(t(), keyword()) :: :ok | {:error, term()}
   def delete_thread(%__MODULE__{checkpointer: cp}, opts) when not is_nil(cp) do
     cp.delete_thread(Keyword.get(opts, :config, []))
   end
+
+  @doc """
+  Copies a thread's full history onto `target_thread_id`.
+
+  The copy is independent — running either thread leaves the other
+  untouched — which is what makes it safe to branch a live conversation
+  (e.g. exploring an alternative reply without disturbing the original,
+  or snapshotting before a risky operation). Subgraph namespaces come
+  along, so the branch resumes mid-subgraph exactly as the source would.
+
+  Returns `{:error, {:unsupported, module}}` for a checkpointer that does
+  not implement copying.
+  """
+  @spec copy_thread(t(), String.t(), keyword()) :: :ok | {:error, term()}
+  def copy_thread(%__MODULE__{checkpointer: cp}, target_thread_id, opts) when not is_nil(cp) do
+    cp
+    |> copyable?()
+    |> copy_to(cp, target_thread_id, Keyword.get(opts, :config, []))
+  end
+
+  defp copyable?(cp), do: Code.ensure_loaded?(cp) and function_exported?(cp, :copy_thread, 2)
+
+  defp copy_to(false, cp, _target, _config), do: {:error, {:unsupported, cp}}
+  defp copy_to(true, cp, target, config), do: cp.copy_thread(config, target)
 
   @doc """
   Applies an update to a thread's checkpointed state and saves it as a
@@ -187,7 +223,8 @@ defmodule LangEx.Graph.Compiled do
   The update goes through the graph's reducers, exactly as a node
   result would. Loading a historical checkpoint via `:checkpoint_id`
   in `:config` forks the thread from that point. Returns the new
-  checkpoint.
+  checkpoint, whose `source` is `:update` when it extends the thread's
+  head and `:fork` when it branches from an earlier point.
   """
   @spec update_state(t(), map(), keyword()) :: {:ok, Checkpoint.t()} | {:error, term()}
   def update_state(%__MODULE__{checkpointer: cp} = graph, update, opts) when not is_nil(cp) do
@@ -202,12 +239,14 @@ defmodule LangEx.Graph.Compiled do
     forked =
       Checkpoint.new(
         thread_id: saved.thread_id,
+        checkpoint_ns: saved.checkpoint_ns,
         parent_id: saved.checkpoint_id,
         state: State.apply_update(saved.state, update, graph.reducers),
         next_nodes: saved.next_nodes,
         step: saved.step,
         pending_interrupts: saved.pending_interrupts,
-        metadata: saved.metadata
+        metadata: saved.metadata,
+        source: update_source(config)
       )
 
     config
@@ -220,6 +259,13 @@ defmodule LangEx.Graph.Compiled do
 
   defp forked_result(:ok, forked), do: {:ok, forked}
   defp forked_result({:error, _} = err, _forked), do: err
+
+  # Writing against a pinned historical checkpoint branches the thread;
+  # writing against its head continues it.
+  defp update_source(config), do: fork_or_update(Keyword.get(config, :checkpoint_id))
+
+  defp fork_or_update(nil), do: :update
+  defp fork_or_update(_checkpoint_id), do: :fork
 
   defp resume_from_checkpoint(
          {:ok, %Checkpoint{pending_interrupts: [_ | _]} = saved},

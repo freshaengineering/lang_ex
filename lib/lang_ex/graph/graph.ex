@@ -14,14 +14,15 @@ defmodule LangEx.Graph do
             node_opts: %{},
             edges: %{},
             conditional_edges: %{},
-            schema: []
+            schema: [],
+            ephemeral: []
 
   @type node_fn :: (map() -> map() | LangEx.Command.t())
 
   @type node_opt ::
           {:retry, keyword() | true}
           | {:cache, keyword() | true}
-          | {:defer, boolean()}
+          | {:defer, boolean() | [atom()]}
           | {:timeout, pos_integer()}
           | {:on_error, (Exception.t(), map() -> map() | LangEx.Command.t())}
 
@@ -32,19 +33,52 @@ defmodule LangEx.Graph do
           node_opts: %{atom() => [node_opt()]},
           edges: %{atom() => [atom()]},
           conditional_edges: %{atom() => {routing_fn(), map() | nil}},
-          schema: keyword()
+          schema: keyword(),
+          ephemeral: [atom()]
         }
 
   @node_opt_keys [:retry, :cache, :defer, :timeout, :on_error]
+  @cache_opt_keys [:ttl, :key]
   @reserved_names [:__start__, :__end__]
 
   @doc """
   Creates a new graph builder with the given state schema.
 
   Schema entries are `key: default` or `key: {default, reducer_fn}`.
+
+  ## Options
+
+  - `:ephemeral` — state keys that carry a signal rather than durable
+    data. An ephemeral key is readable by the super-step after the one
+    that wrote it, then resets to its default, and is never written to a
+    checkpoint. Use it for one-shot coordination between steps — a
+    routing hint, a "retry this once" flag, a decrypted value that must
+    not reach storage — where a leftover value in the next turn would be
+    a bug and persisting it would be a liability.
+
+        Graph.new([route_hint: nil, messages: {[], &Message.add_messages/2}],
+          ephemeral: [:route_hint]
+        )
   """
-  @spec new(keyword()) :: t()
-  def new(schema \\ []), do: %__MODULE__{schema: schema}
+  @spec new(keyword(), keyword()) :: t()
+  def new(schema \\ [], opts \\ []) do
+    :ok = validate_ephemeral!(schema, Keyword.get(opts, :ephemeral, []))
+    %__MODULE__{schema: schema, ephemeral: Keyword.get(opts, :ephemeral, [])}
+  end
+
+  defp validate_ephemeral!(schema, keys) do
+    keys
+    |> Enum.reject(&Keyword.has_key?(schema, &1))
+    |> assert_ephemeral_declared!()
+  end
+
+  defp assert_ephemeral_declared!([]), do: :ok
+
+  defp assert_ephemeral_declared!(unknown) do
+    raise ArgumentError,
+          "ephemeral key(s) #{inspect(unknown)} are not in the state schema — " <>
+            "an ephemeral key needs a declared default to reset to"
+  end
 
   @doc """
   Adds a named node with its handler function.
@@ -61,11 +95,26 @@ defmodule LangEx.Graph do
     (`max_attempts:`, `initial_interval_ms:`, `backoff_factor:`,
     `max_interval_ms:`, `jitter:`, `retryable?:`).
   - `:cache` - memoize successful results keyed by the node's input
-    state. `true` for no expiry, or `[ttl: milliseconds]`. Cannot be
-    combined with `:on_error`.
-  - `:defer` - when `true`, the node runs only once no other
-    (non-deferred) nodes are active — a fan-in barrier for parallel
-    branches that converge at different depths.
+    state. `true` for no expiry, or a keyword list:
+    - `ttl:` - milliseconds before the entry expires (default no expiry)
+    - `key:` - `fn state -> term end` narrowing what the key covers, so
+      an expensive node keeps its cache when unrelated state changes:
+
+          Graph.add_node(graph, :embed, &embed/1,
+            cache: [ttl: 60_000, key: & &1.query]
+          )
+
+    Cannot be combined with `:on_error`.
+  - `:defer` - a fan-in barrier. `true` holds the node until no other
+    (non-deferred) node is active. A list of node names holds it only
+    while one of those names is active, so a merge node waits for its own
+    branches instead of queueing behind every unrelated node in the
+    graph:
+
+        Graph.add_node(graph, :merge, &merge/1, defer: [:search, :summarize])
+
+    When every active node is barred, the barrier releases rather than
+    deadlocking.
   - `:timeout` - per-attempt time budget in milliseconds. A timed-out
     attempt raises `LangEx.NodeTimeoutError`, which the retry policy
     can retry; when exhausted it surfaces as `{:error, %LangEx.NodeError{}}`.
@@ -135,8 +184,20 @@ defmodule LangEx.Graph do
   end
 
   defp validate_node_opt!(_name, {:retry, value}) when value == true or is_list(value), do: :ok
-  defp validate_node_opt!(_name, {:cache, value}) when value == true or is_list(value), do: :ok
+  defp validate_node_opt!(_name, {:cache, true}), do: :ok
+
+  defp validate_node_opt!(name, {:cache, cache_opts}) when is_list(cache_opts) do
+    :ok = validate_cache_keys!(name, cache_opts)
+    validate_cache_key_fn!(name, Keyword.get(cache_opts, :key))
+  end
+
   defp validate_node_opt!(_name, {:defer, value}) when is_boolean(value), do: :ok
+
+  defp validate_node_opt!(name, {:defer, sources}) when is_list(sources) do
+    sources
+    |> Enum.reject(&is_atom/1)
+    |> assert_defer_sources!(name)
+  end
 
   defp validate_node_opt!(_name, {:timeout, value}) when is_integer(value) and value > 0,
     do: :ok
@@ -146,6 +207,38 @@ defmodule LangEx.Graph do
   defp validate_node_opt!(name, {key, value}) do
     raise ArgumentError,
           "invalid value #{inspect(value)} for node option #{inspect(key)} on #{inspect(name)}"
+  end
+
+  defp validate_cache_keys!(name, cache_opts) do
+    cache_opts
+    |> Keyword.keys()
+    |> Enum.reject(&(&1 in @cache_opt_keys))
+    |> assert_cache_keys!(name)
+  end
+
+  defp assert_cache_keys!([], _name), do: :ok
+
+  defp assert_cache_keys!(unknown, name) do
+    raise ArgumentError,
+          "unknown `cache:` option(s) #{inspect(unknown)} on #{inspect(name)} — " <>
+            "supported: #{inspect(@cache_opt_keys)}"
+  end
+
+  defp validate_cache_key_fn!(_name, nil), do: :ok
+  defp validate_cache_key_fn!(_name, key_fn) when is_function(key_fn, 1), do: :ok
+
+  defp validate_cache_key_fn!(name, key_fn) do
+    raise ArgumentError,
+          "`cache: [key: ...]` on #{inspect(name)} must be a 1-arity function of " <>
+            "the node's input state, got #{inspect(key_fn)}"
+  end
+
+  defp assert_defer_sources!([], _name), do: :ok
+
+  defp assert_defer_sources!(invalid, name) do
+    raise ArgumentError,
+          "`defer:` on #{inspect(name)} lists non-node value(s) #{inspect(invalid)} — " <>
+            "a scoped barrier names the nodes it waits for"
   end
 
   defp assert_compatible_opts!(name, node_opts) do
@@ -221,6 +314,12 @@ defmodule LangEx.Graph do
   - `:interrupt_after` - node names to pause at after execution
   - `:warn_unreachable` - warn about nodes not reachable via declared
     edges (default `true`; disable for graphs routed via Command goto)
+  - `:node_defaults` - execution policy applied to every node, using the
+    same keys as `add_node/4`. A node's own options win per key, so a
+    graph can set one resilience policy up front and let individual nodes
+    opt out or tighten it:
+
+        Graph.compile(builder, node_defaults: [retry: true, timeout: 30_000])
   """
   @spec compile(t(), keyword()) :: Compiled.t()
   def compile(%__MODULE__{} = graph, opts \\ []) do
@@ -236,17 +335,43 @@ defmodule LangEx.Graph do
     %Compiled{
       name: Keyword.get(opts, :name),
       nodes: graph.nodes,
-      node_opts: graph.node_opts,
+      node_opts: resolve_node_opts(graph, Keyword.get(opts, :node_defaults, [])),
       edges: graph.edges,
       conditional_edges: graph.conditional_edges,
       initial_state: initial_state,
       reducers: reducers,
+      ephemeral: Map.take(initial_state, graph.ephemeral),
       checkpointer: Keyword.get(opts, :checkpointer),
       store: opts |> Keyword.get(:store) |> LangEx.Store.normalize(),
       interrupt_before: Keyword.get(opts, :interrupt_before, []),
       interrupt_after: Keyword.get(opts, :interrupt_after, [])
     }
   end
+
+  defp resolve_node_opts(graph, []), do: graph.node_opts
+
+  defp resolve_node_opts(graph, defaults) do
+    :ok = validate_node_opts!(:node_defaults, defaults)
+
+    Map.new(graph.nodes, fn {name, _node} ->
+      {name, merge_node_defaults(Map.get(graph.node_opts, name, []), defaults)}
+    end)
+  end
+
+  # A node's own option wins per key. `:on_error` is dropped when the node
+  # sets its own `:cache`, since caching handler results is unsafe and a
+  # graph-wide default must not silently create that pairing.
+  defp merge_node_defaults(own, defaults) do
+    defaults
+    |> Keyword.drop(conflicting_defaults(own))
+    |> Keyword.merge(own)
+  end
+
+  defp conflicting_defaults(own), do: Enum.flat_map(own, &excluded_by/1)
+
+  defp excluded_by({:cache, _value}), do: [:on_error]
+  defp excluded_by({:on_error, _value}), do: [:cache]
+  defp excluded_by(_opt), do: []
 
   defp validate_entry_point(%__MODULE__{edges: %{__start__: _}}), do: :ok
   defp validate_entry_point(%__MODULE__{conditional_edges: %{__start__: _}}), do: :ok

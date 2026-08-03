@@ -48,11 +48,18 @@ LangEx (facade: invoke/3, stream/3, get_state/2, get_state_history/2, update_sta
 │   ├── Tool.Node                     # Graph node for parallel tool execution
 │   └── Tool.Annotation               # Error recovery guidance for LLM
 ├── Message                           # Chat message types (Human, AI, System, Tool, RemoveMessage)
-├── Middleware                        # Composable model-call hooks for Prebuilt.agent
+├── Middleware                        # Composable agent hooks for Prebuilt.agent
+│   ├── Middleware.ModelRequest       # The model call as data, with override/2
 │   ├── Middleware.Summarization      # LLM-summarised, persisted context compaction
 │   ├── Middleware.ContextEditing     # Clears stale tool-result contents (no LLM)
 │   ├── Middleware.TodoList           # write_todos planning tool + :todos state
 │   ├── Middleware.ToolSelector       # LLM tool pre-selection for large tool sets
+│   ├── Middleware.ToolApproval       # Human review of guarded tool calls (HITL)
+│   ├── Middleware.ToolRetry          # Retries transient tool failures in place
+│   ├── Middleware.CallBudget         # Caps model calls / tokens per run
+│   ├── Middleware.ModelFallback      # Retries a failed call on fallback models
+│   ├── Middleware.Subagent           # Delegation to nested agents as tools
+│   ├── Middleware.Filesystem         # Sandboxed file tools
 │   └── Middleware.Rubric             # Completion gate scoring the final answer
 ├── Checkpoint / Checkpointer         # Pause/resume with Memory, Redis, or Postgres
 ├── Store                             # Long-term memory (ETS / Postgres backends)
@@ -96,10 +103,17 @@ lib/lang_ex/
 ├── prebuilt.ex                      → LangEx.Prebuilt
 ├── middleware.ex                    → LangEx.Middleware
 ├── middleware/
+│   ├── model_request.ex             → LangEx.Middleware.ModelRequest
 │   ├── summarization.ex             → LangEx.Middleware.Summarization
 │   ├── context_editing.ex           → LangEx.Middleware.ContextEditing
 │   ├── todo_list.ex                 → LangEx.Middleware.TodoList
 │   ├── tool_selector.ex             → LangEx.Middleware.ToolSelector
+│   ├── tool_approval.ex             → LangEx.Middleware.ToolApproval
+│   ├── tool_retry.ex                → LangEx.Middleware.ToolRetry
+│   ├── call_budget.ex               → LangEx.Middleware.CallBudget
+│   ├── model_fallback.ex            → LangEx.Middleware.ModelFallback
+│   ├── subagent.ex                  → LangEx.Middleware.Subagent
+│   ├── filesystem.ex                → LangEx.Middleware.Filesystem
 │   └── rubric.ex                    → LangEx.Middleware.Rubric
 ├── send.ex                          → LangEx.Send
 ├── telemetry.ex                     → LangEx.Telemetry
