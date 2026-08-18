@@ -35,6 +35,7 @@ on:
 jobs:
   static:
     name: Static Checks
+    timeout-minutes: 25
     runs-on: runs-on,runner=4cpu-linux-x64
     outputs:
       HASH: ${{ steps.hash.outputs.HASH }}
@@ -92,6 +93,7 @@ jobs:
 
   test:
     name: Unit Tests
+    timeout-minutes: 25
     runs-on: runs-on,runner=2cpu-linux-x64
     steps:
       - name: Harden the runner
@@ -145,6 +147,7 @@ jobs:
 
   permit:
     name: Permit Package Publishing
+    timeout-minutes: 25
     needs: [static, test]
     runs-on: runs-on,runner=1cpu-linux-x64
     outputs:
@@ -202,6 +205,7 @@ jobs:
 
   publish:
     name: Publish Hex Package
+    timeout-minutes: 25
     needs: [permit]
     env:
       HEX_API_KEY: ${{ secrets.GH_FRESHAENGINEERING_LANG_EX_HEX_PM_API_KEY }}
