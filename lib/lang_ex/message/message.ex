@@ -53,10 +53,24 @@ defmodule LangEx.Message do
   end
 
   defmodule Tool do
-    @moduledoc "The result of a tool call, correlated by `tool_call_id`."
+    @moduledoc """
+    The result of a tool call, correlated by `tool_call_id`.
+
+    `:status` distinguishes a result from a failure. Marking failures
+    rather than only phrasing them in `:content` lets retry and
+    observability logic recognise them without parsing prose, and lets
+    providers that model tool errors natively (Anthropic's `is_error`)
+    be told the call failed.
+    """
     @derive Jason.Encoder
-    defstruct [:content, :tool_call_id, :id]
-    @type t :: %__MODULE__{content: String.t(), tool_call_id: String.t(), id: String.t() | nil}
+    defstruct [:content, :tool_call_id, :id, status: :ok]
+
+    @type t :: %__MODULE__{
+            content: String.t(),
+            tool_call_id: String.t(),
+            id: String.t() | nil,
+            status: :ok | :error
+          }
   end
 
   defmodule RemoveMessage do
@@ -95,6 +109,16 @@ defmodule LangEx.Message do
   def tool(content, tool_call_id, opts \\ []) do
     struct!(Tool, [{:content, content}, {:tool_call_id, tool_call_id} | opts])
   end
+
+  @doc "Create a tool result message marked as a failure."
+  @spec tool_error(String.t(), String.t(), keyword()) :: Tool.t()
+  def tool_error(content, tool_call_id, opts \\ []),
+    do: tool(content, tool_call_id, Keyword.put(opts, :status, :error))
+
+  @doc "True when `message` is a tool result reporting a failure."
+  @spec tool_error?(term()) :: boolean()
+  def tool_error?(%Tool{status: :error}), do: true
+  def tool_error?(_message), do: false
 
   @doc "Create a `RemoveMessage` targeting a single message by its `:id`."
   @spec remove(String.t()) :: RemoveMessage.t()

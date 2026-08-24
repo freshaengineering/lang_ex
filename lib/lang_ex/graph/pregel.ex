@@ -14,7 +14,10 @@ defmodule LangEx.Graph.Pregel do
   ## Interrupt model
 
   Every `LangEx.Interrupt.interrupt/1` call gets a stable ID derived from
-  the node name and the call order within the node (`"node:0"`, `"node:1"`).
+  the executing work entry and the call order within it (`"node:0"`,
+  `"node:1"`). A `%LangEx.Send{}` entry contributes its stamped ID, so
+  parallel Sends to the same node get distinct interrupt IDs
+  (`"node#Ab3f:0"`) and each fan-out branch is answered separately.
   Resume values are keyed by interrupt ID, so a node can interrupt multiple
   times across resume cycles, and several nodes interrupting in the same
   parallel super-step each keep their own pending entry. Completed sibling
@@ -31,8 +34,10 @@ defmodule LangEx.Graph.Pregel do
   """
 
   alias LangEx.Checkpoint
+  alias LangEx.Checkpointer
   alias LangEx.Command
   alias LangEx.Graph.Compiled
+  alias LangEx.Graph.Journal
   alias LangEx.Graph.NodeCache
   alias LangEx.Graph.RetryPolicy
   alias LangEx.Graph.State
@@ -84,9 +89,10 @@ defmodule LangEx.Graph.Pregel do
 
   def run(%Compiled{} = graph, state, %{} = opts) do
     metadata = graph_invoke_metadata(graph, opts)
+    run_opts = Map.put(opts, :ephemeral, graph.ephemeral)
 
     Runs.span([:lang_ex, :graph, :invoke], metadata, fn ->
-      result = run_graph(graph, state, opts)
+      result = run_graph(graph, state, run_opts)
       {result, Map.put(metadata, :result, result_tag(result))}
     end)
   end
@@ -96,10 +102,42 @@ defmodule LangEx.Graph.Pregel do
   end
 
   defp run_graph(graph, state, opts) do
+    targets = initial_targets(Map.get(opts, :start_nodes), graph, state)
+    step(targets, graph, state, anchor_input(targets, state, opts))
+  end
+
+  # A fresh run records its starting state before any node executes. The
+  # run's input becomes visible in the thread history instead of being
+  # implied by the first step's output, and the first super-step gains a
+  # checkpoint to anchor its write journal to — without one, a crash in
+  # step 0 has nothing to recover against.
+  defp anchor_input(targets, state, opts) do
     opts
-    |> Map.get(:start_nodes)
-    |> initial_targets(graph, state)
-    |> step(graph, state, opts)
+    |> fresh_thread?()
+    |> record_input(targets, state, opts)
+  end
+
+  defp fresh_thread?(%{checkpointer: nil}), do: false
+
+  defp fresh_thread?(opts) do
+    is_nil(Map.get(opts, :start_nodes)) and
+      Map.get(opts, :durability, :sync) != :exit and
+      not is_nil(Keyword.get(opts.config, :thread_id))
+  end
+
+  defp record_input(false, _targets, _state, opts), do: opts
+
+  defp record_input(true, targets, state, %{checkpointer: cp, config: config} = opts) do
+    config
+    |> Keyword.get(:thread_id)
+    |> persist_checkpoint(cp, config, :sync,
+      state: persistable(state, opts),
+      next_nodes: targets,
+      step: 0,
+      source: :input,
+      metadata: %{}
+    )
+    |> then(&with_parent(opts, &1))
   end
 
   defp initial_targets(nil, graph, state), do: resolve_targets(graph, :__start__, state)
@@ -122,7 +160,7 @@ defmodule LangEx.Graph.Pregel do
     :ok = validate_active!(graph, active)
 
     active
-    |> Enum.split_with(&deferred?(graph, &1))
+    |> Enum.split_with(&barred?(graph, &1, active))
     |> run_ready(graph, state, opts)
   end
 
@@ -142,18 +180,33 @@ defmodule LangEx.Graph.Pregel do
             "Check Command goto and Send targets."
   end
 
-  defp deferred?(graph, entry) do
+  defp barred?(graph, entry, active) do
     graph.node_opts
     |> Map.get(entry_name(entry), [])
     |> Keyword.get(:defer, false)
+    |> barrier_holds?(entry, active)
   end
 
-  # Deferred nodes wait until no other node is active — a fan-in barrier.
-  defp run_ready({deferred, []}, graph, state, opts),
-    do: run_super_step(deferred, graph, state, opts)
+  defp barrier_holds?(false, _entry, _active), do: false
+  defp barrier_holds?(true, _entry, _active), do: true
 
-  defp run_ready({deferred, ready}, graph, state, opts),
-    do: run_super_step(ready, graph, state, Map.put(opts, :deferred_backlog, deferred))
+  # A scoped barrier waits only for the nodes it names, so a merge node
+  # runs as soon as its own branches have landed rather than queueing
+  # behind everything else in the graph.
+  defp barrier_holds?(sources, entry, active) when is_list(sources) do
+    active
+    |> Enum.reject(&(&1 == entry))
+    |> Enum.any?(&(entry_name(&1) in sources))
+  end
+
+  # Barred nodes wait until nothing they are waiting on is active. When
+  # every active node is barred the barrier releases, so mutually barring
+  # nodes make progress instead of deadlocking.
+  defp run_ready({barred, []}, graph, state, opts),
+    do: run_super_step(barred, graph, state, opts)
+
+  defp run_ready({barred, ready}, graph, state, opts),
+    do: run_super_step(ready, graph, state, Map.put(opts, :deferred_backlog, barred))
 
   defp run_super_step([], graph, state, opts), do: finalize_run(graph, state, opts)
 
@@ -205,12 +258,13 @@ defmodule LangEx.Graph.Pregel do
   defp execute_super_step(active, graph, state, opts) do
     emit(opts, {:step_start, opts.step, active})
     metadata = %{step: opts.step, active_nodes: active}
+    step_opts = Map.put(opts, :journal, Journal.load(opts))
 
     Runs.span([:lang_ex, :graph, :step], metadata, fn ->
       result =
         state
-        |> inject_managed(opts)
-        |> then(&execute_nodes(graph, &1, active, opts))
+        |> inject_managed(step_opts)
+        |> then(&execute_nodes(graph, &1, active, step_opts))
         |> handle_super_step_result(graph, active, state, opts)
 
       {result, metadata}
@@ -226,10 +280,10 @@ defmodule LangEx.Graph.Pregel do
          {new_state, cmds, [_ | _] = interrupts},
          graph,
          active,
-         _state,
+         state,
          opts
        ) do
-    clean = strip_managed(new_state, graph)
+    clean = settle(new_state, state, graph, opts)
     pending = interrupts |> Enum.map(&interrupt_entry/1) |> dedup_targets()
 
     save_interrupts(
@@ -241,8 +295,8 @@ defmodule LangEx.Graph.Pregel do
     )
   end
 
-  defp handle_super_step_result({new_state, command_targets, []}, graph, active, _state, opts) do
-    clean = strip_managed(new_state, graph)
+  defp handle_super_step_result({new_state, command_targets, []}, graph, active, state, opts) do
+    clean = settle(new_state, state, graph, opts)
     emit(opts, {:step_end, opts.step, clean})
 
     next =
@@ -328,7 +382,7 @@ defmodule LangEx.Graph.Pregel do
     config
     |> Keyword.get(:thread_id)
     |> persist_checkpoint(cp, config, :sync,
-      state: state,
+      state: persistable(state, opts),
       next_nodes: [:__end__],
       step: opts.step,
       parent_id: Map.get(opts, :parent_id),
@@ -355,7 +409,7 @@ defmodule LangEx.Graph.Pregel do
     config
     |> Keyword.get(:thread_id)
     |> persist_checkpoint(cp, config, :sync,
-      state: state,
+      state: persistable(state, opts),
       next_nodes: active,
       step: opts.step,
       parent_id: Map.get(opts, :parent_id),
@@ -402,6 +456,13 @@ defmodule LangEx.Graph.Pregel do
 
   defp entry_name(%Send{node: node}), do: node
   defp entry_name(node) when is_atom(node), do: node
+
+  # The interrupt scope of a work entry. Plain nodes key on their name, so
+  # IDs recorded before Sends were individually addressable still resolve.
+  # A stamped Send adds its ID, giving each fan-out branch its own scope.
+  defp entry_task_key(%Send{node: node, id: nil}), do: to_string(node)
+  defp entry_task_key(%Send{node: node, id: id}), do: "#{node}##{id}"
+  defp entry_task_key(node) when is_atom(node), do: to_string(node)
 
   defp entry_input(%Send{state: payload}, _shared_state), do: payload
   defp entry_input(node, shared_state) when is_atom(node), do: shared_state
@@ -508,6 +569,23 @@ defmodule LangEx.Graph.Pregel do
   end
 
   defp call_node(graph, entry, state, opts) do
+    opts
+    |> Map.get(:journal, %{})
+    |> Map.fetch(entry_task_key(entry))
+    |> replay_or_execute(graph, entry, state, opts)
+  end
+
+  # Work already recorded for this step is not re-run; its result is
+  # handed back as if the node had just produced it.
+  defp replay_or_execute({:ok, update}, _graph, _entry, _state, _opts), do: update
+
+  defp replay_or_execute(:error, graph, entry, state, opts) do
+    graph
+    |> execute_node_call(entry, state, opts)
+    |> journal_result(entry, opts)
+  end
+
+  defp execute_node_call(graph, entry, state, opts) do
     name = entry_name(entry)
     node = fetch_node!(graph, name)
     policy = Map.get(graph.node_opts, name, [])
@@ -524,6 +602,17 @@ defmodule LangEx.Graph.Pregel do
     after
       clear_node_context()
     end
+  end
+
+  # Only work that completed normally is journaled. An interrupt or a
+  # failure is already fully described by the checkpoint the engine writes
+  # for it, and replaying either would skip the pause or hide the error.
+  defp journal_result({:interrupted, _, _} = result, _entry, _opts), do: result
+  defp journal_result({:graph_error, _} = result, _entry, _opts), do: result
+
+  defp journal_result(result, entry, opts) do
+    Journal.record(opts, entry_task_key(entry), entry_name(entry), result)
+    result
   end
 
   defp fetch_node!(graph, name) do
@@ -568,19 +657,43 @@ defmodule LangEx.Graph.Pregel do
   end
 
   defp run_cached(cache_opts, policy, node, entry, state, opts) do
-    key = {entry_name(entry), :erlang.phash2({node, state})}
+    input = cache_input(cache_opts, node, state)
 
-    key
-    |> NodeCache.fetch({node, state})
-    |> serve_cached(key, cache_opts, policy, node, entry, state, opts)
+    {entry_name(entry), :erlang.phash2(input)}
+    |> NodeCache.fetch(input)
+    |> serve_cached(input, cache_opts, policy, node, entry, state, opts)
   end
 
-  defp serve_cached({:ok, result}, _key, _cache_opts, _policy, _node, _entry, _state, _opts),
+  # Keying on the whole input state misses whenever any unrelated key
+  # changes, which for a long-running conversation is every super-step. A
+  # `key:` function narrows the key to what the node actually reads, so
+  # an expensive node keeps its cache across churn elsewhere in the state.
+  defp cache_input(true, node, state), do: {node, state}
+
+  defp cache_input(cache_opts, node, state) when is_list(cache_opts) do
+    cache_opts
+    |> Keyword.get(:key)
+    |> derive_cache_input(node, state)
+  end
+
+  defp derive_cache_input(nil, node, state), do: {node, state}
+
+  defp derive_cache_input(key_fn, node, state) when is_function(key_fn, 1),
+    do: {node, key_fn.(state)}
+
+  defp serve_cached({:ok, result}, _input, _cache_opts, _policy, _node, _entry, _state, _opts),
     do: result
 
-  defp serve_cached(:miss, key, cache_opts, policy, node, entry, state, opts) do
+  defp serve_cached(:miss, input, cache_opts, policy, node, entry, state, opts) do
     result = run_retried(policy, node, entry, state, opts)
-    NodeCache.store(key, {node, state}, result, cache_ttl(cache_opts))
+
+    NodeCache.store(
+      {entry_name(entry), :erlang.phash2(input)},
+      input,
+      result,
+      cache_ttl(cache_opts)
+    )
+
     result
   end
 
@@ -785,7 +898,7 @@ defmodule LangEx.Graph.Pregel do
     %{
       recursion_limit: opts.recursion_limit,
       checkpointer: subgraph.checkpointer,
-      config: subgraph_config(opts.config, name),
+      config: subgraph_config(opts.config, name, opts),
       context: opts.context,
       resume: nil,
       resume_values: resume_values(opts),
@@ -799,16 +912,27 @@ defmodule LangEx.Graph.Pregel do
     }
   end
 
-  defp subgraph_config(config, name) do
+  # A subgraph shares the parent's thread and descends into its own
+  # namespace, so one thread ID still addresses the whole run tree. It
+  # also records the parent's current checkpoint, keeping lineage
+  # reconstructable across the graph boundary.
+  defp subgraph_config(config, name, opts) do
+    parent_ns = Checkpointer.namespace(config)
+
     config
-    |> Keyword.get(:thread_id)
-    |> namespace_thread(Keyword.delete(config, :checkpoint_id), name)
+    |> Keyword.delete(:checkpoint_id)
+    |> Keyword.put(:checkpoint_ns, Checkpoint.child_ns(parent_ns, name))
+    |> Keyword.put(:checkpoint_parents, parents(config, parent_ns, opts))
   end
 
-  defp namespace_thread(nil, config, _name), do: config
+  defp parents(config, parent_ns, opts) do
+    config
+    |> Keyword.get(:checkpoint_parents, %{})
+    |> put_parent(parent_ns, Map.get(opts, :parent_id))
+  end
 
-  defp namespace_thread(thread_id, config, name),
-    do: Keyword.put(config, :thread_id, "#{thread_id}/#{name}")
+  defp put_parent(parents, _ns, nil), do: parents
+  defp put_parent(parents, ns, checkpoint_id), do: Map.put(parents, ns, checkpoint_id)
 
   defp unwrap_subgraph({:ok, result}), do: result
 
@@ -821,6 +945,7 @@ defmodule LangEx.Graph.Pregel do
 
   defp prepare_node_context(entry, opts) do
     Process.put(:lang_ex_current_node, entry_name(entry))
+    Process.put(:lang_ex_current_task, entry_task_key(entry))
     Process.put(:lang_ex_interrupt_counter, 0)
     Process.put(:lang_ex_resume_values, resume_values(opts))
     Process.put(:lang_ex_stream_emit, opts.emit_to)
@@ -829,6 +954,7 @@ defmodule LangEx.Graph.Pregel do
 
   defp clear_node_context do
     Process.delete(:lang_ex_current_node)
+    Process.delete(:lang_ex_current_task)
     Process.delete(:lang_ex_interrupt_counter)
     Process.delete(:lang_ex_resume_values)
     Process.delete(:lang_ex_stream_emit)
@@ -902,11 +1028,14 @@ defmodule LangEx.Graph.Pregel do
     |> dedup_targets()
   end
 
-  # Duplicate Sends are distinct units of work and must all run;
-  # only plain node targets are deduplicated.
+  # Duplicate Sends are distinct units of work and must all run; only plain
+  # node targets are deduplicated. Every Send is stamped with an ID as it
+  # enters a super-step, which is what makes even two identical payloads
+  # separately addressable once persisted. Stamping is idempotent, so
+  # entries carried across a pause keep the ID they were saved with.
   defp dedup_targets(targets) do
     {sends, nodes} = Enum.split_with(targets, &match?(%Send{}, &1))
-    Enum.uniq(nodes) ++ sends
+    Enum.uniq(nodes) ++ Enum.map(sends, &Send.stamp/1)
   end
 
   defp resolve_conditional(:error, _state), do: []
@@ -997,6 +1126,33 @@ defmodule LangEx.Graph.Pregel do
 
   defp tokens_exhausted?(_state, _opts), do: false
 
+  # Closes out a super-step: drops engine-managed values and expires
+  # ephemeral keys that were not written during this step.
+  defp settle(new_state, state_before, graph, opts) do
+    new_state
+    |> strip_managed(graph)
+    |> expire_ephemeral(state_before, opts)
+  end
+
+  # An ephemeral key written during this step survives into the next one,
+  # which is the whole point — a node signals the step that follows. One
+  # that went untouched already had its turn and resets now.
+  defp expire_ephemeral(state, state_before, %{ephemeral: defaults})
+       when map_size(defaults) > 0 do
+    defaults
+    |> Enum.reject(fn {key, _default} -> Map.get(state, key) != Map.get(state_before, key) end)
+    |> Enum.reduce(state, fn {key, default}, acc -> Map.put(acc, key, default) end)
+  end
+
+  defp expire_ephemeral(state, _state_before, _opts), do: state
+
+  # Ephemeral keys never reach storage: their value is a signal scoped to
+  # a super-step, and a stale one revived by a resume would be a bug.
+  defp persistable(state, %{ephemeral: defaults}) when map_size(defaults) > 0,
+    do: Map.drop(state, Map.keys(defaults))
+
+  defp persistable(state, _opts), do: state
+
   defp strip_managed(state, %Compiled{initial_state: initial}) do
     Enum.reduce(@managed_keys, state, fn key, acc ->
       initial
@@ -1025,7 +1181,7 @@ defmodule LangEx.Graph.Pregel do
     config
     |> Keyword.get(:thread_id)
     |> persist_checkpoint(cp, config, durability,
-      state: state,
+      state: persistable(state, opts),
       next_nodes: nodes,
       step: step,
       parent_id: Map.get(opts, :parent_id),
@@ -1036,13 +1192,24 @@ defmodule LangEx.Graph.Pregel do
   defp persist_checkpoint(nil, _cp, _config, _durability, _data), do: nil
 
   defp persist_checkpoint(thread_id, cp, config, durability, data) do
-    checkpoint = Checkpoint.new([{:thread_id, thread_id} | data])
+    checkpoint = Checkpoint.new(checkpoint_attrs(thread_id, config, data))
     write_checkpoint(durability, cp, config, checkpoint, thread_id)
+    Journal.discard(cp, config, Keyword.get(data, :parent_id), Keyword.fetch!(data, :step))
     checkpoint.checkpoint_id
   end
 
+  defp checkpoint_attrs(thread_id, config, data) do
+    data
+    |> Keyword.put(:thread_id, thread_id)
+    |> Keyword.put(:checkpoint_ns, Checkpointer.namespace(config))
+    |> Keyword.put_new(:source, :step)
+    |> Keyword.update!(:metadata, &Map.put(&1, :parents, ancestor_checkpoints(config)))
+  end
+
+  defp ancestor_checkpoints(config), do: Keyword.get(config, :checkpoint_parents, %{})
+
   defp write_checkpoint(:sync, cp, config, checkpoint, thread_id) do
-    metadata = %{checkpointer: cp, thread_id: thread_id}
+    metadata = %{checkpointer: cp, thread_id: thread_id, checkpoint_ns: checkpoint.checkpoint_ns}
 
     Runs.span([:lang_ex, :checkpoint, :save], metadata, fn ->
       {cp.save(config, checkpoint), metadata}
@@ -1081,7 +1248,7 @@ defmodule LangEx.Graph.Pregel do
     config
     |> Keyword.get(:thread_id)
     |> persist_checkpoint(cp, config, :sync,
-      state: state,
+      state: persistable(state, opts),
       next_nodes: pending,
       step: step,
       parent_id: Map.get(opts, :parent_id),

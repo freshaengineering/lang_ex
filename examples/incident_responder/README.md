@@ -127,6 +127,26 @@ Or use the programmatic API:
 {:ok, response} = IncidentResponder.chat(session_id, "yes, restart it")
 ```
 
+## Session lifecycle
+
+A durable session is not only started and resumed — it is audited,
+branched, closed, and eventually aged out:
+
+```elixir
+# Who changed this incident's state by hand, and when
+IncidentResponder.edit_history(session_id)
+
+# Snapshot before a risky remediation, then explore on the copy
+{:ok, branch} = IncidentResponder.branch_session(session_id, "#{session_id}-what-if")
+
+# Close the incident for good (removes subgraph namespaces too)
+IncidentResponder.close_session(session_id)
+
+# Retention job: drop checkpoints older than 30 days, keeping the last 5
+# per session so a live incident stays resumable
+IncidentResponder.enforce_retention(days: 30, keep_latest: 5)
+```
+
 ## What This Demonstrates
 
 - `LangEx.Tool.Node.node/2` for executing diagnostic and action tools as a graph node
@@ -138,6 +158,10 @@ Or use the programmatic API:
 - `Graph.add_conditional_edges` for intent-based routing (question vs incident vs goodbye)
 - `LangEx.LLM.Resilient.chat/3` for LLM calls with retries, backoff, and a fallback message
 - `LangEx.Checkpointer.Postgres` for durable session state
+- `LangEx.get_state_history/2` with `source:` for a provenance-filtered audit trail
+- `LangEx.copy_thread/3` for branching a live session without disturbing it
+- `LangEx.delete_thread/2` for closing a session, subgraph namespaces included
+- `LangEx.Checkpointer.Postgres.prune/2` for enforcing a retention window
 
 For small, runnable feature tours (no API key or database needed), see
 [`examples/scripts`](../scripts).

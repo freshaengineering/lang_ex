@@ -35,6 +35,7 @@ defmodule LangEx.Middleware.ModelFallback do
 
   alias LangEx.LLM.ChatModel
   alias LangEx.Middleware
+  alias LangEx.Middleware.ModelRequest
 
   @type model_spec :: String.t() | {module(), String.t()}
 
@@ -85,23 +86,28 @@ defmodule LangEx.Middleware.ModelFallback do
     attempt_fallbacks(rest, request, llm_opts, exception, stacktrace)
   end
 
-  # Mirrors LangEx.Prebuilt.model_fn/1: a ChatModel node built with the
-  # request's tools, called with the request's messages and usage over state.
+  # Mirrors LangEx.Prebuilt.model_fn/1: the request's tools, prompt and
+  # provider options are kept; only the model it names is replaced, since
+  # that is the part that just failed.
   defp call_fallback(spec, request, llm_opts) do
-    spec
-    |> fallback_opts(request.tools, llm_opts)
+    request
+    |> ModelRequest.provider_opts(llm_opts)
+    |> pin_model(spec)
     |> ChatModel.node()
     |> then(& &1.(fallback_state(request)))
   end
 
-  defp fallback_opts({provider, model}, tools, llm_opts),
-    do: [provider: provider, model: model] ++ Keyword.put(llm_opts, :tools, tools)
+  defp pin_model(opts, {provider, model}),
+    do: Keyword.merge(opts, provider: provider, model: model)
 
-  defp fallback_opts(model, tools, llm_opts) when is_binary(model),
-    do: [model: model] ++ Keyword.put(llm_opts, :tools, tools)
+  defp pin_model(opts, model) when is_binary(model),
+    do: opts |> Keyword.delete(:provider) |> Keyword.put(:model, model)
 
-  defp fallback_state(%{messages: messages, state: state}) do
-    Map.merge(state, %{messages: messages, llm_usage: Map.get(state, :llm_usage, %{})})
+  defp fallback_state(request) do
+    Map.merge(request.state, %{
+      messages: ModelRequest.resolved_messages(request),
+      llm_usage: Map.get(request.state, :llm_usage, %{})
+    })
   end
 
   defp model_name({_provider, model}), do: model

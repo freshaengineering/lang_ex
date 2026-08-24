@@ -116,7 +116,7 @@ defmodule LangEx.Tool.Node do
 
       state
       |> Map.fetch!(messages_key)
-      |> extract_tool_calls()
+      |> pending_tool_calls()
       |> then(
         &execute_all(
           &1,
@@ -136,8 +136,8 @@ defmodule LangEx.Tool.Node do
   @doc """
   Routing condition for tool-calling workflows.
 
-  Returns `:tools` when the last message has pending tool calls,
-  `:__end__` otherwise. Use with `Graph.add_conditional_edges/4`.
+  Returns `:tools` while the last AI message has tool calls awaiting a
+  reply, `:__end__` otherwise. Use with `Graph.add_conditional_edges/4`.
 
   ## Options
 
@@ -149,17 +149,49 @@ defmodule LangEx.Tool.Node do
 
     state
     |> Map.get(messages_key, [])
-    |> List.last()
+    |> pending_tool_calls()
     |> has_tool_calls?()
   end
 
-  defp has_tool_calls?(%Message.AI{tool_calls: [_ | _]}), do: :tools
-  defp has_tool_calls?(_), do: :__end__
+  @doc """
+  The tool calls in `messages` still awaiting a reply.
 
-  defp extract_tool_calls(messages) do
-    messages
-    |> List.last()
+  Only calls without a `%LangEx.Message.Tool{}` result are pending, so a
+  reviewer can answer a call in advance — denying a destructive one, say —
+  by appending its result, and the rest of the batch still runs. A new
+  human turn retires any call left unanswered before it.
+  """
+  @spec pending_calls([Message.t()]) :: [Message.ToolCall.t()]
+  def pending_calls(messages), do: pending_tool_calls(messages)
+
+  defp has_tool_calls?([]), do: :__end__
+  defp has_tool_calls?([_ | _]), do: :tools
+
+  defp pending_tool_calls(messages) do
+    {trailing, rest} =
+      messages
+      |> Enum.reverse()
+      |> Enum.split_while(&(not match?(%Message.AI{}, &1)))
+
+    rest
+    |> List.first()
     |> last_tool_calls()
+    |> drop_answered(trailing)
+  end
+
+  defp drop_answered(calls, trailing) do
+    trailing
+    |> Enum.any?(&match?(%Message.Human{}, &1))
+    |> keep_unanswered(calls, trailing)
+  end
+
+  defp keep_unanswered(true, _calls, _trailing), do: []
+
+  defp keep_unanswered(false, calls, trailing) do
+    trailing
+    |> Enum.filter(&match?(%Message.Tool{}, &1))
+    |> MapSet.new(& &1.tool_call_id)
+    |> then(fn answered -> Enum.reject(calls, &MapSet.member?(answered, &1.id)) end)
   end
 
   defp last_tool_calls(%Message.AI{tool_calls: calls}) when calls != [], do: calls
@@ -370,14 +402,14 @@ defmodule LangEx.Tool.Node do
     @tool_error_template
     |> :io_lib.format([Exception.message(exception)])
     |> to_string()
-    |> Message.tool(call.id)
+    |> Message.tool_error(call.id)
   end
 
   defp format_error(_exception, call, message) when is_binary(message),
-    do: Message.tool(message, call.id)
+    do: Message.tool_error(message, call.id)
 
   defp format_error(exception, call, handler) when is_function(handler, 1),
-    do: Message.tool(handler.(exception), call.id)
+    do: Message.tool_error(handler.(exception), call.id)
 
   defp invalid_tool_message(call, tools_by_name) do
     tools_by_name
@@ -385,7 +417,7 @@ defmodule LangEx.Tool.Node do
     |> Enum.join(", ")
     |> then(&:io_lib.format(@invalid_tool_template, [call.name, &1]))
     |> to_string()
-    |> Message.tool(call.id)
+    |> Message.tool_error(call.id)
   end
 
   defp encode_result(result) when is_binary(result), do: result

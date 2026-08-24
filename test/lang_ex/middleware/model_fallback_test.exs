@@ -4,6 +4,7 @@ defmodule LangEx.Middleware.ModelFallbackTest do
 
   alias LangEx.Message
   alias LangEx.Middleware.ModelFallback
+  alias LangEx.Middleware.ModelRequest
   alias LangEx.Tool
 
   @moduletag :capture_log
@@ -19,11 +20,12 @@ defmodule LangEx.Middleware.ModelFallbackTest do
 
       middleware = ModelFallback.new(models: ["claude-sonnet-5"])
 
-      request = %{
-        messages: [Message.human("hi")],
-        tools: [],
-        state: %{messages: [Message.human("hi")], llm_usage: %{}}
-      }
+      request =
+        ModelRequest.new(
+          messages: [Message.human("hi")],
+          tools: [],
+          state: %{messages: [Message.human("hi")], llm_usage: %{}}
+        )
 
       update =
         middleware.wrap_model_call.(request, fn _request ->
@@ -46,11 +48,12 @@ defmodule LangEx.Middleware.ModelFallbackTest do
       middleware =
         ModelFallback.new(models: ["claude-sonnet-5"], llm_opts: [temperature: 0.2])
 
-      request = %{
-        messages: [Message.human("hi")],
-        tools: [%Tool{name: "logs", description: "read logs", parameters: %{}}],
-        state: %{messages: [Message.human("hi")], llm_usage: %{}}
-      }
+      request =
+        ModelRequest.new(
+          messages: [Message.human("hi")],
+          tools: [%Tool{name: "logs", description: "read logs", parameters: %{}}],
+          state: %{messages: [Message.human("hi")], llm_usage: %{}}
+        )
 
       update = middleware.wrap_model_call.(request, fn _request -> raise "provider down" end)
 
@@ -74,11 +77,12 @@ defmodule LangEx.Middleware.ModelFallbackTest do
       middleware =
         ModelFallback.new(models: [{LangEx.LLM.OpenAI, "gpt-5"}, "claude-sonnet-5"])
 
-      request = %{
-        messages: [Message.human("hi")],
-        tools: [],
-        state: %{messages: [Message.human("hi")], llm_usage: %{}}
-      }
+      request =
+        ModelRequest.new(
+          messages: [Message.human("hi")],
+          tools: [],
+          state: %{messages: [Message.human("hi")], llm_usage: %{}}
+        )
 
       update = middleware.wrap_model_call.(request, fn _request -> raise "provider down" end)
 
@@ -92,11 +96,12 @@ defmodule LangEx.Middleware.ModelFallbackTest do
 
       middleware = ModelFallback.new(models: ["claude-sonnet-5"])
 
-      request = %{
-        messages: [Message.human("hi")],
-        tools: [],
-        state: %{messages: [Message.human("hi")], llm_usage: %{}}
-      }
+      request =
+        ModelRequest.new(
+          messages: [Message.human("hi")],
+          tools: [],
+          state: %{messages: [Message.human("hi")], llm_usage: %{}}
+        )
 
       assert_raise RuntimeError, "primary down", fn ->
         middleware.wrap_model_call.(request, fn _request -> raise "primary down" end)
@@ -106,11 +111,12 @@ defmodule LangEx.Middleware.ModelFallbackTest do
     test "propagates the failure untouched when no fallback models are configured" do
       middleware = ModelFallback.new(models: [])
 
-      request = %{
-        messages: [Message.human("hi")],
-        tools: [],
-        state: %{messages: [Message.human("hi")], llm_usage: %{}}
-      }
+      request =
+        ModelRequest.new(
+          messages: [Message.human("hi")],
+          tools: [],
+          state: %{messages: [Message.human("hi")], llm_usage: %{}}
+        )
 
       assert_raise RuntimeError, "primary down", fn ->
         middleware.wrap_model_call.(request, fn _request -> raise "primary down" end)

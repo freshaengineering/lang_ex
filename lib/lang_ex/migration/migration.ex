@@ -39,12 +39,13 @@ defmodule LangEx.Migration do
       def down, do: LangEx.Migration.down(prefix: "private")
   """
 
-  @current_version 3
+  @current_version 4
 
   @migrations %{
     1 => LangEx.Migration.V1,
     2 => LangEx.Migration.V2,
-    3 => LangEx.Migration.V3
+    3 => LangEx.Migration.V3,
+    4 => LangEx.Migration.V4
   }
 
   @doc """

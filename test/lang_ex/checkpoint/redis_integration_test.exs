@@ -112,8 +112,124 @@ defmodule LangEx.Checkpointer.RedisIntegrationTest do
           checkpoint(thread, state: %{}, next_nodes: [], step: 0)
         )
 
-      {:ok, ttl} = Redix.command(conn, ["TTL", "lang_ex:thread:#{thread}"])
+      {:ok, ttl} = Redix.command(conn, ["TTL", "lang_ex:idx:#{thread}:"])
       assert ttl > 0 and ttl <= 120
+    end
+  end
+
+  describe "namespaces" do
+    test "subgraph checkpoints share the thread and are separated by namespace", %{conn: conn} do
+      thread = thread_id("ns")
+      root = config(conn, thread)
+      nested = root ++ [checkpoint_ns: "planner"]
+
+      :ok = Redis.save(root, checkpoint(thread, state: %{v: :root}, next_nodes: [], step: 0))
+
+      :ok =
+        Redis.save(
+          nested,
+          checkpoint(thread,
+            state: %{v: :nested},
+            next_nodes: [],
+            step: 0,
+            checkpoint_ns: "planner"
+          )
+        )
+
+      assert {:ok, %Checkpoint{state: %{v: :root}}} = Redis.load(root)
+      assert {:ok, %Checkpoint{state: %{v: :nested}}} = Redis.load(nested)
+      assert [_one] = Redis.list(root)
+    end
+
+    test "delete_thread removes every namespace of the thread", %{conn: conn} do
+      thread = thread_id("ns-del")
+      root = config(conn, thread)
+      nested = root ++ [checkpoint_ns: "planner"]
+
+      :ok = Redis.save(root, checkpoint(thread, state: %{}, next_nodes: [], step: 0))
+
+      :ok =
+        Redis.save(
+          nested,
+          checkpoint(thread, state: %{}, next_nodes: [], step: 0, checkpoint_ns: "planner")
+        )
+
+      :ok = Redis.delete_thread(root)
+
+      assert Redis.load(root) == :none
+      assert Redis.load(nested) == :none
+    end
+  end
+
+  describe "copy_thread/2" do
+    test "the copy carries every namespace and stays independent", %{conn: conn} do
+      source = thread_id("copy-src")
+      target = thread_id("copy-dst")
+      nested = config(conn, source) ++ [checkpoint_ns: "planner"]
+
+      :ok = Redis.save(config(conn, source), checkpoint(source, state: %{v: 1}, step: 0))
+
+      :ok =
+        Redis.save(
+          nested,
+          checkpoint(source, state: %{v: 2}, step: 0, checkpoint_ns: "planner")
+        )
+
+      :ok = Redis.copy_thread(config(conn, source), target)
+      :ok = Redis.save(config(conn, target), checkpoint(target, state: %{v: 99}, step: 1))
+
+      assert {:ok, %Checkpoint{state: %{v: 99}}} = Redis.load(config(conn, target))
+      assert {:ok, %Checkpoint{state: %{v: 1}}} = Redis.load(config(conn, source))
+
+      assert {:ok, %Checkpoint{thread_id: ^target, state: %{v: 2}}} =
+               Redis.load(config(conn, target) ++ [checkpoint_ns: "planner"])
+    end
+  end
+
+  describe "history pagination and provenance" do
+    test "the :before cursor pages backwards and :source filters", %{conn: conn} do
+      thread = thread_id("page")
+      cfg = config(conn, thread)
+
+      Enum.each(0..3, fn step ->
+        :ok =
+          Redis.save(
+            cfg,
+            checkpoint(thread,
+              state: %{v: step},
+              next_nodes: [],
+              step: step,
+              source: source_for(step)
+            )
+          )
+      end)
+
+      [newest | rest] = Redis.list(cfg)
+
+      assert Enum.map(Redis.list(cfg, before: newest.checkpoint_id, limit: 2), & &1.step) ==
+               rest |> Enum.take(2) |> Enum.map(& &1.step)
+
+      assert [%Checkpoint{source: :input, step: 0}] = Redis.list(cfg, source: :input)
+    end
+
+    defp source_for(0), do: :input
+    defp source_for(_step), do: :step
+  end
+
+  describe "write journal" do
+    test "journaled work is readable until it is discarded", %{conn: conn} do
+      cfg = config(conn, thread_id("journal"))
+      write = %{task_id: "worker#abc", node: :worker, update: %{done: [:a]}, idx: 2}
+
+      :ok = Redis.put_writes(cfg, "anchor-1:2", write, [])
+
+      assert [%{task_id: "worker#abc", node: :worker, update: %{done: [:a]}, idx: 2}] =
+               Redis.load_writes(cfg, "anchor-1:2")
+
+      assert [] = Redis.load_writes(cfg, "other:2")
+
+      :ok = Redis.discard_writes(cfg, "anchor-1:2")
+      assert [] = Redis.load_writes(cfg, "anchor-1:2")
     end
   end
 
