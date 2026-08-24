@@ -128,7 +128,7 @@ defmodule LangEx.Prebuilt.Supervisor do
       view = task_view(state.messages)
 
       member
-      |> Compiled.invoke(%{:messages => view, @active_agent_key => name}, context: context)
+      |> Member.run_turn(%{:messages => view, @active_agent_key => name}, context)
       |> report(view, name, sup_name, output_mode)
     end
   end
@@ -142,8 +142,6 @@ defmodule LangEx.Prebuilt.Supervisor do
     }
   end
 
-  # A worker runs as a nested execution, so an interrupt or error inside it
-  # cannot resume across the team boundary — surface it as an error.
   defp report(outcome, _view, name, _sup_name, _output_mode) do
     raise "worker #{inspect(name)} did not complete normally: #{inspect(outcome)}"
   end

@@ -2,6 +2,7 @@ defmodule LangEx.Prebuilt.MemberTest do
   use ExUnit.Case, async: false
   use Mimic
 
+  alias LangEx.Command
   alias LangEx.Graph
   alias LangEx.Interrupt
   alias LangEx.Message
@@ -250,7 +251,7 @@ defmodule LangEx.Prebuilt.MemberTest do
   end
 
   describe "node/3 failure propagation" do
-    test "an interrupt inside a member raises a clear error" do
+    test "an interrupt outside a parent graph raises a clear error" do
       member =
         Graph.new(messages: {[], &Message.add_messages/2}, active_agent: :x)
         |> Graph.add_node(:pause, fn _state -> %{approved: Interrupt.interrupt("ok?")} end)
@@ -276,6 +277,60 @@ defmodule LangEx.Prebuilt.MemberTest do
       assert_raise RuntimeError, ~r/failed/, fn -> node.(%{messages: []}, nil) end
     end
   end
+
+  describe "node/3 inside a parent graph" do
+    test "an interrupt inside a member pauses the parent and resumes on the same thread" do
+      parent = team_with_pausing_member()
+      config = [thread_id: "member-interrupt-1"]
+
+      assert {:interrupt, :review, _paused} =
+               LangEx.invoke(parent, %{messages: [Message.human("hi")]}, config: config)
+
+      assert {:ok, %{messages: [%Message.Human{}, %Message.AI{content: "prepped"}]}} =
+               LangEx.invoke(parent, %Command{resume: true}, config: config)
+    end
+
+    test "resuming a member does not re-run nodes that already completed" do
+      {:ok, prep_runs} = Agent.start_link(fn -> 0 end)
+      parent = team_with_pausing_member(prep_runs)
+      config = [thread_id: "member-interrupt-2"]
+
+      {:interrupt, :review, _} =
+        LangEx.invoke(parent, %{messages: [Message.human("hi")]}, config: config)
+
+      {:ok, _result} = LangEx.invoke(parent, %Command{resume: true}, config: config)
+
+      assert Agent.get(prep_runs, & &1) == 1
+    end
+  end
+
+  defp team_with_pausing_member(prep_runs \\ nil) do
+    member =
+      Graph.new(messages: {[], &Message.add_messages/2}, active_agent: :reviewer)
+      |> Graph.add_node(:prep, fn _state ->
+        prep_runs
+        |> count_prep()
+        |> then(fn _ -> %{messages: [Message.ai("prepped")]} end)
+      end)
+      |> Graph.add_node(:ask, fn _state ->
+        :review
+        |> Interrupt.interrupt()
+        |> then(fn _approved -> %{} end)
+      end)
+      |> Graph.add_edge(:__start__, :prep)
+      |> Graph.add_edge(:prep, :ask)
+      |> Graph.add_edge(:ask, :__end__)
+      |> Graph.compile()
+
+    Graph.new(messages: {[], &Message.add_messages/2}, active_agent: :reviewer)
+    |> Graph.add_node(:reviewer, Member.node(member, :reviewer, :full_history))
+    |> Graph.add_edge(:__start__, :reviewer)
+    |> Graph.add_edge(:reviewer, :__end__)
+    |> Graph.compile(checkpointer: LangEx.Checkpointer.Memory)
+  end
+
+  defp count_prep(nil), do: :ok
+  defp count_prep(prep_runs), do: Agent.update(prep_runs, &(&1 + 1))
 
   defp ping_tool do
     %Tool{

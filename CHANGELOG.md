@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Interrupts inside team members resume on the parent thread
+
+- `LangEx.Prebuilt.Member.node/3` (and supervisor workers) used to turn an
+  inner `LangEx.Interrupt` into an error, so a human-in-the-loop pause
+  inside a swarm or supervisor member could not continue. A member turn
+  now runs as a child of the parent: same thread, a descended checkpoint
+  namespace, and the interrupt re-thrown so the team pauses. Resume the
+  parent with `%LangEx.Command{resume: value}` and the member continues
+  from the call site.
+- A child compiled without its own checkpointer inherits the parent's, so
+  nodes that already finished inside the member are not re-run on resume.
+
 ## v0.13.0
 
 Requires a new migration calling `LangEx.Migration.up()` (V4) for the Postgres
