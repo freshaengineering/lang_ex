@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Documentation
+
+- README rewritten as a product tour. Options, edge cases, and behaviours
+  stay in the module docs on HexDocs.
+
 ### Interrupts inside team members resume on the parent thread
 
 - `LangEx.Prebuilt.Member.node/3` (and supervisor workers) used to turn an

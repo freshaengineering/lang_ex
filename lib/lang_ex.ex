@@ -1,27 +1,37 @@
 defmodule LangEx do
   @moduledoc """
-  LangEx — LangGraph for Elixir.
+  Stateful LLM agents for Elixir.
 
-  A graph-based agent orchestration library inspired by LangGraph.
-  Build stateful, multi-step LLM workflows using nodes, edges,
-  conditional routing, and composable state reducers.
+  `invoke/3` and `stream/3` run a compiled graph. Build one with
+  `LangEx.Prebuilt.agent/1`, or with `LangEx.Graph` when the workflow
+  has a shape of its own.
 
-  ## Quick Start
-
-      alias LangEx.Graph
       alias LangEx.Message
+      alias LangEx.Tool
 
-      graph =
-        Graph.new(messages: {[], &Message.add_messages/2})
-        |> Graph.add_node(:greet, fn state ->
-          name = hd(state.messages).content
-          %{messages: [Message.ai("Hello, \#{name}!")]}
-        end)
-        |> Graph.add_edge(:__start__, :greet)
-        |> Graph.add_edge(:greet, :__end__)
-        |> Graph.compile()
+      lookup = %Tool{
+        name: "lookup_service",
+        description: "Health and error rate for a service.",
+        parameters: %{
+          type: "object",
+          properties: %{name: %{type: "string"}},
+          required: ["name"]
+        },
+        function: fn %{"name" => name} -> %{name: name, status: :degraded} end
+      }
 
-      {:ok, result} = LangEx.invoke(graph, %{messages: [Message.human("World")]})
+      agent =
+        LangEx.Prebuilt.agent(
+          model: "claude-sonnet-4-20250514",
+          system_prompt: "You are on-call. Diagnose, then recommend.",
+          tools: [lookup]
+        )
+
+      {:ok, result} =
+        LangEx.invoke(agent, %{messages: [Message.human("api-gateway 5xxs spiked")]})
+
+  See the [README](readme.html) for a tour — graphs, interrupts,
+  checkpointing, teams, and streaming.
   """
 
   alias LangEx.Graph.Compiled
