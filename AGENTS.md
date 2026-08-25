@@ -39,8 +39,10 @@ LangEx (facade: invoke/3, stream/3, get_state/2, get_state_history/2, update_sta
 │   ├── LLM.Anthropic                 # Claude adapter (streaming SSE)
 │   │   ├── Anthropic.SSE             # SSE state machine (internal)
 │   │   └── Anthropic.Formatter       # Message wire format (internal)
-│   ├── LLM.OpenAI                    # GPT adapter
-│   ├── LLM.Gemini                    # Gemini adapter
+│   ├── LLM.OpenAI                    # GPT adapter (streaming SSE)
+│   │   └── OpenAI.SSE                # SSE state machine (internal)
+│   ├── LLM.Gemini                    # Gemini adapter (streaming SSE)
+│   │   └── Gemini.SSE                # SSE state machine (internal)
 │   ├── LLM.Resilient                 # Retry wrapper with backoff
 │   ├── LLM.ChatModel                 # Graph node helper for LLM calls
 │   └── LLM.Registry                  # Provider resolution by model string
@@ -143,7 +145,9 @@ lib/lang_ex/
 │   ├── anthropic/sse.ex             → LangEx.LLM.Anthropic.SSE (@moduledoc false)
 │   ├── anthropic/formatter.ex       → LangEx.LLM.Anthropic.Formatter (@moduledoc false)
 │   ├── openai.ex                    → LangEx.LLM.OpenAI
+│   ├── openai/sse.ex                → LangEx.LLM.OpenAI.SSE (@moduledoc false)
 │   ├── gemini.ex                    → LangEx.LLM.Gemini
+│   ├── gemini/sse.ex                → LangEx.LLM.Gemini.SSE (@moduledoc false)
 │   ├── resilient.ex                 → LangEx.LLM.Resilient
 │   ├── chat_model.ex                → LangEx.LLM.ChatModel
 │   └── chat_models.ex               → LangEx.LLM.Registry
