@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Token streaming for OpenAI and Gemini
+
+- `LangEx.LLM.OpenAI` and `LangEx.LLM.Gemini` honor `:on_token` and
+  `:stream`, so `LangEx.stream(..., modes: [:messages])` yields
+  `{:message_delta, ...}` content chunks for every built-in provider.
+  Without those opts the adapters still send a single JSON completion —
+  existing batch tests and `invoke/3` are unchanged.
+- OpenAI requests `stream_options.include_usage` so the final SSE chunk
+  carries token counts. Gemini uses `streamGenerateContent?alt=sse`.
+  Tool-call / function-call payloads are assembled into the final
+  `Message.AI` and are not emitted as content deltas. Gemini thought
+  parts (`thought: true`) are excluded from content.
+
 ### Interrupts inside team members resume on the parent thread
 
 - `LangEx.Prebuilt.Member.node/3` (and supervisor workers) used to turn an
