@@ -28,9 +28,8 @@ defmodule LangEx.MixProject do
   end
 
   defp description do
-    "Graph-based agent orchestration for building stateful, multi-step LLM workflows " <>
-      "with nodes, edges, conditional routing, state reducers, human-in-the-loop interrupts, " <>
-      "and checkpointing. Inspired by LangGraph, built on BEAM primitives."
+    "Stateful LLM agents for Elixir. Graphs of functions, durable checkpoints, " <>
+      "and human-in-the-loop — LangGraph on the BEAM."
   end
 
   defp package do
@@ -47,6 +46,10 @@ defmodule LangEx.MixProject do
       extras: ["README.md", "CHANGELOG.md"],
       source_ref: "v#{@version}",
       groups_for_modules: [
+        Agents: [
+          LangEx.Prebuilt,
+          LangEx.Middleware
+        ],
         Graph: [
           LangEx.Graph,
           LangEx.Graph.Compiled,
@@ -65,6 +68,8 @@ defmodule LangEx.MixProject do
         ],
         Checkpointing: [
           LangEx.Checkpoint,
+          LangEx.Checkpoint.Codec,
+          LangEx.Checkpoint.Codec.Encrypted,
           LangEx.Checkpoint.Serializer,
           LangEx.Checkpointer,
           LangEx.Checkpointer.Memory,
@@ -95,12 +100,27 @@ defmodule LangEx.MixProject do
           LangEx.Tool.Annotation,
           LangEx.Tool.Node
         ],
+        Middleware: [
+          LangEx.Middleware.CallBudget,
+          LangEx.Middleware.ContextEditing,
+          LangEx.Middleware.Filesystem,
+          LangEx.Middleware.ModelFallback,
+          LangEx.Middleware.ModelRequest,
+          LangEx.Middleware.Rubric,
+          LangEx.Middleware.Subagent,
+          LangEx.Middleware.Summarization,
+          LangEx.Middleware.TodoList,
+          LangEx.Middleware.ToolApproval,
+          LangEx.Middleware.ToolRetry,
+          LangEx.Middleware.ToolSelector
+        ],
         Embeddings: [
           LangEx.Embedding.Hashing
         ],
         "Multi-Agent": [
           LangEx.Prebuilt.Handoff,
           LangEx.Prebuilt.Member,
+          LangEx.Prebuilt.Reflect,
           LangEx.Prebuilt.Supervisor,
           LangEx.Prebuilt.Swarm
         ],

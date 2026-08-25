@@ -1,416 +1,235 @@
 # LangEx
 
+[![CI](https://github.com/surgeventures/lang_ex/actions/workflows/ci.yaml/badge.svg)](https://github.com/surgeventures/lang_ex/actions/workflows/ci.yaml)
 [![Hex.pm](https://img.shields.io/hexpm/v/lang_ex.svg)](https://hex.pm/packages/lang_ex)
 [![Hex Docs](https://img.shields.io/badge/hex-docs-blue.svg)](https://hexdocs.pm/lang_ex)
 [![License](https://img.shields.io/hexpm/l/lang_ex.svg)](https://github.com/surgeventures/lang_ex/blob/main/LICENSE)
 
-Graph-based agent orchestration for Elixir. Build stateful, multi-step LLM workflows using nodes, edges, and conditional routing -- with the concurrency, fault tolerance, and streaming you get for free on the BEAM.
+Stateful LLM agents for Elixir. You write functions, wire them into a graph, and the BEAM keeps the run alive — across tool calls, crashes, and a human saying "wait."
 
 ```elixir
-tools = [
-  %LangEx.Tool{
-    name: "get_weather",
-    description: "Get current weather for a city",
-    parameters: %{type: "object", properties: %{city: %{type: "string"}}, required: ["city"]},
-    function: fn %{"city" => city} -> "#{city}: 22°C, sunny" end
-  }
-]
+alias LangEx.Message
+alias LangEx.Tool
 
-graph =
-  Graph.new(LangEx.MessagesState.schema())
-  |> Graph.add_node(:agent, LangEx.LLM.ChatModel.node(model: "claude-opus-4-20250514", tools: tools))
-  |> Graph.add_node(:tools, LangEx.Tool.Node.node(tools))
-  |> Graph.add_edge(:__start__, :agent)
-  |> Graph.add_conditional_edges(:agent, &LangEx.Tool.Node.tools_condition/1, %{
-    tools: :tools,
-    __end__: :__end__
-  })
-  |> Graph.add_edge(:tools, :agent)
-  |> Graph.compile()
+lookup = %Tool{
+  name: "lookup_service",
+  description: "Health, last deploy, and error rate for a service.",
+  parameters: %{
+    type: "object",
+    properties: %{name: %{type: "string"}},
+    required: ["name"]
+  },
+  function: fn
+    %{"name" => "api-gateway"} ->
+      %{status: :degraded, error_rate: 0.12, last_deploy: ~U[2026-08-25 09:14:00Z]}
 
-{:ok, result} = LangEx.invoke(graph, %{messages: [Message.human("Weather in Tokyo?")]})
+    %{"name" => name} ->
+      %{status: :healthy, error_rate: 0.0, name: name}
+  end
+}
+
+agent =
+  LangEx.Prebuilt.agent(
+    model: "claude-sonnet-4-20250514",
+    system_prompt: "You are on-call. Diagnose with tools, then recommend the next action.",
+    tools: [lookup]
+  )
+
+{:ok, result} =
+  LangEx.invoke(agent, %{messages: [Message.human("api-gateway 5xxs just spiked")]})
 ```
 
-Define a graph. Add nodes for LLM calls and tool execution. Wire them with edges and conditions. Compile. Invoke. The LLM decides when to call tools and when to respond -- LangEx orchestrates the loop.
+That is a tool-calling loop: the model decides when to call `lookup_service`, LangEx runs the function, and the conversation continues until there is an answer. Swap the stub for your metrics client. Add a checkpointer and the same agent survives a deploy.
 
-## Why LangEx?
+Inspired by [LangGraph](https://www.langchain.com/langgraph). Built on functions, messages, and supervisors — not threads and async/await.
 
-Python has [LangGraph](https://www.langchain.com/langgraph). Elixir deserves the same power, built on primitives that actually make sense for long-running, stateful agent workflows:
+## Why LangEx
 
-- **Parallel node execution** -- tool calls and graph nodes run concurrently via `Task.Supervisor`, not thread pools or async/await hacks
-- **Lightweight state machines** -- graph state lives in function arguments and checkpoints, not GenServers; thousands of agent threads cost nothing
-- **Interrupt and resume** -- pause execution for human approval, persist state to Redis or Postgres, resume hours later from exactly where you left off
-- **Streaming for free** -- execution events are a lazy Elixir `Stream`; pipe them to Phoenix channels, LiveView, or Server-Sent Events
-- **Fault tolerance** -- BEAM supervisors and process isolation mean one failing agent doesn't take down the rest
+- **Graphs are data.** Nodes are functions. Edges are routes. `compile/1` freezes the shape; `invoke/3` runs it. No GenServer per conversation.
+- **Checkpoints, not processes.** Memory, Redis, or Postgres. Crash mid-step, resume the thread. Pause for a human, come back tomorrow.
+- **Parallel is a `Task.Supervisor`.** Tool calls and sibling nodes run concurrently. One failing agent does not take the VM with it.
+- **Streaming is `Stream`.** Token deltas, node events, interrupts — pipe them to a LiveView, a channel, or `IO.write/1`.
 
 ## Installation
 
 ```elixir
 def deps do
   [
-    {:lang_ex, "~> 0.8.0"},
-
-    # Optional: for Redis checkpointing
-    {:redix, "~> 1.5"},
-
-    # Optional: for PostgreSQL checkpointing
-    {:postgrex, "~> 0.19"},
+    {:lang_ex, "~> 0.13.0"},
+    {:redix, "~> 1.5"},       # optional — Redis checkpoints
+    {:postgrex, "~> 0.19"},   # optional — Postgres checkpoints
     {:ecto_sql, "~> 3.12"}
   ]
 end
 ```
 
-The core library has zero infrastructure dependencies. Add a checkpointer only if you need pause/resume or durability.
-
-## Quick Start
-
-A minimal graph that routes messages by intent:
+API keys resolve from opts, then application config, then the environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`). Model strings pick the provider: `"claude-…"`, `"gpt-…"`, `"gemini-…"`.
 
 ```elixir
-alias LangEx.Graph
-alias LangEx.Message
-
-graph =
-  Graph.new(messages: {[], &Message.add_messages/2}, intent: nil)
-  |> Graph.add_node(:classify, fn state ->
-    content = List.last(state.messages).content
-    intent = if String.contains?(content, "weather"), do: "weather", else: "greeting"
-    %{intent: intent}
-  end)
-  |> Graph.add_node(:weather, fn _state -> %{messages: [Message.ai("It's sunny today!")]} end)
-  |> Graph.add_node(:greet, fn _state -> %{messages: [Message.ai("Hello there!")]} end)
-  |> Graph.add_edge(:__start__, :classify)
-  |> Graph.add_conditional_edges(:classify, &Map.get(&1, :intent), %{
-    "weather" => :weather,
-    "greeting" => :greet
-  })
-  |> Graph.add_edge(:weather, :__end__)
-  |> Graph.add_edge(:greet, :__end__)
-  |> Graph.compile()
-
-{:ok, result} = LangEx.invoke(graph, %{messages: [Message.human("What's the weather?")]})
+config :lang_ex, :anthropic, api_key: System.get_env("ANTHROPIC_API_KEY")
 ```
 
-**How it works:** `Graph.new` defines the state schema (with optional reducers per key). Nodes are functions that receive state and return updates. Edges wire nodes together. Conditional edges route dynamically based on state. `compile/1` validates and freezes the graph. `invoke/2` runs it.
+## A graph you can read
 
-## Configuration
-
-API keys are resolved in order: explicit opts, Application config, environment variables.
+`Prebuilt.agent/1` is the 80% path. When the workflow has a shape — triage, then a specialist, then a side effect — you write that shape down.
 
 ```elixir
-# Environment variables (recommended)
-# export ANTHROPIC_API_KEY=sk-ant-...
+defmodule Incident.Graph do
+  alias LangEx.Graph
+  alias LangEx.Message
 
-# Or application config
-config :lang_ex, :anthropic, api_key: "sk-ant-..."
-```
+  def build do
+    Graph.new(messages: {[], &Message.add_messages/2}, severity: nil)
+    |> Graph.add_node(:triage, &triage/1)
+    |> Graph.add_node(:page, &page/1)
+    |> Graph.add_node(:ticket, &ticket/1)
+    |> Graph.add_edge(:__start__, :triage)
+    |> Graph.add_conditional_edges(:triage, & &1.severity, %{
+      sev1: :page,
+      sev2: :ticket
+    })
+    |> Graph.add_edge(:page, :__end__)
+    |> Graph.add_edge(:ticket, :__end__)
+    |> Graph.compile()
+  end
 
-Model strings are auto-resolved to providers -- `"claude-opus-4-20250514"` routes to Anthropic, `"gemini-2.0-flash"` to Gemini, `"gpt-4o"` to OpenAI. Register custom providers at runtime:
+  defp triage(%{messages: messages}), do: %{severity: severity(List.last(messages))}
 
-```elixir
-LangEx.LLM.Registry.register_provider(:groq, MyApp.LLM.Groq)
-LangEx.LLM.Registry.register_prefix("llama-", :groq)
-```
+  defp severity(%{content: content}), do: severity_for(String.downcase(content))
+  defp severity_for(text) when text =~ "down", do: :sev1
+  defp severity_for(text) when text =~ "5xx", do: :sev1
+  defp severity_for(_text), do: :sev2
 
-## Features
-
-### Checkpointing
-
-Persist graph state after each step for pause/resume, fault recovery, and time-travel debugging.
-
-```elixir
-graph = Graph.new(...) |> ... |> Graph.compile(checkpointer: LangEx.Checkpointer.Redis)
-
-{:ok, result} = LangEx.invoke(graph, input, config: [thread_id: "my-thread"])
-```
-
-| | Memory | Redis | PostgreSQL |
-|---|---|---|---|
-| **Setup** | Built in, nothing to add | Add `redix` dep (auto-starts) | Add `ecto_sql` + run migration |
-| **Best for** | Development and tests (per-VM, lost on restart) | Fast iteration, ephemeral workflows | Durable state, transactional guarantees |
-
-For PostgreSQL, generate a migration and call `LangEx.Migration.up()`:
-
-```elixir
-defmodule MyApp.Repo.Migrations.AddLangEx do
-  use Ecto.Migration
-
-  def up, do: LangEx.Migration.up()
-  def down, do: LangEx.Migration.down()
+  defp page(_state), do: %{messages: [Message.ai("Paging the primary on-call.")]}
+  defp ticket(_state), do: %{messages: [Message.ai("Opened a ticket for the rotation.")]}
 end
+
+{:ok, %{severity: :sev1}} =
+  LangEx.invoke(Incident.Graph.build(), %{
+    messages: [LangEx.Message.human("api-gateway 5xxs just spiked")]
+  })
 ```
 
-Checkpoint write timing is controlled by the `:durability` invoke option:
+State keys can carry reducers (`messages: {[], &Message.add_messages/2}` appends and dedupes). Nodes return a patch, not the whole state. Replace `triage/1` with `LangEx.LLM.ChatModel.node/1` when the model should pick the route.
 
-| Mode | Writes | Trade-off |
-|---|---|---|
-| `:sync` (default) | After every super-step, on the hot path | Strongest crash recovery |
-| `:async` | After every super-step, in a supervised task | Lower latency; a crash may lose the latest step |
-| `:exit` | Only on interrupts, completion, and failures | Fastest; mid-run crash recovery restarts from `:__start__` |
+```mermaid
+flowchart LR
+  start((start)) --> triage
+  triage -->|sev1| page
+  triage -->|sev2| ticket
+  page --> finish((end))
+  ticket --> finish
+```
 
-Under every mode, checkpoints preserve full work entries — including pending
-`%LangEx.Send{}` payloads — so crash-continue and interrupt-resume pick up
-exactly where the run stopped (checkpoint format v2).
+## Pause, persist, resume
 
-### Human-in-the-Loop Interrupts
-
-Pause execution at any node, surface a payload to the caller, and resume with a human-provided value. Requires a checkpointer.
+`interrupt/1` inside a node pauses the run and surfaces a payload. Resume with `%LangEx.Command{resume: value}` on the same `thread_id`. A checkpointer is required — the thread has to live somewhere while the human thinks.
 
 ```elixir
+alias LangEx.Command
+alias LangEx.Graph
+alias LangEx.Interrupt
+
 graph =
-  Graph.new(value: 0, approved: false)
-  |> Graph.add_node(:check, fn state ->
-    approval = LangEx.Interrupt.interrupt("Approve value #{state.value}?")
-    %{approved: approval}
+  Graph.new(action: nil)
+  |> Graph.add_node(:plan, fn _state -> %{action: {:restart, "api-gateway"}} end)
+  |> Graph.add_node(:gate, fn state ->
+    %{action: Interrupt.interrupt({:approve, state.action})}
   end)
-  |> Graph.add_node(:finalize, fn state -> %{value: state.value * 10} end)
-  |> Graph.add_edge(:__start__, :check)
-  |> Graph.add_edge(:check, :finalize)
-  |> Graph.add_edge(:finalize, :__end__)
-  |> Graph.compile(checkpointer: LangEx.Checkpointer.Redis)
+  |> Graph.add_node(:apply, fn %{action: action} -> %{applied: action} end)
+  |> Graph.add_edge(:__start__, :plan)
+  |> Graph.add_edge(:plan, :gate)
+  |> Graph.add_edge(:gate, :apply)
+  |> Graph.add_edge(:apply, :__end__)
+  |> Graph.compile(checkpointer: LangEx.Checkpointer.Postgres)
 
-# Pauses at the interrupt
-{:interrupt, "Approve value 42?", _state} =
-  LangEx.invoke(graph, %{value: 42}, config: [thread_id: "approval-1"])
+config = [thread_id: "inc-4821", repo: MyApp.Repo]
 
-# Resume with the human's decision
-{:ok, result} =
-  LangEx.invoke(graph, %LangEx.Command{resume: true}, config: [thread_id: "approval-1"])
+{:interrupt, {:approve, {:restart, "api-gateway"}}, _state} =
+  LangEx.invoke(graph, %{}, config: config)
+
+{:ok, _result} =
+  LangEx.invoke(graph, %Command{resume: {:restart, "api-gateway"}}, config: config)
 ```
 
-On resume the interrupted node re-runs from the top: earlier `interrupt/1`
-calls return their recorded answers and execution continues past the pause
-point. Side effects placed before an interrupt therefore execute again —
-keep them idempotent or move them to a later node. `interrupt/1` must be
-called from a graph node function; calling it from tool functions or
-processes spawned inside a node raises.
+| | Memory | Redis | Postgres |
+|---|---|---|---|
+| **Use** | Tests, a single VM | Fast, shared across nodes | Durable, transactional |
+| **Setup** | Built in | add `redix` | add `ecto_sql`, run `LangEx.Migration.up()` |
 
-When a branch of a parallel super-step interrupts, completed siblings keep
-their results *and* their routing: their state updates merge before the
-pause and their next targets are recorded in the checkpoint, so nothing is
-re-executed or dropped on resume.
+## Stream
 
-### Error Handling
-
-Node exceptions never leak as raises out of `invoke/3`. After a node's
-retry policy (if any) is exhausted, the run returns a structured error
-with the failing node and original cause:
+`LangEx.stream/3` is the same contract as `invoke/3`, as a lazy stream — including token deltas from the model:
 
 ```elixir
-{:error, %LangEx.NodeError{node: :fetch, reason: %Req.TransportError{}}} =
-  LangEx.invoke(graph, input)
-```
-
-Per-node execution policies compose on `Graph.add_node/4`:
-
-```elixir
-Graph.add_node(graph, :fetch, &fetch_data/1,
-  timeout: 10_000,
-  retry: [max_attempts: 4, initial_interval_ms: 200, backoff_factor: 2.0, jitter: true],
-  on_error: fn exception, _state -> %{fetch_failed: Exception.message(exception)} end
-)
-```
-
-- `retry:` — exponential backoff with jitter and a `max_interval_ms` cap;
-  retries exceptions only (`{:error, _}` returns are ordinary results)
-- `timeout:` — per-attempt budget; a timed-out attempt raises
-  `LangEx.NodeTimeoutError`, which the retry policy can retry
-- `on_error:` — fallback invoked after retries are exhausted; its return
-  value becomes the node result (a state update or `%LangEx.Command{}`)
-- `cache:` — memoize results by input state (bounded ETS, optional TTL)
-- `defer:` — fan-in barrier for parallel branches converging at
-  different depths
-
-Programmer errors — routing to an undefined node, a missing conditional
-mapping — still raise with descriptive messages.
-
-### Streaming
-
-Get a lazy stream of execution events:
-
-```elixir
-graph
-|> LangEx.stream(%{value: 0})
-|> Enum.each(fn
-  {:node_start, name} -> IO.puts("Starting #{name}...")
-  {:node_end, name, _update} -> IO.puts("Finished #{name}")
-  {:done, {:ok, result}} -> IO.inspect(result, label: "Final")
-  _ -> :ok
+agent
+|> LangEx.stream(%{messages: [LangEx.Message.human("status of payments?")]}, modes: [:messages])
+|> Stream.each(fn
+  {:message_delta, %{text: chunk}} -> IO.write(chunk)
+  {:done, {:ok, _state}} -> IO.write("\n")
+  _event -> :ok
 end)
+|> Stream.run()
 ```
 
-### State Reducers
+Pipe that into a PubSub topic, a Phoenix channel, or a LiveView. Errors from a node are `{:error, %LangEx.NodeError{}}`, never an uncaught raise out of `invoke/3`.
 
-Each state key can have a custom merge function. The built-in `Message.add_messages/2` appends and deduplicates by ID; write your own for counters, sets, or domain-specific logic.
+## Teams
 
-```elixir
-Graph.new(
-  messages: {[], &Message.add_messages/2},
-  total: {0, fn old, new -> old + new end}
-)
-```
-
-### Subgraphs
-
-Use a compiled graph as a node inside another graph for composable, nested workflows:
-
-```elixir
-inner = Graph.new(value: 0) |> ... |> Graph.compile()
-
-outer =
-  Graph.new(value: 0, label: "")
-  |> Graph.add_node(:sub, inner)
-  |> Graph.add_node(:tag, fn _state -> %{label: "done"} end)
-  |> Graph.add_edge(:__start__, :sub)
-  |> Graph.add_edge(:sub, :tag)
-  |> Graph.add_edge(:tag, :__end__)
-  |> Graph.compile()
-```
-
-Interrupts, errors, context, and stream events propagate through subgraph
-boundaries. Resuming an interrupt that fired inside a subgraph depends on
-the subgraph's own checkpointing:
-
-- **Subgraph compiled with its own checkpointer** — checkpoints are
-  namespaced under `"{thread_id}/{node_name}"` and the subgraph resumes
-  from its saved position; nodes before the interrupt do not re-run.
-- **No subgraph checkpointer** — the subgraph re-runs from `:__start__`
-  with resume values injected, so all pre-interrupt subgraph nodes
-  execute again and their side effects must be idempotent.
-
-### Multi-Agent Teams
-
-Build teams of cooperating agents that pass the conversation between one another. A **swarm** lets any agent hand off to any peer; the active agent is tracked in state and persisted across turns:
+A **swarm** hands the conversation to a peer and stays there across turns. A **supervisor** delegates a task and takes the reply back.
 
 ```elixir
 graph =
   LangEx.Prebuilt.Swarm.create(
     agents: [
-      [model: "gpt-4o", name: :router, system_prompt: "Route the user to the right specialist."],
-      [model: "gpt-4o", name: :refunds, system_prompt: "Handle refund requests."]
+      [name: :router, model: "gpt-4o", system_prompt: "Route the user to a specialist."],
+      [name: :refunds, model: "gpt-4o", system_prompt: "Handle refunds. Be specific about timing."]
     ],
     default_active_agent: :router,
     checkpointer: LangEx.Checkpointer.Memory
   )
 
 {:ok, state} =
-  LangEx.invoke(graph, %{messages: [Message.human("I want a refund")]},
-    config: [thread_id: "t-1"]
+  LangEx.invoke(graph, %{messages: [LangEx.Message.human("I want a refund")]},
+    config: [thread_id: "ticket-17"]
   )
 ```
 
-Each agent automatically gets a `transfer_to_<peer>` tool for every other agent. A **supervisor** instead delegates to workers that return control when done:
+Each agent gets a `transfer_to_<peer>` tool. The active agent is just state, so the next message on that thread continues with whoever last spoke.
+
+## Middleware
+
+Layer behaviour around `Prebuilt.agent/1` without changing the graph. Summarise old turns, require a human before `restart_service`, cap the bill:
 
 ```elixir
-graph =
-  LangEx.Prebuilt.Supervisor.create(
-    model: "gpt-4o",
-    prompt: "You manage a research agent and a math agent. Delegate to them.",
-    agents: [
-      [model: "gpt-4o", name: :research, tools: [search_tool]],
-      [model: "gpt-4o", name: :math, tools: [calc_tool]]
-    ],
-    checkpointer: LangEx.Checkpointer.Memory
-  )
+LangEx.Prebuilt.agent(
+  model: "claude-sonnet-4-20250514",
+  tools: ops_tools,
+  middleware: [
+    LangEx.Middleware.Summarization.new(model: "claude-haiku-4-5-20251001"),
+    LangEx.Middleware.ToolApproval.new(tools: ["restart_service"]),
+    LangEx.Middleware.CallBudget.new(max_model_calls: 20)
+  ]
+)
 ```
 
-Handoffs are ordinary tools: a tool function returning a `%LangEx.Command{}` updates state (e.g. the active agent) and steers routing. Build one directly with `LangEx.Prebuilt.Handoff.tool/2`.
-
-### Agent Middleware
-
-Layer extra behaviour around a `Prebuilt.agent/1` run with composable `%LangEx.Middleware{}` values. A middleware can hook the run (`before_agent` / `after_agent`), each turn (`before_model` / `after_model` / `wrap_model_call`), and each tool call (`before_tools` / `wrap_tool_call`), contribute tools, and extend the agent's state — an `after_model` hook can even steer routing (loop, go to tools, or end). Built-ins ship for the common needs:
-
-```elixir
-graph =
-  LangEx.Prebuilt.agent(
-    model: "claude-opus-4-20250514",
-    tools: investigation_tools,
-    compaction: false,
-    middleware: [
-      # keep context small without losing findings
-      LangEx.Middleware.Summarization.new(model: "claude-haiku-4-5-20251001"),
-      # let the agent keep a running plan
-      LangEx.Middleware.TodoList.new(),
-      # narrow a big tool set to what's relevant each turn
-      LangEx.Middleware.ToolSelector.new(model: "claude-haiku-4-5-20251001", max_tools: 7),
-      # a human signs off before anything is restarted
-      LangEx.Middleware.ToolApproval.new(tools: ["restart_service"]),
-      # ride out a flaky API instead of spending a turn on it
-      LangEx.Middleware.ToolRetry.new(max_attempts: 3, backoff: fn n -> n * 250 end),
-      # never let one investigation run away
-      LangEx.Middleware.CallBudget.new(max_model_calls: 20, max_tokens: 400_000),
-      # don't let it finish until the answer meets the bar
-      LangEx.Middleware.Rubric.new(
-        model: "claude-opus-4-20250514",
-        rubric: "Cites concrete evidence and names a root cause."
-      )
-    ]
-  )
-```
-
-`wrap_model_call` receives the call as data, so a middleware can redirect it:
-
-```elixir
-escalate =
-  LangEx.Middleware.new(
-    name: :escalate,
-    wrap_model_call: fn request, next ->
-      request
-      |> LangEx.Middleware.ModelRequest.override(model: "claude-opus-4-20250514")
-      |> next.()
-    end
-  )
-```
-
-Also available: `LangEx.Middleware.ContextEditing` (clears stale tool-result bodies while keeping the message skeleton), `LangEx.Middleware.ModelFallback` (retries a failed call on other models), `LangEx.Middleware.Subagent`, and `LangEx.Middleware.Filesystem`. Write your own with `LangEx.Middleware.new/1`.
-
-### Runtime Context
-
-Inject dependencies into nodes without closures:
-
-```elixir
-Graph.add_node(:greet, fn _state, context ->
-  %{greeting: "Hello from #{context.provider}!"}
-end)
-
-LangEx.invoke(graph, %{}, context: %{provider: "Anthropic"})
-```
-
-### Send (Fan-Out)
-
-Dynamic map-reduce patterns from conditional edges using `%LangEx.Send{}`.
-
-### Telemetry
-
-All LLM calls and graph executions emit `:telemetry` events for observability.
-
-## Extending LangEx
-
-**Custom LLM provider** -- implement `LangEx.LLM` behaviour (`chat/2`):
-
-```elixir
-defmodule MyApp.LLM.Groq do
-  @behaviour LangEx.LLM
-
-  @impl true
-  def chat(messages, opts) do
-    # Call the Groq API
-    {:ok, LangEx.Message.ai("response")}
-  end
-end
-
-LangEx.LLM.Registry.register_provider(:groq, MyApp.LLM.Groq)
-```
-
-**Custom checkpointer** -- implement `LangEx.Checkpointer` behaviour (`save/2`, `load/1`, `list/2`, `delete_thread/1`).
+Also in the box: subgraphs, `%LangEx.Send{}` fan-out, per-node retry / timeout / cache, encrypted checkpoints, a long-term `LangEx.Store`, OpenTelemetry. Custom providers implement `LangEx.LLM` and register with `LangEx.LLM.Registry`.
 
 ## Examples
 
-| Example | What it demonstrates |
+Runnable scripts — most offline, no API key:
+
+```bash
+elixir examples/scripts/01_quick_start.exs
+```
+
+| Example | What it shows |
 |---|---|
-| [Feature Scripts](https://github.com/surgeventures/lang_ex/tree/main/examples/scripts) | Ten tiny, runnable scripts — one per feature, no API keys or databases needed (`elixir examples/scripts/01_quick_start.exs`) |
-| [Incident Responder](https://github.com/surgeventures/lang_ex/tree/main/examples/incident_responder) | DevOps agent with tool chains, multi-turn conversation, conditional routing, Postgres checkpointing |
-| [Support Triage](https://github.com/surgeventures/lang_ex/tree/main/examples/support_triage) | Customer support agent with intent classification and escalation |
+| [Feature scripts](https://github.com/surgeventures/lang_ex/tree/main/examples/scripts) | One file per idea: routing, streaming, interrupts, crash recovery, teams, middleware |
+| [Incident responder](https://github.com/surgeventures/lang_ex/tree/main/examples/incident_responder) | DevOps agent, tool chains, Postgres checkpoints |
+| [Support triage](https://github.com/surgeventures/lang_ex/tree/main/examples/support_triage) | Classify, answer or escalate |
+
+The [API reference](https://hexdocs.pm/lang_ex) is the source of truth for options, behaviours, and edge cases.
 
 ## License
 
