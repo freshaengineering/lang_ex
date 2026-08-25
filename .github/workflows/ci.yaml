@@ -53,7 +53,9 @@ jobs:
           clean: false
           persist-credentials: true
       - name: Setup mise
-        uses: step-security/mise-action@2796166110dee826668caddd4bffedae5116e7cd # v4.2.0
+        uses: step-security/mise-action@6e96d2ffbc65c037f23c78818f2a339d6cf830f7 # v4.2.4
+        with:
+          version: '2026.8.12'
       - name: Install Hex + Rebar
         run: mix local.hex --force && mix local.rebar --force
       - name: Get SHA sum (HASH) of relevant files
@@ -109,7 +111,9 @@ jobs:
           clean: false
           persist-credentials: true
       - name: Setup mise
-        uses: step-security/mise-action@2796166110dee826668caddd4bffedae5116e7cd # v4.2.0
+        uses: step-security/mise-action@6e96d2ffbc65c037f23c78818f2a339d6cf830f7 # v4.2.4
+        with:
+          version: '2026.8.12'
       - name: Install Hex + Rebar
         run: mix local.hex --force && mix local.rebar --force
       - name: Get SHA sum (HASH) of relevant files
@@ -227,7 +231,9 @@ jobs:
           clean: false
           persist-credentials: true
       - name: Setup mise
-        uses: step-security/mise-action@2796166110dee826668caddd4bffedae5116e7cd # v4.2.0
+        uses: step-security/mise-action@6e96d2ffbc65c037f23c78818f2a339d6cf830f7 # v4.2.4
+        with:
+          version: '2026.8.12'
       - name: Install Hex + Rebar
         run: mix local.hex --force && mix local.rebar --force
       - name: Get dependencies
