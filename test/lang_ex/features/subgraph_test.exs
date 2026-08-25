@@ -77,6 +77,40 @@ defmodule LangEx.Features.SubgraphTest do
       assert %{approved: true, label: "done"} = result
     end
 
+    test "a subgraph without its own checkpointer inherits the parent's and skips earlier nodes" do
+      {:ok, prep_runs} = Agent.start_link(fn -> 0 end)
+
+      inner =
+        Graph.new(value: 0, approved: nil)
+        |> Graph.add_node(:prep, fn state ->
+          Agent.update(prep_runs, &(&1 + 1))
+          %{value: state.value + 1}
+        end)
+        |> Graph.add_node(:approve, fn _state ->
+          %{approved: LangEx.Interrupt.interrupt("approve inner?")}
+        end)
+        |> Graph.add_edge(:__start__, :prep)
+        |> Graph.add_edge(:prep, :approve)
+        |> Graph.add_edge(:approve, :__end__)
+        |> Graph.compile()
+
+      outer =
+        Graph.new(value: 0, approved: nil)
+        |> Graph.add_node(:sub, inner)
+        |> Graph.add_edge(:__start__, :sub)
+        |> Graph.add_edge(:sub, :__end__)
+        |> Graph.compile(checkpointer: LangEx.Checkpointer.Memory)
+
+      config = [thread_id: "subgraph-inherited-checkpointer-1"]
+
+      {:interrupt, "approve inner?", _} = LangEx.invoke(outer, %{value: 7}, config: config)
+
+      {:ok, result} = LangEx.invoke(outer, %LangEx.Command{resume: true}, config: config)
+
+      assert %{value: 8, approved: true} = result
+      assert Agent.get(prep_runs, & &1) == 1
+    end
+
     test "a subgraph with its own checkpointer resumes without re-running earlier nodes" do
       {:ok, prep_runs} = Agent.start_link(fn -> 0 end)
 

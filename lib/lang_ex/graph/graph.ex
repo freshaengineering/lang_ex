@@ -85,8 +85,8 @@ defmodule LangEx.Graph do
 
   A compiled graph can be used as a node (subgraph). The runtime
   context, streaming events, and interrupts propagate through it, and
-  its checkpoints (when it has its own checkpointer) are namespaced
-  under `"{thread_id}/{node_name}"`.
+  its checkpoints are namespaced under the parent thread (the subgraph's
+  own checkpointer, or the parent's when it has none).
 
   ## Execution policy options
 

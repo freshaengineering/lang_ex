@@ -2,6 +2,8 @@ defmodule LangEx.Prebuilt.SwarmTest do
   use ExUnit.Case, async: false
   use Mimic
 
+  alias LangEx.Command
+  alias LangEx.Interrupt
   alias LangEx.Message
   alias LangEx.Prebuilt.Swarm
 
@@ -191,6 +193,80 @@ defmodule LangEx.Prebuilt.SwarmTest do
       assert Enum.any?(events, &match?({:node_start, :alice}, &1))
       assert Enum.any?(events, &match?({:node_start, :bob}, &1))
       assert {:done, {:ok, %{active_agent: :bob}}} = List.last(events)
+    end
+
+    test "an interrupt inside the member that received a handoff resumes on the parent thread" do
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, &scripted/2)
+
+      graph =
+        Swarm.create(
+          agents: [
+            [
+              provider: LangEx.LLM.OpenAI,
+              model: "gpt-4o",
+              name: :alice,
+              system_prompt: "You are alice."
+            ],
+            [
+              provider: LangEx.LLM.OpenAI,
+              model: "gpt-4o",
+              name: :bob,
+              system_prompt: "You are bob.",
+              post_model_hook: fn update ->
+                :review
+                |> Interrupt.interrupt()
+                |> then(fn _approved -> update end)
+              end
+            ]
+          ],
+          default_active_agent: :alice,
+          checkpointer: LangEx.Checkpointer.Memory
+        )
+
+      config = [thread_id: "swarm-interrupt-handoff-1"]
+
+      assert {:interrupt, :review, %{active_agent: :bob}} =
+               LangEx.invoke(graph, %{messages: [Message.human("help")]}, config: config)
+
+      assert {:ok, %{active_agent: :bob, messages: messages}} =
+               LangEx.invoke(graph, %Command{resume: true}, config: config)
+
+      assert %Message.AI{content: "done by bob"} = List.last(messages)
+    end
+
+    test "an interrupt inside a member pauses the swarm and resumes on the same thread" do
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, fn _messages, _opts ->
+        {:ok, Message.ai("handled by alice"), usage()}
+      end)
+
+      graph =
+        Swarm.create(
+          agents: [
+            [
+              provider: LangEx.LLM.OpenAI,
+              model: "gpt-4o",
+              name: :alice,
+              system_prompt: "You are alice.",
+              post_model_hook: fn update ->
+                :review
+                |> Interrupt.interrupt()
+                |> then(fn _approved -> update end)
+              end
+            ]
+          ],
+          default_active_agent: :alice,
+          checkpointer: LangEx.Checkpointer.Memory
+        )
+
+      config = [thread_id: "swarm-interrupt-1"]
+
+      assert {:interrupt, :review, _paused} =
+               LangEx.invoke(graph, %{messages: [Message.human("hi")]}, config: config)
+
+      assert {:ok, %{active_agent: :alice, messages: messages}} =
+               LangEx.invoke(graph, %Command{resume: true}, config: config)
+
+      assert %Message.AI{content: "handled by alice"} = List.last(messages)
     end
 
     test "the active agent persists across invocations" do

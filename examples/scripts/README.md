@@ -32,6 +32,7 @@ Run them in order — each builds on the ideas of the previous one.
 | [17_thread_lifecycle.exs](17_thread_lifecycle.exs) | Provenance-filtered history, cursor pagination, branching a thread with `copy_thread/3`, namespace-aware delete |
 | [18_agent_middleware.exs](18_agent_middleware.exs) | Tool approval with argument correction, tool retry, a call budget, model-request overrides, and run-scoped hooks — scripted LLM, no key needed |
 | [19_encrypted_checkpoints.exs](19_encrypted_checkpoints.exs) | Encrypting checkpoint payloads at rest, with a plaintext allowlist and key rotation |
+| [20_team_member_interrupts.exs](20_team_member_interrupts.exs) | `interrupt/1` inside a swarm or supervisor member pauses the parent thread; resume continues the member — scripted LLM, no key needed |
 
 The scripts that pause and resume use
 [`support/in_memory_checkpointer.exs`](support/in_memory_checkpointer.exs),

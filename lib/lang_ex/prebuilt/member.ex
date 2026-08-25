@@ -16,14 +16,20 @@ defmodule LangEx.Prebuilt.Member do
   The team's runtime context is forwarded into each member turn, and each
   turn's token usage is contributed back under `:llm_usage`.
 
-  A member runs its turn as a nested execution, so a `LangEx.Interrupt`
-  raised inside a member is not resumable across the team boundary —
-  `node/3` surfaces it as an error instead. Keep human-in-the-loop pauses
-  at the team level.
+  When `node/3` runs inside a parent graph, a `LangEx.Interrupt` raised
+  inside the member pauses the parent on the same thread. Resume the
+  parent with `%LangEx.Command{resume: value}` and the member continues
+  from the interrupt. Tool functions cannot interrupt — call
+  `LangEx.Interrupt.interrupt/1` from a node inside the member.
+
+  Invoking `node/3` outside a parent graph still surfaces an inner
+  interrupt as an error, because there is no thread to resume.
   """
 
   alias LangEx.ContextCompaction
   alias LangEx.Graph
+  alias LangEx.Graph.Compiled
+  alias LangEx.Graph.Pregel
   alias LangEx.LLM.ChatModel
   alias LangEx.Message
 
@@ -70,7 +76,7 @@ defmodule LangEx.Prebuilt.Member do
   - all other options (`:model`/`:provider`, `:temperature`, ...) are
     forwarded to `LangEx.LLM.ChatModel.node/1`
   """
-  @spec build(keyword()) :: Graph.Compiled.t()
+  @spec build(keyword()) :: Compiled.t()
   def build(opts) do
     {member_opts, llm_opts} = Keyword.split(opts, @member_opt_keys)
     name = Keyword.fetch!(member_opts, :name)
@@ -95,16 +101,25 @@ defmodule LangEx.Prebuilt.Member do
   messages produced this turn (per `output_mode`), the resulting
   `:active_agent`, and the turn's `:llm_usage`. The enclosing team's
   runtime context is forwarded into the member turn.
+
+  An interrupt inside the member pauses the parent graph on the same
+  thread; resume the parent to continue the member.
   """
-  @spec node(Graph.Compiled.t(), atom(), output_mode()) :: (map(), term() -> map())
-  def node(%Graph.Compiled{} = member, name, output_mode) do
+  @spec node(Compiled.t(), atom(), output_mode()) :: (map(), term() -> map())
+  def node(%Compiled{} = member, name, output_mode) do
     fn state, context ->
       member
-      |> Graph.Compiled.invoke(%{:messages => state.messages, @active_agent_key => name},
-        context: context
-      )
+      |> run_turn(%{:messages => state.messages, @active_agent_key => name}, context)
       |> contribute(state, name, output_mode)
     end
+  end
+
+  @doc false
+  @spec run_turn(Compiled.t(), map(), term()) :: {:ok, map()} | {:error, term()}
+  def run_turn(%Compiled{} = member, input, context) do
+    :lang_ex_run_opts
+    |> Process.get()
+    |> run_nested(member, input, context)
   end
 
   @doc """
@@ -119,25 +134,48 @@ defmodule LangEx.Prebuilt.Member do
   defp route_after_tools(active, name) when active in [nil, name], do: :agent
   defp route_after_tools(_active, _name), do: :__end__
 
+  defp run_nested(nil, member, input, context) do
+    Compiled.invoke(member, input, context: context)
+  end
+
+  defp run_nested(parent_opts, member, input, context) do
+    :lang_ex_current_node
+    |> Process.get(:member)
+    |> child_turn(member, input, %{parent_opts | context: context})
+  end
+
+  defp child_turn(name, member, input, opts) do
+    try do
+      {:ok, Pregel.invoke_child(member, name, input, opts)}
+    catch
+      :throw, {:lang_ex_graph_error, reason} -> {:error, reason}
+    end
+  end
+
   defp contribute({:ok, result}, state, _name, output_mode) do
     result.messages
     |> Enum.drop(length(state.messages))
-    |> then(
-      &%{
-        :messages => select_output(&1, output_mode),
-        :llm_usage => result.llm_usage,
-        @active_agent_key => result.active_agent
-      }
-    )
+    |> then(&turn_update(&1, result, output_mode))
   end
 
   defp contribute({:interrupt, _payload, _result}, _state, name, _output_mode) do
-    raise "member agent #{inspect(name)} interrupted; interrupts inside team members are not supported"
+    raise "member agent #{inspect(name)} interrupted; no parent thread to resume"
   end
 
   defp contribute({:error, reason}, _state, name, _output_mode) do
     raise "member agent #{inspect(name)} failed: #{inspect(reason)}"
   end
+
+  defp turn_update(delta, result, output_mode) do
+    %{
+      :messages => select_output(delta, output_mode),
+      @active_agent_key => result.active_agent
+    }
+    |> put_usage(Map.get(result, :llm_usage))
+  end
+
+  defp put_usage(update, nil), do: update
+  defp put_usage(update, usage), do: Map.put(update, :llm_usage, usage)
 
   defp select_output(delta, :last_message), do: delta |> List.last() |> List.wrap()
   defp select_output(delta, _full_history), do: delta

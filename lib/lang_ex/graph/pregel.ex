@@ -815,14 +815,9 @@ defmodule LangEx.Graph.Pregel do
   defp execute_node_value(%Compiled{} = subgraph, name, state, opts) do
     Process.delete(:lang_ex_parent_goto)
 
-    result =
-      subgraph
-      |> start_subgraph(name, state, opts)
-      |> unwrap_subgraph()
-
-    :lang_ex_parent_goto
-    |> Process.delete()
-    |> attach_parent_goto(result)
+    subgraph
+    |> invoke_child(name, state, opts)
+    |> then(&attach_parent_goto(Process.delete(:lang_ex_parent_goto), &1))
     |> then(&{:__subgraph_state__, &1})
   end
 
@@ -834,6 +829,18 @@ defmodule LangEx.Graph.Pregel do
   defp attach_parent_goto(targets, result) when is_map(result),
     do: %Command{update: result, goto: targets}
 
+  # Runs a compiled graph as a child of the current parent node: same
+  # thread, a descended checkpoint namespace, and interrupts re-thrown so
+  # the parent pauses. Used both when the node *is* a compiled graph and
+  # when a wrapper (a team member) invokes one from inside a node.
+  @doc false
+  @spec invoke_child(Compiled.t(), atom(), map(), run_opts()) :: map()
+  def invoke_child(%Compiled{} = subgraph, name, state, opts) do
+    subgraph
+    |> start_subgraph(name, state, opts)
+    |> unwrap_subgraph()
+  end
+
   defp start_subgraph(subgraph, name, state, opts) do
     sub_opts = subgraph_opts(subgraph, name, opts)
 
@@ -842,19 +849,20 @@ defmodule LangEx.Graph.Pregel do
     |> run_subgraph(subgraph, state, sub_opts)
   end
 
-  # A subgraph with its own checkpointer resumes from its namespaced
-  # checkpoint when the resume values answer one of its pending
-  # interrupts. Without a checkpointer the subgraph re-runs from
-  # :__start__ with resume values injected — all pre-interrupt subgraph
-  # nodes execute again, so their side effects must be idempotent.
-  defp saved_subgraph_resume(%Compiled{checkpointer: nil}, _sub_opts), do: :fresh
-
-  defp saved_subgraph_resume(%Compiled{checkpointer: cp}, sub_opts) do
+  # A child run resumes from its namespaced checkpoint when the resume
+  # values answer one of its pending interrupts. The checkpointer is the
+  # child's own, or the parent's when the child was compiled without one,
+  # so a member turn can pause and continue on the same thread. Without a
+  # checkpointer the child re-runs from :__start__ with resume values
+  # injected — all pre-interrupt child nodes execute again, so their side
+  # effects must be idempotent.
+  defp saved_subgraph_resume(_subgraph, sub_opts) do
     sub_opts
     |> Map.get(:resume_values, %{})
-    |> load_resumable_checkpoint(cp, sub_opts.config)
+    |> load_resumable_checkpoint(Map.get(sub_opts, :checkpointer), sub_opts.config)
   end
 
+  defp load_resumable_checkpoint(_values, nil, _config), do: :fresh
   defp load_resumable_checkpoint(values, _cp, _config) when values == %{}, do: :fresh
 
   defp load_resumable_checkpoint(values, cp, config) do
@@ -897,7 +905,7 @@ defmodule LangEx.Graph.Pregel do
   defp subgraph_opts(subgraph, name, opts) do
     %{
       recursion_limit: opts.recursion_limit,
-      checkpointer: subgraph.checkpointer,
+      checkpointer: subgraph.checkpointer || Map.get(opts, :checkpointer),
       config: subgraph_config(opts.config, name, opts),
       context: opts.context,
       resume: nil,
@@ -950,6 +958,7 @@ defmodule LangEx.Graph.Pregel do
     Process.put(:lang_ex_resume_values, resume_values(opts))
     Process.put(:lang_ex_stream_emit, opts.emit_to)
     Process.put(:lang_ex_store, Map.get(opts, :store))
+    Process.put(:lang_ex_run_opts, opts)
   end
 
   defp clear_node_context do
@@ -959,6 +968,7 @@ defmodule LangEx.Graph.Pregel do
     Process.delete(:lang_ex_resume_values)
     Process.delete(:lang_ex_stream_emit)
     Process.delete(:lang_ex_store)
+    Process.delete(:lang_ex_run_opts)
   end
 
   defp resume_values(%{resume: %{values: values}}), do: values

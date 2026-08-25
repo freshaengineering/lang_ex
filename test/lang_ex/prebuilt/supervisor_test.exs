@@ -2,6 +2,8 @@ defmodule LangEx.Prebuilt.SupervisorTest do
   use ExUnit.Case, async: false
   use Mimic
 
+  alias LangEx.Command
+  alias LangEx.Interrupt
   alias LangEx.Message
   alias LangEx.Prebuilt.Supervisor
 
@@ -171,6 +173,42 @@ defmodule LangEx.Prebuilt.SupervisorTest do
 
       assert_received {:worker_view, view}
       assert Enum.any?(view, fn m -> content(m) =~ "Task for worker: investigate the outage" end)
+    end
+
+    test "an interrupt inside a worker pauses the team and resumes on the same thread" do
+      stub(LangEx.LLM.OpenAI, :chat_with_usage, &scripted/2)
+
+      graph =
+        Supervisor.create(
+          provider: LangEx.LLM.OpenAI,
+          model: "gpt-4o",
+          prompt: "You are supervisor.",
+          checkpointer: LangEx.Checkpointer.Memory,
+          agents: [
+            [
+              provider: LangEx.LLM.OpenAI,
+              model: "gpt-4o",
+              name: :worker,
+              system_prompt: "You are worker.",
+              post_model_hook: fn update ->
+                :review
+                |> Interrupt.interrupt()
+                |> then(fn _approved -> update end)
+              end
+            ]
+          ]
+        )
+
+      config = [thread_id: "supervisor-interrupt-1"]
+
+      assert {:interrupt, :review, _paused} =
+               LangEx.invoke(graph, %{messages: [Message.human("do the thing")]}, config: config)
+
+      assert {:ok, %{active_agent: :supervisor} = state} =
+               LangEx.invoke(graph, %Command{resume: true}, config: config)
+
+      assert %Message.AI{content: "all done"} = List.last(state.messages)
+      assert mentions?(state.messages, "worker done")
     end
 
     @tag capture_log: true
