@@ -8,7 +8,7 @@ env:
   OTP_VERSION: 26.2.5
   RELEVANT_FILES: "mix.lock mix.exs lib config test"
   REPOSITORY: lang_ex
-  RUNNER_OS: ubuntu22
+  RUNNER_OS: ubuntu24
   SHA: ${{ github.sha }}
 
 concurrency:
