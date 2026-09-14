@@ -1,0 +1,40 @@
+# Thin wrapper into the org-wide actions-manifest system (see that repo's README).
+name: actions-maintenance
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Shared join-key branch name for an in-flight actions-manifest change.
+        required: true
+        type: string
+      pr:
+        description: Optional owner/repo#number of the related PR, if already known.
+        required: false
+        type: string
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - ".github/**"
+  push:
+    branches: [main]
+    paths:
+      - ".github/**"
+
+permissions:
+  contents: read
+
+jobs:
+  actions-maintenance:
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
+      actions: write
+      statuses: write
+    # Must stay @main (not pinned) — hallpass/octo-sts trust matches on the literal job_workflow_ref.
+    uses: freshaengineering/actions-manifest/.github/workflows/actions-maintenance.yaml@main
+    with:
+      branch: ${{ inputs.branch }}
+      pr: ${{ inputs.pr }}
+    secrets: inherit
