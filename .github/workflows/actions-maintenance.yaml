@@ -1,5 +1,5 @@
 # Thin wrapper into the org-wide actions-manifest system (see that repo's README).
-name: actions-maintenance
+name: Actions Maintenance
 
 on:
   workflow_dispatch:
@@ -13,7 +13,6 @@ on:
         required: false
         type: string
   pull_request:
-    types: [opened, synchronize, reopened]
     paths:
       - ".github/**"
 
@@ -21,7 +20,8 @@ permissions:
   contents: read
 
 jobs:
-  actions-maintenance:
+  phase:
+    name: Phase
     permissions:
       contents: write
       pull-requests: write
