@@ -130,4 +130,78 @@ defmodule LangEx.LLM.GeminiTest do
       )
     end
   end
+
+  describe "streaming" do
+    @sse_hello """
+    data: {"candidates":[{"content":{"role":"model","parts":[{"text":"Hel"}]},"index":0}]}
+
+    data: {"candidates":[{"content":{"role":"model","parts":[{"text":"lo"}]},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":2,"totalTokenCount":5}}
+    """
+
+    test "on_token hits streamGenerateContent with :into set" do
+      test_pid = self()
+
+      expect(Req, :post, fn url, opts ->
+        assert url =~ "streamGenerateContent"
+        assert url =~ "alt=sse"
+        assert is_function(opts[:into], 2)
+        refute url =~ ":generateContent?"
+        refute Map.has_key?(opts[:json], :stream)
+        assert {"x-goog-api-key", "test"} in opts[:headers]
+
+        {:ok, %{status: 200, body: @sse_hello}}
+      end)
+
+      assert {:ok, %Message.AI{content: "Hello"}, %{input_tokens: 3, output_tokens: 2}} =
+               LangEx.LLM.Gemini.chat_with_usage(
+                 [Message.human("hi")],
+                 model: "gemini-2.0-flash",
+                 api_key: "test",
+                 on_token: &send(test_pid, {:token, &1})
+               )
+
+      assert_received {:token, "Hel"}
+      assert_received {:token, "lo"}
+    end
+
+    test "stream: true uses the :into callback accumulator" do
+      expect(Req, :post, fn url, opts ->
+        assert url =~ "streamGenerateContent"
+        assert is_function(opts[:into], 2)
+        {:cont, _} = opts[:into].({:data, @sse_hello}, {nil, nil})
+        {:ok, %{status: 200, body: ""}}
+      end)
+
+      assert {:ok, %Message.AI{content: "Hello"}} =
+               LangEx.LLM.Gemini.chat(
+                 [Message.human("hi")],
+                 model: "gemini-2.0-flash",
+                 api_key: "test",
+                 stream: true
+               )
+    end
+
+    test "batch still hits generateContent" do
+      expect(Req, :post, fn url, opts ->
+        assert url =~ ":generateContent"
+        refute url =~ "streamGenerateContent"
+        assert is_nil(opts[:into])
+
+        {:ok,
+         %{
+           status: 200,
+           body: %{
+             "candidates" => [%{"content" => %{"parts" => [%{"text" => "ok"}]}}]
+           }
+         }}
+      end)
+
+      assert {:ok, %Message.AI{content: "ok"}} =
+               LangEx.LLM.Gemini.chat(
+                 [Message.human("hi")],
+                 model: "gemini-2.0-flash",
+                 api_key: "test"
+               )
+    end
+  end
 end

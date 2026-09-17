@@ -3,6 +3,8 @@ defmodule LangEx.LLM.Gemini do
   Google Gemini chat adapter with function calling support.
 
   Supports Gemini models via the `/v1beta/models/{model}:generateContent` endpoint.
+  Streaming uses `:streamGenerateContent?alt=sse` and the same `x-goog-api-key`
+  header.
 
   ## Tool Calling
 
@@ -17,6 +19,12 @@ defmodule LangEx.LLM.Gemini do
 
   ## Options
 
+  - `:on_token` — `fn(text_delta) -> any()` callback invoked per streamed
+    content token (used by graph streaming's `:messages` mode). Implies SSE
+    streaming. Function-call payloads are assembled, not emitted as tokens.
+  - `:stream` — use SSE streaming (`true` / `false`, default `false`). Also
+    streams when `:on_token` is set. The final return stays
+    `{:ok, %Message.AI{}, usage}` — streaming is how the body arrives.
   - `:tool_choice` — force function calling: `:auto` (default), `:required`/
     `:any` (must call some function), or `{:tool, name}` (must call that one)
   """
@@ -24,6 +32,7 @@ defmodule LangEx.LLM.Gemini do
   @behaviour LangEx.LLM
 
   alias LangEx.Config
+  alias LangEx.LLM.Gemini.SSE
   alias LangEx.Message
   alias LangEx.Tool
 
@@ -44,6 +53,7 @@ defmodule LangEx.LLM.Gemini do
     api_key = Config.api_key!(:gemini, opts)
     model = Config.model(:gemini, opts)
     tools = Keyword.get(opts, :tools, [])
+    stream? = stream_requested?(opts)
 
     {system_instruction, contents} = extract_system(messages)
 
@@ -52,9 +62,18 @@ defmodule LangEx.LLM.Gemini do
     |> put_generation_config(opts)
     |> put_tools(tools)
     |> put_tool_choice(Keyword.get(opts, :tool_choice))
-    |> send_request(api_key, model)
-    |> handle_response()
+    |> send_request(api_key, model, SSE.callbacks(Keyword.get(opts, :on_token)), stream?)
   end
+
+  defp stream_requested?(opts) do
+    opts
+    |> Keyword.get(:stream, false)
+    |> stream_enabled?(Keyword.get(opts, :on_token))
+  end
+
+  defp stream_enabled?(true, _), do: true
+  defp stream_enabled?(_, on_token) when is_function(on_token, 1), do: true
+  defp stream_enabled?(_, _), do: false
 
   defp put_tool_choice(body, nil), do: body
   defp put_tool_choice(body, choice), do: Map.put(body, :tool_config, format_tool_choice(choice))
@@ -127,14 +146,86 @@ defmodule LangEx.LLM.Gemini do
   defp to_text(%{"text" => text}), do: {:text, text}
   defp to_text(_), do: nil
 
-  defp send_request(body, api_key, model) do
-    Req.post("#{@base_url}/models/#{model}:generateContent",
+  defp send_request(body, api_key, model, callbacks, stream?) do
+    [
       json: body,
       headers: [
         {"x-goog-api-key", api_key},
         {"content-type", "application/json"}
       ]
-    )
+    ]
+    |> add_stream_timeouts(stream?)
+    |> dispatch_request(callbacks, stream?, endpoint(model, stream?))
+  end
+
+  defp endpoint(model, true),
+    do: "#{@base_url}/models/#{model}:streamGenerateContent?alt=sse"
+
+  defp endpoint(model, false),
+    do: "#{@base_url}/models/#{model}:generateContent"
+
+  defp add_stream_timeouts(opts, true),
+    do: opts |> Keyword.put(:receive_timeout, 300_000) |> Keyword.put(:pool_timeout, 60_000)
+
+  defp add_stream_timeouts(opts, false), do: opts
+
+  defp dispatch_request(req_opts, callbacks, true, url),
+    do: stream_request(req_opts, callbacks, url)
+
+  defp dispatch_request(req_opts, _callbacks, false, url),
+    do: batch_request(req_opts, url)
+
+  defp stream_request(req_opts, callbacks, url) do
+    pkey = {__MODULE__, make_ref()}
+    Process.put(pkey, SSE.initial_state())
+
+    callback = fn {:data, chunk}, {req, resp} ->
+      pkey
+      |> Process.get()
+      |> SSE.process_chunk(callbacks, chunk)
+      |> then(&Process.put(pkey, &1))
+
+      {:cont, {req, resp}}
+    end
+
+    result =
+      req_opts
+      |> Keyword.put(:into, callback)
+      |> then(&Req.post(url, &1))
+      |> handle_streaming_response(pkey, callbacks)
+
+    Process.delete(pkey)
+    result
+  end
+
+  defp handle_streaming_response({:ok, %{status: 200, body: ""}}, pkey, _callbacks),
+    do: SSE.build_message(Process.get(pkey))
+
+  defp handle_streaming_response(
+         {:ok, %{status: 200, body: %Req.Response.Async{}}},
+         pkey,
+         _callbacks
+       ),
+       do: SSE.build_message(Process.get(pkey))
+
+  defp handle_streaming_response({:ok, %{status: 200, body: raw}}, _pkey, callbacks)
+       when is_binary(raw) and byte_size(raw) > 0,
+       do: SSE.parse_response(raw, callbacks)
+
+  defp handle_streaming_response({:ok, %{status: 200, body: response}}, _pkey, _callbacks)
+       when is_map(response),
+       do: handle_response({:ok, %{status: 200, body: response}})
+
+  defp handle_streaming_response({:ok, %{status: status, body: resp_body}}, _pkey, _callbacks),
+    do: {:error, {status, resp_body}}
+
+  defp handle_streaming_response({:error, reason}, _pkey, _callbacks),
+    do: {:error, reason}
+
+  defp batch_request(req_opts, url) do
+    url
+    |> Req.post(req_opts)
+    |> handle_response()
   end
 
   defp extract_system(messages) do

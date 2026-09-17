@@ -15,11 +15,24 @@ defmodule LangEx.LLM.OpenAI do
         model: "gpt-4o-mini",
         tools: [%LangEx.Tool{name: "get_weather", ...}]
       )
+
+  ## Options
+
+  - `:on_token` — `fn(text_delta) -> any()` callback invoked per streamed
+    content token (used by graph streaming's `:messages` mode). Implies SSE
+    streaming. Tool-call argument fragments are assembled, not emitted.
+  - `:stream` — use SSE streaming (`true` / `false`, default `false`). Also
+    streams when `:on_token` is set. The final return stays
+    `{:ok, %Message.AI{}, usage}` — streaming is how the body arrives.
+  - `:tool_choice` — force tool use: `:auto` (default), `:required`/`:any`
+    (must call some tool), or `{:tool, name}` (must call that tool)
+  - `:base_url` — override the API root (OpenRouter and other compatible hosts)
   """
 
   @behaviour LangEx.LLM
 
   alias LangEx.Config
+  alias LangEx.LLM.OpenAI.SSE
   alias LangEx.Message
   alias LangEx.Tool
 
@@ -41,15 +54,31 @@ defmodule LangEx.LLM.OpenAI do
     model = Config.model(:openai, opts)
     tools = Keyword.get(opts, :tools, [])
     base_url = Keyword.get(opts, :base_url, @base_url)
+    stream? = stream_requested?(opts)
 
     %{model: model, messages: Enum.map(messages, &format_message/1)}
     |> put_present(:temperature, opts[:temperature])
     |> put_present(:max_tokens, opts[:max_tokens])
     |> put_tools(tools)
     |> put_tool_choice(Keyword.get(opts, :tool_choice))
-    |> send_request(api_key, base_url)
-    |> handle_response()
+    |> put_stream(stream?)
+    |> send_request(api_key, base_url, SSE.callbacks(Keyword.get(opts, :on_token)), stream?)
   end
+
+  defp stream_requested?(opts) do
+    opts
+    |> Keyword.get(:stream, false)
+    |> stream_enabled?(Keyword.get(opts, :on_token))
+  end
+
+  defp stream_enabled?(true, _), do: true
+  defp stream_enabled?(_, on_token) when is_function(on_token, 1), do: true
+  defp stream_enabled?(_, _), do: false
+
+  defp put_stream(body, true),
+    do: body |> Map.put(:stream, true) |> Map.put(:stream_options, %{include_usage: true})
+
+  defp put_stream(body, false), do: body
 
   defp put_tool_choice(body, nil), do: body
   defp put_tool_choice(body, choice), do: Map.put(body, :tool_choice, format_tool_choice(choice))
@@ -114,14 +143,80 @@ defmodule LangEx.LLM.OpenAI do
   defp parse_decoded({:ok, parsed}), do: parsed
   defp parse_decoded(_), do: %{}
 
-  defp send_request(body, api_key, base_url) do
-    Req.post("#{base_url}/chat/completions",
+  defp send_request(body, api_key, base_url, callbacks, stream?) do
+    [
       json: body,
       headers: [
         {"authorization", "Bearer #{api_key}"},
         {"content-type", "application/json"}
       ]
-    )
+    ]
+    |> add_stream_timeouts(stream?)
+    |> dispatch_request(callbacks, stream?, "#{base_url}/chat/completions")
+  end
+
+  defp add_stream_timeouts(opts, true),
+    do: opts |> Keyword.put(:receive_timeout, 300_000) |> Keyword.put(:pool_timeout, 60_000)
+
+  defp add_stream_timeouts(opts, false), do: opts
+
+  defp dispatch_request(req_opts, callbacks, true, url),
+    do: stream_request(req_opts, callbacks, url)
+
+  defp dispatch_request(req_opts, _callbacks, false, url),
+    do: batch_request(req_opts, url)
+
+  defp stream_request(req_opts, callbacks, url) do
+    pkey = {__MODULE__, make_ref()}
+    Process.put(pkey, SSE.initial_state())
+
+    callback = fn {:data, chunk}, {req, resp} ->
+      pkey
+      |> Process.get()
+      |> SSE.process_chunk(callbacks, chunk)
+      |> then(&Process.put(pkey, &1))
+
+      {:cont, {req, resp}}
+    end
+
+    result =
+      req_opts
+      |> Keyword.put(:into, callback)
+      |> then(&Req.post(url, &1))
+      |> handle_streaming_response(pkey, callbacks)
+
+    Process.delete(pkey)
+    result
+  end
+
+  defp handle_streaming_response({:ok, %{status: 200, body: ""}}, pkey, _callbacks),
+    do: SSE.build_message(Process.get(pkey))
+
+  defp handle_streaming_response(
+         {:ok, %{status: 200, body: %Req.Response.Async{}}},
+         pkey,
+         _callbacks
+       ),
+       do: SSE.build_message(Process.get(pkey))
+
+  defp handle_streaming_response({:ok, %{status: 200, body: raw}}, _pkey, callbacks)
+       when is_binary(raw) and byte_size(raw) > 0,
+       do: SSE.parse_response(raw, callbacks)
+
+  defp handle_streaming_response({:ok, %{status: 200, body: response}}, _pkey, _callbacks)
+       when is_map(response),
+       do: handle_response({:ok, %{status: 200, body: response}})
+
+  defp handle_streaming_response({:ok, %{status: status, body: resp_body}}, _pkey, _callbacks),
+    do: {:error, {status, resp_body}}
+
+  defp handle_streaming_response({:error, reason}, _pkey, _callbacks),
+    do: {:error, reason}
+
+  defp batch_request(req_opts, url) do
+    url
+    |> Req.post(req_opts)
+    |> handle_response()
   end
 
   defp format_message(%Message.Human{content: c}), do: %{role: "user", content: c}
