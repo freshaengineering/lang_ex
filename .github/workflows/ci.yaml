@@ -3,9 +3,9 @@ name: Elixir CI Checks
 env:
   DEBIAN_FRONTEND: noninteractive
   DEPENDENCY_FILE: mix.lock
-  ELIXIR_VERSION: 1.16.2
+  ELIXIR_VERSION: 1.18.4
   JOB_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-  OTP_VERSION: 26.2.5
+  OTP_VERSION: 27.3.4.19
   RELEVANT_FILES: "mix.lock mix.exs lib config test"
   REPOSITORY: lang_ex
   RUNNER_OS: ubuntu24
@@ -88,9 +88,9 @@ jobs:
         run: mix compile --warnings-as-errors --force
       - name: Run format
         run: mix format --check-formatted --dry-run
+      # lang_ex already exists on hex.pm, so the dry run never asks hex.pm who
+      # the user is and needs no Hex key.
       - name: Run publish --dry-run
-        env:
-          HEX_API_KEY: ${{ secrets.GH_FRESHAENGINEERING_LANG_EX_HEX_PM_API_KEY }}
         run: mix hex.publish --dry-run
 
   test:
@@ -211,12 +211,20 @@ jobs:
     name: Publish Hex Package
     timeout-minutes: 25
     needs: [permit]
-    env:
-      HEX_API_KEY: ${{ secrets.GH_FRESHAENGINEERING_LANG_EX_HEX_PM_API_KEY }}
     runs-on: runs-on,runner=2cpu-linux-x64
     if: >-
       (needs.permit.outputs.PUBLISH == 'true' && github.event_name == 'push') ||
       (github.event_name == 'workflow_dispatch' && inputs.publish)
+    permissions:
+      contents: read
+      # hex.pm exchanges the job's OIDC token for a short-lived token that can only
+      # publish lang_ex; no Hex key is stored in this repository.
+      id-token: write
+    # hex.pm trusts this job through a workload identity that names this repository,
+    # ci.yaml and this environment. hex.pm has no branch rule of its own, so the
+    # environment's deployment branch rule (main only) is what stops a branch
+    # that edits this file, or a dispatch from another branch, from publishing.
+    environment: hex-publish
     steps:
       - name: Harden the runner
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
@@ -235,10 +243,13 @@ jobs:
         with:
           version: '2026.8.12'
       - name: Install Hex + Rebar
-        run: mix local.hex --force && mix local.rebar --force
+        # Hex 2.6.0 is the first version that publishes with a workload identity.
+        run: mix local.hex 2.7.0 --force && mix local.rebar --force
       - name: Get dependencies
         shell: bash
         run: mix deps.get
       - name: Publish package
         shell: bash
+        # With no HEX_API_KEY and no user session, mix hex.publish exchanges the
+        # job's OIDC token for a short-lived one.
         run: mix hex.publish --yes
