@@ -36,49 +36,49 @@ checksum = "sha256:98257c51bb8d0042c417638b4a109ce073b7044e60550887dfde5223cdea9
 url = "https://builds.hex.pm/builds/elixir/v1.18.4-otp-27.zip"
 
 [[tools.erlang]]
-version = "27.3.4.19"
+version = "27.3.4.20"
 backend = "core:erlang"
-specifiers = ["27.3.4.19"]
+specifiers = ["27.3.4.20"]
 
 [tools.erlang.options]
 precompiled_os = "ubuntu-24.04"
 
 [tools.erlang."platforms.linux-arm64"]
-checksum = "sha256:8bb6bffbf78eaaf17be6148e2af08457cd717d11b828480dcf0fd476f292aba3"
-url = "https://builds.hex.pm/builds/otp/arm64/ubuntu-24.04/OTP-27.3.4.19.tar.gz"
+checksum = "sha256:4758332429ffc1d547062731aa8896467e7c674a91a2e930ebdc8f8cd70b9a04"
+url = "https://builds.hex.pm/builds/otp/arm64/ubuntu-24.04/OTP-27.3.4.20.tar.gz"
 
 [tools.erlang."platforms.linux-x64"]
-checksum = "sha256:8ce4332d7b90fef51f1ecaf4b9fe2a2e363b2c1b6025b0ff044ee1bf7d346f87"
-url = "https://builds.hex.pm/builds/otp/amd64/ubuntu-24.04/OTP-27.3.4.19.tar.gz"
+checksum = "sha256:6402f6d51b5f5d0fdde74678c47f32a67b83ccae7268770c867f3aa41edd9ba5"
+url = "https://builds.hex.pm/builds/otp/amd64/ubuntu-24.04/OTP-27.3.4.20.tar.gz"
 
 [[tools.erlang]]
-version = "27.3.4.19"
+version = "27.3.4.20"
 backend = "core:erlang"
-specifiers = ["27.3.4.19"]
+specifiers = ["27.3.4.20"]
 
 [tools.erlang."platforms.linux-arm64-musl"]
-checksum = "sha256:866307e64e245e86bee15b3807030a998e59873d7480d6fae1e40b432a3d12b7"
-url = "https://github.com/erlang/otp/releases/download/OTP-27.3.4.19/otp_src_27.3.4.19.tar.gz"
-url_api = "https://api.github.com/repos/erlang/otp/releases/assets/640824046"
+checksum = "sha256:9717de6c0b7ca569770e09c70aa3d36b88a53d509bacfa8688927fbfd119e7ff"
+url = "https://github.com/erlang/otp/releases/download/OTP-27.3.4.20/otp_src_27.3.4.20.tar.gz"
+url_api = "https://api.github.com/repos/erlang/otp/releases/assets/787641772"
 install = "source"
 
 [tools.erlang."platforms.linux-x64-musl"]
-checksum = "sha256:866307e64e245e86bee15b3807030a998e59873d7480d6fae1e40b432a3d12b7"
-url = "https://github.com/erlang/otp/releases/download/OTP-27.3.4.19/otp_src_27.3.4.19.tar.gz"
-url_api = "https://api.github.com/repos/erlang/otp/releases/assets/640824046"
+checksum = "sha256:9717de6c0b7ca569770e09c70aa3d36b88a53d509bacfa8688927fbfd119e7ff"
+url = "https://github.com/erlang/otp/releases/download/OTP-27.3.4.20/otp_src_27.3.4.20.tar.gz"
+url_api = "https://api.github.com/repos/erlang/otp/releases/assets/787641772"
 install = "source"
 
 [tools.erlang."platforms.macos-arm64"]
-checksum = "sha256:0351e04c3d2bba567f857bcc2e10ac63ef51562f807d44103f665351468611c6"
-url = "https://github.com/erlef/otp_builds/releases/download/OTP-27.3.4.19/otp-aarch64-apple-darwin.tar.gz"
-url_api = "https://api.github.com/repos/erlef/otp_builds/releases/assets/640845488"
+checksum = "sha256:d5fc43262d25e77aadf1669361c153e0aa50ae51afd4fe289a1addcc6a59e9c6"
+url = "https://github.com/erlef/otp_builds/releases/download/OTP-27.3.4.20/otp-aarch64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/erlef/otp_builds/releases/assets/787678657"
 
 [tools.erlang."platforms.macos-x64"]
-checksum = "sha256:217e9f9ec1d5a5d9d6eeba5489692d66eafb69e24d164d776246525e76e2b007"
-url = "https://github.com/erlef/otp_builds/releases/download/OTP-27.3.4.19/otp-x86_64-apple-darwin.tar.gz"
-url_api = "https://api.github.com/repos/erlef/otp_builds/releases/assets/640866972"
+checksum = "sha256:22ffe81351ae556f5b9bd72efcda65ebf0780480f04fe08d75290582f43b928a"
+url = "https://github.com/erlef/otp_builds/releases/download/OTP-27.3.4.20/otp-x86_64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/erlef/otp_builds/releases/assets/787713075"
 
 [tools.erlang."platforms.windows-x64"]
-checksum = "sha256:1f6fb477b4938e76c3d7473c7cb8c8e463ed6be42d77ae4b446bf74bbf2d0ae9"
-url = "https://github.com/erlang/otp/releases/download/OTP-27.3.4.19/otp_win64_27.3.4.19.zip"
-url_api = "https://api.github.com/repos/erlang/otp/releases/assets/641231457"
+checksum = "sha256:029505327f29565c40395a3719f5ca0e3b5b8fe72b2f2fabdfb12766068f63d0"
+url = "https://github.com/erlang/otp/releases/download/OTP-27.3.4.20/otp_win64_27.3.4.20.zip"
+url_api = "https://api.github.com/repos/erlang/otp/releases/assets/787885905"
